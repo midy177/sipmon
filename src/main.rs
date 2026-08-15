@@ -270,13 +270,20 @@ fn main() -> Result<()> {
                 return run_default_file(&cfg, &path, global_no_tui);
             }
             let source = capture::live::LiveSource::open("any", cfg.bpf.as_deref())?;
-            run_capture_loop(Box::new(source), cfg, "live:any".to_string(), want_tui(false), false, false)
+            run_capture_loop(
+                Box::new(source),
+                cfg,
+                "live:any".to_string(),
+                want_tui(false),
+                false,
+                false,
+            )
         }
     }
 }
 
 /// Default FILE mode: a .pcap/.pcapng is analyzed like `file -r`, a .evlog is
-/// replayed like `replay -l`.
+/// replayed like `replay -l`, a .jsonl snapshot export is loaded for viewing.
 fn run_default_file(cfg: &Config, path: &std::path::Path, no_tui: bool) -> Result<()> {
     let ext = path
         .extension()
@@ -296,8 +303,9 @@ fn run_default_file(cfg: &Config, path: &std::path::Path, no_tui: bool) -> Resul
             )
         }
         "evlog" => run_replay(cfg, &path.to_string_lossy(), want_tui(no_tui)),
+        "jsonl" => run_jsonl_view(cfg, path, want_tui(no_tui)),
         _ => anyhow::bail!(
-            "unrecognized file type '{ext}': pass `file -r FILE` for pcap/pcapng or `replay -l FILE` for an evlog"
+            "unrecognized file type '{ext}': pass `file -r FILE` for pcap/pcapng, `replay -l FILE` for an evlog, or a .jsonl snapshot export"
         ),
     }
 }
@@ -747,6 +755,93 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
     Ok(())
 }
 
+// ----------------------------- jsonl snapshot view -----------------------------
+
+/// View a JSONL snapshot export: load it once and show it in the TUI (or print
+/// the per-call lines headless). Unlike replay, there is no event stream — the
+/// full snapshot is published immediately and a worker only re-publishes when
+/// the UI focuses a call so the Call Detail page gets its per-call diagnostics.
+fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Result<()> {
+    let base = export::jsonl::import_snapshot(path)?;
+    let shared = Arc::new(Shared::new());
+    *shared.snap.lock().unwrap() = base.clone();
+
+    let shared2 = shared.clone();
+    let handle = std::thread::spawn(move || {
+        let mut last_pub_focus: Option<String> = Some("\u{0}init".to_string());
+        loop {
+            if shared2.quit.load(Ordering::Relaxed) {
+                break;
+            }
+            if shared2.pause.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
+            if cur_focus != last_pub_focus {
+                publish_jsonl(&shared2, &base, cur_focus.as_deref());
+                last_pub_focus = cur_focus;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    if with_tui {
+        run_tui(shared.clone())?;
+        shared.quit.store(true, Ordering::Relaxed);
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("jsonl view thread panicked"))?;
+    } else {
+        shared.quit.store(true, Ordering::Relaxed);
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("jsonl view thread panicked"))?;
+        let snap = shared.snap.lock().unwrap().clone();
+        for c in &snap.calls {
+            println!(
+                "{}",
+                serde_json::json!({"kind":"call","call_id":c.call_id,"state":c.state.label(),"pdd_ms":c.pdd_ms,"setup_ms":c.setup_ms,"warn":c.warn_count,"crit":c.critical_count})
+            );
+        }
+    }
+    final_exports(cfg, &shared)?;
+    Ok(())
+}
+
+/// Rebuild the published snapshot for a jsonl view, filling in the focused
+/// call's detail (streams/messages are not present in the export, so the detail
+/// is limited to its diagnostics).
+fn publish_jsonl(shared: &Shared, base: &store::registry::Snapshot, focus: Option<&str>) {
+    let mut snap = base.clone();
+    snap.focus = focus.and_then(|id| build_jsonl_focus(base, id));
+    if let Ok(mut s) = shared.snap.lock() {
+        *s = snap;
+    }
+}
+
+fn build_jsonl_focus(
+    base: &store::registry::Snapshot,
+    call_id: &str,
+) -> Option<store::registry::Focus> {
+    let call = base.calls.iter().find(|c| c.call_id == call_id)?;
+    Some(store::registry::Focus {
+        call_id: call.call_id.clone(),
+        state: Some(call.state),
+        from_user: call.from_user.clone(),
+        to_user: call.to_user.clone(),
+        messages: Vec::new(),
+        streams: Vec::new(),
+        diagnostics: base
+            .diagnostics
+            .iter()
+            .filter(|d| d.call_id == call_id)
+            .cloned()
+            .collect(),
+        negotiated_endpoints: Vec::new(),
+    })
+}
+
 // ----------------------------- query -----------------------------
 
 fn run_query(evlog: &str, call_id: &str) -> Result<()> {
@@ -869,7 +964,7 @@ fn run_export(
                             1 => Severity::Warn,
                             _ => Severity::Critical,
                         },
-                        code: leaked_code(&e.code),
+                        code: diagnostics::code_from_str(&e.code),
                         message: e.message.clone(),
                     });
                 }
@@ -898,37 +993,6 @@ fn run_export(
         eprintln!("nothing to do: pass --jsonl and/or --sqlite");
     }
     Ok(())
-}
-
-/// Promote an owned String code to &'static via leak (bounded by evlog size).
-/// Map a diagnostic code string (from our own evlog writer) back to its
-/// `&'static str` constant without leaking per-record strings. Unknown codes
-/// fall back to a single static placeholder (no unbounded leak).
-fn leaked_code(s: &str) -> &'static str {
-    const KNOWN: &[&str] = &[
-        crate::diagnostics::CONTACT_UNREACHABLE,
-        crate::diagnostics::CONTACT_PRIVATE_NAT,
-        crate::diagnostics::CONTACT_MCAST,
-        crate::diagnostics::RR_NOT_HONORED,
-        crate::diagnostics::RR_DEPTH_MISMATCH,
-        crate::diagnostics::SDP_HOLD,
-        crate::diagnostics::RTP_PT_MISMATCH,
-        crate::diagnostics::RTP_FLOW_UNEXPECTED,
-        crate::diagnostics::RTP_PT_CHANGED,
-        crate::diagnostics::ONE_WAY_MEDIA,
-        crate::diagnostics::TURN_ALLOC_OK,
-        crate::diagnostics::TURN_ALLOC_FAILED,
-        crate::diagnostics::TURN_REFRESH_FAILED,
-        crate::diagnostics::TURN_RELAY_MEDIA,
-        crate::diagnostics::TURN_CHANNEL_MEDIA,
-        crate::diagnostics::TURN_SEND_IND_MEDIA,
-        crate::diagnostics::TURN_LEG_IMBALANCE,
-    ];
-    KNOWN
-        .iter()
-        .copied()
-        .find(|c| *c == s)
-        .unwrap_or("UNKNOWN_DIAG")
 }
 
 // ----------------------------- TUI -----------------------------

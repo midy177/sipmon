@@ -50,6 +50,31 @@ pub const TURN_CHANNEL_MEDIA: &str = "TURN_CHANNEL_MEDIA";
 pub const TURN_SEND_IND_MEDIA: &str = "TURN_SEND_IND_MEDIA";
 pub const TURN_LEG_IMBALANCE: &str = "TURN_LEG_IMBALANCE";
 
+/// Map a diagnostic code string back to its `&'static str` constant without
+/// leaking per-record strings. Unknown codes fall back to a shared placeholder.
+pub fn code_from_str(s: &str) -> &'static str {
+    match s {
+        CONTACT_UNREACHABLE => CONTACT_UNREACHABLE,
+        CONTACT_PRIVATE_NAT => CONTACT_PRIVATE_NAT,
+        CONTACT_MCAST => CONTACT_MCAST,
+        RR_NOT_HONORED => RR_NOT_HONORED,
+        RR_DEPTH_MISMATCH => RR_DEPTH_MISMATCH,
+        SDP_HOLD => SDP_HOLD,
+        RTP_PT_MISMATCH => RTP_PT_MISMATCH,
+        RTP_FLOW_UNEXPECTED => RTP_FLOW_UNEXPECTED,
+        RTP_PT_CHANGED => RTP_PT_CHANGED,
+        ONE_WAY_MEDIA => ONE_WAY_MEDIA,
+        TURN_ALLOC_OK => TURN_ALLOC_OK,
+        TURN_ALLOC_FAILED => TURN_ALLOC_FAILED,
+        TURN_REFRESH_FAILED => TURN_REFRESH_FAILED,
+        TURN_RELAY_MEDIA => TURN_RELAY_MEDIA,
+        TURN_CHANNEL_MEDIA => TURN_CHANNEL_MEDIA,
+        TURN_SEND_IND_MEDIA => TURN_SEND_IND_MEDIA,
+        TURN_LEG_IMBALANCE => TURN_LEG_IMBALANCE,
+        _ => "UNKNOWN_DIAG",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub ts_us: u64,

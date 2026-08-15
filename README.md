@@ -58,8 +58,10 @@ sipmon file -r capture.pcap
 # Default input: pass a filename directly (no subcommand)
 #   *.pcap / *.pcapng  → equivalent to `file -r`
 #   *.evlog            → equivalent to `replay -l`
+#   *.jsonl            → load a snapshot export for viewing
 sipmon capture.pcap
 sipmon cap.evlog
+sipmon out.jsonl
 
 # Read a tcpdump stream (live forwarding)
 tcpdump -i eth0 -w - | sipmon -
@@ -69,7 +71,7 @@ tcpdump -i eth0 -w - | sipmon -
 
 | Command | Description |
 |---|---|
-| `(none)` | Default mode: a positional `FILE` is dispatched by extension — `.pcap/.pcapng` → `file -r`, `.evlog` → `replay -l`; with no FILE, starts a live capture. `--no-tui` for headless output |
+| `(none)` | Default mode: a positional `FILE` is dispatched by extension — `.pcap/.pcapng` → `file -r`, `.evlog` → `replay -l`, `.jsonl` → load a snapshot export; with no FILE, starts a live capture. `--no-tui` for headless output |
 | `live` | Live capture + TUI. `-i any` captures all interfaces, `-f` sets a BPF filter, `--no-media` disables RTP/RTCP analysis, `-w` optionally writes an event log too |
 | `record` | Headless recording: live capture → event log (`-w` required). `-d` daemonizes, `--pidfile` writes the PID, `--logfile` redirects stderr. Flushes gracefully on SIGTERM/SIGINT |
 | `-` | Read a pcap byte stream from stdin (a `tcpdump -w -` pipe) |

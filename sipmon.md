@@ -171,7 +171,7 @@ sipmon file   -r cap.pcap [--pcapng] [--rate 1x]       # offline pcap analysis +
 sipmon replay -l sipmon.evlog                         # replay an event log + TUI
 sipmon query  -l sipmon.evlog -c <callid>             # no TUI; query flow+stats by Call-ID (script friendly)
 sipmon export -l sipmon.evlog --sqlite out.db|--jsonl out.jsonl [--from --to]
-sipmon cap.pcap | cap.evlog                           # default mode: no subcommand, dispatch by extension to file/replay
+sipmon cap.pcap | cap.evlog | out.jsonl          # default mode: no subcommand, dispatch by extension to file/replay/jsonl view
 common: --raw-truncate 1024 --bucket 15m --ring-hours 24 --export-jsonl/--export-sqlite --dry-run
 ```
 
@@ -179,7 +179,7 @@ Mode matrix:
 
 | Mode | Input | Output | Description |
 |---|---|---|---|
-| `(default FILE)` | pcap/pcapng or evlog | same as file/replay | no subcommand → dispatch by extension: `*.pcap/pcapng` → `file -r`, `*.evlog` → `replay -l` |
+| `(default FILE)` | pcap/pcapng or evlog | same as file/replay | no subcommand → dispatch by extension: `*.pcap/pcapng` → `file -r`, `*.evlog` → `replay -l`, `*.jsonl` → load snapshot export |
 | `live` | interface/stdin/pcap | TUI + (optional) evlog | interactive monitoring |
 | `record` | interface | evlog (required) | headless recording, `-d` daemonizable, suited for 7×24 continuous capture |
 | `replay` | evlog | TUI / headless JSON | replay and re-analyze a past recording |
