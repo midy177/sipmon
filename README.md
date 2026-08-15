@@ -22,7 +22,8 @@ a live `sipbot` caller/callee pair plus a synthetic load pcap). Source recording
 - **Media quality**: RFC3550 jitter/loss (64-packet reorder window), RTCP RR LSR/DLSR RTT, one-way delay estimate, E-model MOS
 - **TURN detection**: auto-learns TURN servers and labels `turn-client` / `turn-peer` relay legs
 - **Diagnostics**: 20+ rules for Contact reachability, Record-Route, SDP/RTP consistency, one-way media, TURN allocation/refresh, etc.
-- **TUI**: Overview / Search / Call Detail (side-by-side) / Heatmap / Streams / EventLog
+- **TUI**: Overview / Search / Call Detail (side-by-side) / Heatmap / Streams / EventLog / IP Stats
+- **Call analysis**: PDD/setup/ring timing, ring-back type (180 vs 183 early media), hangup initiator (caller/callee BYE, CANCEL, reject), per-IP loss over 1s…1h windows
 - **Export**: SQLite / JSONL on exit or via the `export` subcommand; `query` fetches a Call-ID flow for scripting
 
 ## Build
@@ -116,6 +117,7 @@ tcpdump -i eth0 -w - | sipmon -
 | **Heatmap** | `4` | ASR grid over time × remote IP; `b` switches bucket granularity |
 | **Streams** | `5` | Per-RTP-stream live stats table (SSRC/Codec/loss/jitter/RTT/MOS) |
 | **Event Log** | `6` | Diagnostics and call-state-change events |
+| **IP Stats** | `7` | Per-IP network stats: time-windowed loss, volume, heatmap, drill-down |
 
 ### Top bar
 
@@ -125,13 +127,42 @@ tcpdump -i eth0 -w - | sipmon -
 
 ```
 Tab / Shift-Tab   Switch page (inside Call Detail: switch the right pane sub-view)
-1-6               Jump to the matching page
+1-7               Jump to the matching page
 /                 Search (enters Search edit mode)
 Space             Pause / resume
 e                 Export the current snapshot as JSONL (sipmon-export-*.jsonl)
 b                 Switch heatmap bucket granularity (15m→1h→1d)
+x                 Clear all calls/stats (in-memory; the evlog keeps writing)
 q / Esc / Ctrl-C  Quit
 ```
+
+### Call table columns
+
+```
+Time From To State PDD Setup Ring Dur MOS RTP Diag End Call-ID
+PDD    INVITE → ring-back (180/183)            Ring   ring duration · 180/183 code
+Setup  INVITE → 200 OK (answer)                End    who hung up: BYE→ (caller),
+                                                   ←BYE (callee), CANCEL, REJ·486
+```
+
+### IP Stats page
+
+Per-IP network conditions, aggregated from every RTP/RTCP packet and stream
+loss (all endpoints of each stream are credited):
+
+```
+IP   Act  1s   5s   10s  20s  1m   10m  1h   all  Bytes    Pkts
+Act  concurrent active calls involving the IP
+1s..all  loss % over each sliding window (1s/5s/10s/20s/1m/10m/1h/all-time)
+Bytes / Pkts  cumulative traffic volume and packet count for the IP
+```
+
+- **Bottom heatmap**: loss% over time for every IP; `w` cycles the window
+  (last 1m → 10m → 1h).
+- **Sort**: `s` cycles `newest` → `max-loss` → `min-loss`.
+- **Drill-down**: `Enter` on an IP lists the calls involving it (with their
+  packet/MOS/hangup summary); `Enter` on a call opens the full Call Detail,
+  `Esc`/`←` returns to the IP list.
 
 ### Call Detail side-by-side layout
 

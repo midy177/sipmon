@@ -76,6 +76,30 @@ pub struct HangupCause {
     pub reason: Option<String>,
 }
 
+/// Who/which signaling event initiated call termination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum HangupBy {
+    /// Caller sent the BYE.
+    Caller,
+    /// Callee sent the BYE.
+    Callee,
+    /// Caller sent CANCEL (ringing phase cancel).
+    Cancel,
+    /// A non-2xx final response to the INVITE (callee side refused).
+    Reject,
+}
+
+impl HangupBy {
+    pub fn label(self) -> &'static str {
+        match self {
+            HangupBy::Caller => "BYE→",
+            HangupBy::Callee => "←BYE",
+            HangupBy::Cancel => "CANCEL",
+            HangupBy::Reject => "REJ",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Outcome {
     /// Not yet terminated.
@@ -149,6 +173,12 @@ pub struct Call {
     pub end_ts: Option<u64>,
     pub pdd_ms: Option<u32>,
     pub setup_ms: Option<u32>,
+    /// Ringing duration: ringing (180/183) → answer (200 OK).
+    pub ring_ms: Option<u32>,
+    /// Provisional code that started ringing: 180 or 183 (early media).
+    pub ring_code: Option<u16>,
+    /// Initiator of the hangup (BYE sender / cancel / reject).
+    pub hangup_by: Option<HangupBy>,
     pub pkts_sip: u64,
     pub pkts_rtp: u64,
     pub pkts_rtcp: u64,
@@ -164,6 +194,12 @@ pub struct Call {
     /// Remote IP key for heatmap (source IP of the first INVITE), kept on the
     /// call so it survives message-buffer trimming.
     pub invite_key: Option<String>,
+    /// Distinct IPs involved in this call (SIP endpoints + media flows).
+    /// Used by the per-IP network-stats drill-down.
+    pub ips: Vec<std::net::IpAddr>,
+    /// IPs that contributed to the per-IP active-call count (the two signaling
+    /// endpoints of the initial INVITE), decremented at teardown.
+    pub active_ips: Vec<std::net::IpAddr>,
 }
 
 impl Call {
@@ -187,6 +223,9 @@ impl Call {
             end_ts: None,
             pdd_ms: None,
             setup_ms: None,
+            ring_ms: None,
+            ring_code: None,
+            hangup_by: None,
             pkts_sip: 0,
             pkts_rtp: 0,
             pkts_rtcp: 0,
@@ -196,6 +235,8 @@ impl Call {
             critical_count: 0,
             via_turn: false,
             invite_key: None,
+            ips: Vec::new(),
+            active_ips: Vec::new(),
         }
     }
 

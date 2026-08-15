@@ -20,7 +20,7 @@ const TABS: [&str; 3] = ["Raw", "Network", "Diagnostics"];
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Min(0),
     ])
     .split(area);
@@ -66,6 +66,27 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             .map(|a| a.to_string())
             .unwrap_or_else(|| "?".into())
     );
+    let timing = format!(
+        "PDD {}ms | Setup {}ms | Ring {}·{}",
+        fmt_ms(focus.pdd_ms.map(|m| m as f64)),
+        fmt_ms(focus.setup_ms.map(|m| m as f64)),
+        fmt_ms(focus.ring_ms.map(|m| m as f64)),
+        focus
+            .ring_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into()),
+    );
+    let hangup = match (focus.hangup_by, focus.hangup_code, focus.hangup_reason.as_deref()) {
+        (Some(b), code, _) => format!(
+            "End: {} {}",
+            b.label(),
+            code.map(|c| c.to_string()).unwrap_or_default()
+        ),
+        (None, Some(code), reason) => {
+            format!("End: {code} {}", reason.unwrap_or(""))
+        }
+        (None, None, _) => "End: -".into(),
+    };
     let lines = vec![
         Line::from(Span::styled(
             title,
@@ -80,6 +101,10 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         Line::from(Span::styled(
             format!("Callee → {}", callee),
             Style::default().fg(theme::WARNING),
+        )),
+        Line::from(Span::styled(
+            format!("{timing}   {hangup}"),
+            Style::default().fg(theme::MUTED),
         )),
     ];
     f.render_widget(Paragraph::new(lines), chunks[1]);
@@ -196,6 +221,18 @@ fn short(s: &str) -> String {
     s.split(':').next().unwrap_or(s).to_string()
 }
 
+/// Media flow label: IP→IP (ports omitted so it fits the compact table).
+fn flow_short(f: Option<crate::model::packet::Flow5Tuple>) -> String {
+    match f {
+        Some(fl) => format!(
+            "{}→{}",
+            short(&fl.src.to_string()),
+            short(&fl.dst.to_string())
+        ),
+        None => "-".into(),
+    }
+}
+
 fn render_raw(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
     let idx = app
         .flow_state
@@ -307,18 +344,15 @@ fn render_network(f: &mut Frame, area: Rect, focus: &crate::store::registry::Foc
 
     let rows = focus.streams.iter().map(|s| {
         let leg = match (s.via_turn, s.leg.as_deref()) {
-            (true, Some(l)) => format!("turn-{l}"),
-            (true, None) => "turn".to_string(),
+            (true, Some(l)) if l.starts_with("client") => "t-c".to_string(),
+            (true, Some(_)) => "t-p".to_string(),
+            (true, None) => "trn".to_string(),
             (false, _) => "-".into(),
         };
         Row::new(vec![
             Cell::from(format!("{:#x}", s.ssrc)),
             Cell::from(s.codec.clone().unwrap_or_else(|| "-".into())),
-            Cell::from(format!(
-                "{}->{}",
-                short(&s.flow.map(|f| f.src.to_string()).unwrap_or_default()),
-                short(&s.flow.map(|f| f.dst.to_string()).unwrap_or_default())
-            )),
+            Cell::from(flow_short(s.flow)),
             Cell::from(leg).style(Style::default().fg(theme::ACCENT)),
             Cell::from(s.packets.to_string()),
             Cell::from(s.lost.to_string()),
@@ -326,40 +360,33 @@ fn render_network(f: &mut Frame, area: Rect, focus: &crate::store::registry::Foc
             Cell::from(fmt_ms(s.jitter_ms)),
             Cell::from(fmt_ms(s.rtt_avg_ms)),
             Cell::from(fmt_ms(s.mos)),
-            Cell::from(fmt_bytes(s.bytes)),
-            Cell::from(fmt_rate(stream_bytes_per_sec(s))),
         ])
     });
     let table = Table::new(
         rows,
         [
-            Constraint::Length(11),
-            Constraint::Length(9),
-            Constraint::Length(22),
-            Constraint::Length(10),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(6),
             Constraint::Length(8),
-            Constraint::Length(8),
+            Constraint::Length(7),
+            Constraint::Length(17),
+            Constraint::Length(3),
             Constraint::Length(6),
-            Constraint::Length(9),
-            Constraint::Length(10),
+            Constraint::Length(5),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(5),
         ],
     )
     .column_spacing(1)
     .header(Row::new(
-        [
-            "SSRC", "Codec", "Flow", "Leg", "Pkts", "Lost", "Loss%", "Jitter", "RTT", "MOS",
-            "Bytes", "Rate",
-        ]
-        .iter()
-        .map(|h| Cell::from(*h)),
+        ["SSRC", "Codec", "Flow", "Leg", "Pkts", "Lost", "Loss%", "Jitter", "RTT", "MOS"]
+            .iter()
+            .map(|h| Cell::from(*h)),
     ))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Media streams (Leg: turn-client/turn-peer = TURN-relayed)"),
+            .title("Media streams (Leg: t-c/t-p = TURN client/peer leg)"),
     );
     f.render_widget(table, chunks[1]);
 
@@ -513,4 +540,150 @@ fn render_diag(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus)
             .title(format!("Diagnostics ({})", focus.diagnostics.len())),
     );
     f.render_widget(p, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use crate::model::packet::{Flow5Tuple, Proto};
+    use crate::store::registry::{Focus, Snapshot};
+    use crate::ui::app::Page;
+
+    /// The Network tab's media table must fit inside the right pane at typical
+    /// widths without the header wrapping onto a second line. Regression test
+    /// for the demo screenshot where the right side wrapped.
+    #[test]
+    fn network_table_header_fits_no_wrap() {
+        let focus = Focus {
+            call_id: "c1".into(),
+            state: Some(crate::model::sip::CallState::Active),
+            from_user: Some("alice".into()),
+            to_user: Some("bob".into()),
+            streams: vec![
+                StreamSummary {
+                    ssrc: 0x1000,
+                    codec: Some("PCMU".into()),
+                    flow: Some(Flow5Tuple {
+                        proto: Proto::Udp,
+                        src: "10.10.0.8:20014".parse().unwrap(),
+                        dst: "10.20.0.8:30014".parse().unwrap(),
+                    }),
+                    packets: 684,
+                    lost: 5,
+                    loss_pct: 0.7,
+                    jitter_ms: Some(1.3),
+                    rtt_avg_ms: None,
+                    mos: Some(4.3),
+                    ..StreamSummary::default()
+                },
+                StreamSummary {
+                    ssrc: 0x8000,
+                    codec: Some("PCMU".into()),
+                    flow: Some(Flow5Tuple {
+                        proto: Proto::Udp,
+                        src: "10.20.0.8:30014".parse().unwrap(),
+                        dst: "10.10.0.8:20014".parse().unwrap(),
+                    }),
+                    packets: 700,
+                    lost: 2,
+                    loss_pct: 0.3,
+                    jitter_ms: Some(1.0),
+                    rtt_avg_ms: Some(10.0),
+                    mos: Some(4.5),
+                    ..StreamSummary::default()
+                },
+            ],
+            ..Focus::default()
+        };
+        let snap = Arc::new(Mutex::new(Snapshot {
+            focus: Some(focus),
+            ..Snapshot::default()
+        }));
+        let mut app = App::new(
+            snap,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.page = Page::CallDetail;
+        app.detail_tab = 1; // Network
+
+        let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // Every media-table header must appear on the same continuous line as
+        // "SSRC" (i.e. the header never wraps onto a second row).
+        let headers = ["SSRC", "Codec", "Flow", "Leg", "Pkts", "Lost", "Loss%", "Jitter", "RTT", "MOS"];
+        let joined: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let header_line = joined
+            .iter()
+            .find(|l| l.contains("SSRC"))
+            .expect("media table header row must be rendered");
+        for h in headers {
+            assert!(
+                header_line.contains(h),
+                "header {h} must be on the single SSRC header row (no wrap)"
+            );
+        }
+    }
+
+    #[test]
+    fn network_table_fits_narrow_terminal() {
+        let focus = Focus {
+            call_id: "c1".into(),
+            state: Some(crate::model::sip::CallState::Active),
+            from_user: Some("alice".into()),
+            to_user: Some("bob".into()),
+            streams: vec![StreamSummary {
+                ssrc: 0x1000,
+                codec: Some("PCMU".into()),
+                flow: Some(Flow5Tuple {
+                    proto: Proto::Udp,
+                    src: "10.10.0.8:20014".parse().unwrap(),
+                    dst: "10.20.0.8:30014".parse().unwrap(),
+                }),
+                ..StreamSummary::default()
+            }],
+            ..Focus::default()
+        };
+        let snap = Arc::new(Mutex::new(Snapshot {
+            focus: Some(focus),
+            ..Snapshot::default()
+        }));
+        let mut app = App::new(
+            snap,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.page = Page::CallDetail;
+        app.detail_tab = 1;
+
+        // At a 114-column terminal (55% right pane ≈ 63 cols) the render must
+        // not panic and the table should still produce the header row.
+        let mut terminal = Terminal::new(TestBackend::new(114, 44)).unwrap();
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let has_ssrc = (0..buf.area.height).any(|y| {
+            (0..buf.area.width)
+                .any(|x| buf[(x, y)].symbol() == "S" && buf[(x + 1, y)].symbol() == "S")
+        });
+        assert!(has_ssrc, "SSRC header should still be rendered");
+    }
 }

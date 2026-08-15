@@ -169,6 +169,7 @@ struct Shared {
     pause: Arc<AtomicBool>,
     focus: Arc<Mutex<Option<String>>>,
     quit: Arc<AtomicBool>,
+    clear: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -178,6 +179,7 @@ impl Shared {
             pause: Arc::new(AtomicBool::new(false)),
             focus: Arc::new(Mutex::new(None)),
             quit: Arc::new(AtomicBool::new(false)),
+            clear: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -519,6 +521,11 @@ fn run_capture_loop(
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
+            if shared2.clear.swap(false, Ordering::Relaxed) {
+                // `x` in the TUI: reset the in-memory state, then republish.
+                corr.clear();
+                publish(&shared2, &mut corr, false);
+            }
             let Some(frame) = source.next_frame() else {
                 if !exhausted {
                     // Source EOF: final flush + full-fidelity publish so the
@@ -698,6 +705,10 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
+            if shared2.clear.swap(false, Ordering::Relaxed) {
+                corr.clear();
+                publish(&shared2, &mut corr, false);
+            }
             match reader.next_event() {
                 Ok(Some(ev)) => {
                     if let Event::SipMsg(e) = &ev {
@@ -783,6 +794,11 @@ fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Resul
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
+            if shared2.clear.swap(false, Ordering::Relaxed)
+                && let Ok(mut s) = shared2.snap.lock()
+            {
+                *s = store::registry::Snapshot::default();
+            }
             let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
             if cur_focus != last_pub_focus {
                 publish_jsonl(&shared2, &base, cur_focus.as_deref());
@@ -850,6 +866,13 @@ fn build_jsonl_focus(
             .cloned()
             .collect(),
         negotiated_endpoints: Vec::new(),
+        pdd_ms: call.pdd_ms,
+        setup_ms: call.setup_ms,
+        ring_ms: call.ring_ms,
+        ring_code: call.ring_code,
+        hangup_by: call.hangup_by,
+        hangup_code: call.hangup_code,
+        hangup_reason: None,
     })
 }
 
@@ -1023,6 +1046,7 @@ fn run_tui(shared: Arc<Shared>) -> Result<()> {
         shared.snap.clone(),
         shared.pause.clone(),
         shared.focus.clone(),
+        shared.clear.clone(),
     );
     let r = (|| -> Result<()> {
         loop {

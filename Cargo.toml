@@ -2,9 +2,14 @@
 name = "sipmon"
 version = "0.1.0"
 edition = "2024"
-description = "SIP/RTP signaling and media quality monitoring tool (passive, pcap-based)"
+description = "Passive SIP/RTP signaling & media quality monitoring (pcap/live, TUI + SQLite/JSONL export)"
 license = "MIT"
 authors = ["sipmon"]
+repository = "https://github.com/shenjinti/sipmon"
+documentation = "https://docs.rs/sipmon"
+keywords = ["sip", "rtp", "monitoring", "pcap", "voip"]
+categories = ["command-line-utilities", "network-programming"]
+exclude = ["demo/"]
 
 [[bin]]
 name = "sipmon"

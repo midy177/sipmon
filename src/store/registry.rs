@@ -2,7 +2,8 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::diagnostics::Diagnostic;
 use crate::model::media::StreamSummary;
-use crate::model::sip::{Call, CallState, Method, Outcome, SipMsg};
+use crate::model::sip::{Call, CallState, HangupBy, Method, Outcome, SipMsg};
+use crate::store::ipstats::{IpStats, IpStatsStore};
 
 /// Focused-call detail payload for the Call Detail page.
 #[derive(Debug, Clone, Default)]
@@ -26,6 +27,14 @@ pub struct Focus {
     pub streams: Vec<StreamSummary>,
     pub diagnostics: Vec<Diagnostic>,
     pub negotiated_endpoints: Vec<std::net::SocketAddr>,
+    /// Call timing / outcome details for the header block.
+    pub pdd_ms: Option<u32>,
+    pub setup_ms: Option<u32>,
+    pub ring_ms: Option<u32>,
+    pub ring_code: Option<u16>,
+    pub hangup_by: Option<HangupBy>,
+    pub hangup_code: Option<u32>,
+    pub hangup_reason: Option<String>,
 }
 
 /// One RTP/RTCP stream keyed by (5-tuple, ssrc).
@@ -47,6 +56,12 @@ pub struct CallSummary {
     pub duration_ms: Option<u64>,
     pub pdd_ms: Option<u32>,
     pub setup_ms: Option<u32>,
+    /// Ringing duration (ring → answer).
+    pub ring_ms: Option<u32>,
+    /// Provisional code that started ringing: 180 or 183.
+    pub ring_code: Option<u16>,
+    /// Who initiated the hangup.
+    pub hangup_by: Option<HangupBy>,
     pub hangup_code: Option<u32>,
     pub pkts_sip: u64,
     pub pkts_rtp: u64,
@@ -56,6 +71,8 @@ pub struct CallSummary {
     pub stream_count: usize,
     /// True if the call's media traversed a learned TURN relay.
     pub via_turn: bool,
+    /// Distinct IPs involved in the call (drill-down from the IP page).
+    pub ips: Vec<std::net::IpAddr>,
 }
 
 /// Lightweight immutable snapshot for the TUI/export.
@@ -83,6 +100,8 @@ pub struct Snapshot {
     pub events: VecDeque<String>,
     /// Diagnostics for the focused call (filtered by the UI).
     pub diagnostics: Vec<Diagnostic>,
+    /// Per-IP network stats (IP page).
+    pub ip_stats: Vec<IpStats>,
     /// Heatmap cells: (bucket_us, key, metrics).
     pub buckets: Vec<(u64, String, crate::model::stats::MetricSet)>,
     /// Focused call detail (set by the UI via Correlator focus hint).
@@ -131,6 +150,8 @@ pub struct Registry {
     pub stream_index: HashMap<String, Vec<StreamKey>>,
     /// SSRC -> stream keys: O(1) RTCP sample attachment (no full scan).
     pub ssrc_index: HashMap<u32, Vec<StreamKey>>,
+    /// Per-IP packet/loss statistics (updated on the RTP hot path + 5s flush).
+    pub ipstats: IpStatsStore,
     pub max_calls: usize,
     pub max_streams: usize,
     pub max_diagnostics: usize,
@@ -160,6 +181,7 @@ impl Default for Registry {
             focus_hint: None,
             stream_index: HashMap::new(),
             ssrc_index: HashMap::new(),
+            ipstats: IpStatsStore::new(),
             removed: VecDeque::new(),
             heatmap_retain_us: 24 * 3600 * 1_000_000,
             max_calls: 100_000,
@@ -192,6 +214,32 @@ impl Registry {
             // Buckets are incompatible; rebuild empty (v1: heatmap is
             // forward-accumulating only).
         }
+    }
+
+    /// Reset all runtime state (the `x` / clear shortcut): calls, streams,
+    /// diagnostics, events, heatmap, per-IP stats and counters. The evlog
+    /// writer keeps its own file and is unaffected.
+    pub fn clear(&mut self) {
+        self.calls.clear();
+        self.order.clear();
+        self.streams.clear();
+        self.stream_call.clear();
+        self.endpoint_call.clear();
+        self.stream_index.clear();
+        self.ssrc_index.clear();
+        self.events.clear();
+        self.diagnostics.clear();
+        self.heatmap = crate::store::heatmap::Heatmap::new(self.heatmap.bucket_secs());
+        self.ipstats.clear();
+        self.pkts_total = 0;
+        self.pkts_last_window = 0;
+        self.window_start_us = None;
+        self.start_us = None;
+        self.last_us = None;
+        self.pps = 0.0;
+        self.completed = 0;
+        self.failed = 0;
+        self.focus_hint = None;
     }
 
     /// Record that `key` belongs to `call_id` (called on stream creation).
@@ -463,6 +511,7 @@ impl Registry {
                 .collect(),
             events: self.events.clone(),
             diagnostics: self.diagnostics.iter().cloned().collect(),
+            ip_stats: self.ipstats.snapshot(),
             buckets: self.heatmap.flat(),
             focus: self
                 .focus_hint
@@ -522,6 +571,13 @@ impl Registry {
             streams,
             diagnostics,
             negotiated_endpoints: call.negotiated.endpoints.clone(),
+            pdd_ms: call.pdd_ms,
+            setup_ms: call.setup_ms,
+            ring_ms: call.ring_ms,
+            ring_code: call.ring_code,
+            hangup_by: call.hangup_by,
+            hangup_code: call.hangup.code,
+            hangup_reason: call.hangup.reason.clone(),
         })
     }
 
@@ -545,6 +601,9 @@ impl Registry {
             duration_ms: c.duration_ms(),
             pdd_ms: c.pdd_ms,
             setup_ms: c.setup_ms,
+            ring_ms: c.ring_ms,
+            ring_code: c.ring_code,
+            hangup_by: c.hangup_by,
             hangup_code: c.hangup.code,
             pkts_sip: c.pkts_sip,
             pkts_rtp: c.pkts_rtp,
@@ -553,6 +612,7 @@ impl Registry {
             critical_count: c.critical_count,
             stream_count,
             via_turn: c.via_turn,
+            ips: c.ips.clone(),
         }
     }
 

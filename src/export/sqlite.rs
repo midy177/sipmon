@@ -11,7 +11,9 @@ CREATE TABLE IF NOT EXISTS calls (
     from_user TEXT, to_user TEXT,
     state TEXT, outcome TEXT,
     invite_ts_us INTEGER, duration_ms INTEGER,
-    pdd_ms INTEGER, setup_ms INTEGER, hangup_code INTEGER,
+    pdd_ms INTEGER, setup_ms INTEGER,
+    ring_ms INTEGER, ring_code INTEGER, hangup_by TEXT,
+    hangup_code INTEGER,
     pkts_sip INTEGER, pkts_rtp INTEGER,
     best_mos REAL, warn_count INTEGER, critical_count INTEGER, stream_count INTEGER,
     via_turn INTEGER
@@ -39,8 +41,9 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
     let conn = Connection::open(path).with_context(|| format!("open sqlite {}", path.display()))?;
     conn.execute_batch(SCHEMA)?;
 
-    let mut call_stmt =
-        conn.prepare("INSERT OR REPLACE INTO calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")?;
+    let mut call_stmt = conn.prepare(
+        "INSERT OR REPLACE INTO calls VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    )?;
     for c in &snap.calls {
         call_stmt.execute(rusqlite::params![
             c.call_id,
@@ -52,6 +55,9 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
             c.duration_ms.map(|d| d as i64),
             c.pdd_ms,
             c.setup_ms,
+            c.ring_ms,
+            c.ring_code,
+            c.hangup_by.map(|b| format!("{:?}", b)),
             c.hangup_code,
             c.pkts_sip,
             c.pkts_rtp,

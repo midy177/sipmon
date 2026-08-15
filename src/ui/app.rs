@@ -66,6 +66,7 @@ pub enum Page {
     Heatmap,
     Streams,
     EventLog,
+    IpStats,
 }
 
 impl Page {
@@ -77,22 +78,51 @@ impl Page {
             Page::Heatmap => "Heatmap",
             Page::Streams => "Streams",
             Page::EventLog => "Event Log",
+            Page::IpStats => "IP Stats",
         }
     }
-    pub const ALL: [Page; 6] = [
+    pub const ALL: [Page; 7] = [
         Page::Overview,
         Page::Search,
         Page::CallDetail,
         Page::Heatmap,
         Page::Streams,
         Page::EventLog,
+        Page::IpStats,
     ];
+}
+
+/// Sort modes for the per-IP network-stats page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpSort {
+    /// Most recently active first.
+    Newest,
+    /// Highest all-time loss first.
+    MaxLoss,
+    /// Lowest all-time loss first.
+    MinLoss,
+}
+
+impl IpSort {
+    pub const ALL: [IpSort; 3] = [IpSort::Newest, IpSort::MaxLoss, IpSort::MinLoss];
+    pub fn label(self) -> &'static str {
+        match self {
+            IpSort::Newest => "newest",
+            IpSort::MaxLoss => "max-loss",
+            IpSort::MinLoss => "min-loss",
+        }
+    }
+    pub fn next(self) -> IpSort {
+        let i = Self::ALL.iter().position(|&x| x == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
 }
 
 pub struct App {
     pub snap: Arc<Mutex<Snapshot>>,
     pub pause: Arc<AtomicBool>,
     pub focus_id: Arc<Mutex<Option<String>>>,
+    pub clear: Arc<AtomicBool>,
     pub page: Page,
     pub search_query: String,
     pub search_editing: bool,
@@ -115,6 +145,12 @@ pub struct App {
     pub status: String,
     pub export_path: Option<std::path::PathBuf>,
     pub bucket_secs: u64,
+    /// Per-IP network-stats page state.
+    pub ip_table_state: TableState,
+    pub ip_sort: IpSort,
+    pub ip_window_secs: u64, // heatmap window: 60s / 10m / 1h
+    pub ip_drill: Option<std::net::IpAddr>,
+    pub ip_drill_state: TableState,
 }
 
 impl App {
@@ -122,11 +158,13 @@ impl App {
         snap: Arc<Mutex<Snapshot>>,
         pause: Arc<AtomicBool>,
         focus: Arc<Mutex<Option<String>>>,
+        clear: Arc<AtomicBool>,
     ) -> Self {
         Self {
             snap,
             pause,
             focus_id: focus,
+            clear,
             page: Page::Overview,
             search_query: String::new(),
             search_editing: false,
@@ -144,6 +182,11 @@ impl App {
             status: String::new(),
             export_path: None,
             bucket_secs: 900,
+            ip_table_state: TableState::default(),
+            ip_sort: IpSort::Newest,
+            ip_window_secs: 60,
+            ip_drill: None,
+            ip_drill_state: TableState::default(),
         }
     }
 
@@ -205,6 +248,9 @@ impl App {
                     self.page = Page::Overview;
                     self.focus_pending = None;
                     self.focus_id.lock().ok().map(|mut f| f.take());
+                } else if self.page == Page::IpStats && self.ip_drill.is_some() {
+                    // Esc closes the per-IP call drill-down.
+                    self.ip_drill = None;
                 } else {
                     self.should_quit = true;
                 }
@@ -214,6 +260,8 @@ impl App {
                     self.page = Page::Overview;
                     self.focus_pending = None;
                     self.focus_id.lock().ok().map(|mut f| f.take());
+                } else if self.page == Page::IpStats && self.ip_drill.is_some() {
+                    self.ip_drill = None;
                 }
             }
             KeyCode::Tab => {
@@ -241,6 +289,7 @@ impl App {
             KeyCode::Char('4') => self.page = Page::Heatmap,
             KeyCode::Char('5') => self.page = Page::Streams,
             KeyCode::Char('6') => self.page = Page::EventLog,
+            KeyCode::Char('7') => self.page = Page::IpStats,
             KeyCode::Char('/') => {
                 self.page = Page::Search;
                 self.search_editing = true;
@@ -257,6 +306,14 @@ impl App {
             KeyCode::Char('f') => {
                 self.filter = self.filter.next();
                 self.set_status(format!("filter = {}", self.filter.label()));
+            }
+            KeyCode::Char('x') => {
+                self.clear.store(true, Ordering::Relaxed);
+                self.set_status("cleared all calls/stats");
+                // Drop the stale selection anchors.
+                self.selected_call = None;
+                self.focus_pending = None;
+                self.ip_drill = None;
             }
             _ => self.page_key(code),
         }
@@ -385,7 +442,67 @@ impl App {
                 KeyCode::Up => self.eventlog_scroll = self.eventlog_scroll.saturating_sub(1),
                 _ => {}
             },
+            Page::IpStats => self.ip_key(code, &snap),
             Page::Heatmap => {}
+        }
+    }
+
+    fn ip_key(&mut self, code: KeyCode, snap: &Snapshot) {
+        if self.ip_drill.is_some() {
+            // Drill-down: navigate the selected IP's calls, Enter opens one.
+            match code {
+                KeyCode::Down => self.ip_drill_state.select_next(),
+                KeyCode::Up => self.ip_drill_state.select_previous(),
+                KeyCode::Enter => {
+                    let calls = crate::ui::ipstats::calls_for_ip(snap, self.ip_drill);
+                    let idx = self
+                        .ip_drill_state
+                        .selected()
+                        .or_else(|| (!calls.is_empty()).then_some(0));
+                    if let Some(i) = idx
+                        && let Some(c) = calls.get(i)
+                    {
+                        self.open_detail(c.call_id.clone());
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Down => {
+                self.ip_table_state.select_next();
+            }
+            KeyCode::Up => {
+                self.ip_table_state.select_previous();
+            }
+            KeyCode::Enter => {
+                let rows = crate::ui::ipstats::sorted_rows(snap, self.ip_sort);
+                let idx = self
+                    .ip_table_state
+                    .selected()
+                    .or_else(|| (!rows.is_empty()).then_some(0));
+                if let Some(i) = idx
+                    && let Some(r) = rows.get(i)
+                {
+                    self.ip_drill = Some(r.ip);
+                    self.ip_drill_state = TableState::default();
+                    self.set_status(format!("IP {} — calls (Enter to open, Esc back)", r.ip));
+                }
+            }
+            KeyCode::Char('s') => {
+                self.ip_sort = self.ip_sort.next();
+                self.set_status(format!("IP sort = {}", self.ip_sort.label()));
+            }
+            KeyCode::Char('w') => {
+                self.ip_window_secs = match self.ip_window_secs {
+                    60 => 600,
+                    600 => 3600,
+                    _ => 60,
+                };
+                self.set_status(format!("IP heatmap window = {}s", self.ip_window_secs));
+            }
+            _ => {}
         }
     }
 }

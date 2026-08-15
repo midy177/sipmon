@@ -29,6 +29,9 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
             "duration_ms": c.duration_ms,
             "pdd_ms": c.pdd_ms,
             "setup_ms": c.setup_ms,
+            "ring_ms": c.ring_ms,
+            "ring_code": c.ring_code,
+            "hangup_by": c.hangup_by.map(|b| format!("{:?}", b)),
             "hangup_code": c.hangup_code,
             "pkts_sip": c.pkts_sip,
             "pkts_rtp": c.pkts_rtp,
@@ -37,6 +40,7 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
             "critical_count": c.critical_count,
             "stream_count": c.stream_count,
             "via_turn": c.via_turn,
+            "ips": c.ips.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
         });
         writeln!(w, "{line}")?;
     }
@@ -231,6 +235,12 @@ fn import_call(v: &Value) -> CallSummary {
         duration_ms: v.get("duration_ms").and_then(|x| x.as_u64()),
         pdd_ms: opt_u32(v, "pdd_ms"),
         setup_ms: opt_u32(v, "setup_ms"),
+        ring_ms: opt_u32(v, "ring_ms"),
+        ring_code: v
+            .get("ring_code")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as u16),
+        hangup_by: parse_hangup_by(v.get("hangup_by").and_then(|x| x.as_str())),
         hangup_code: opt_u32(v, "hangup_code"),
         pkts_sip: v.get("pkts_sip").and_then(|x| x.as_u64()).unwrap_or(0),
         pkts_rtp: v.get("pkts_rtp").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -243,6 +253,26 @@ fn import_call(v: &Value) -> CallSummary {
             .map(|x| x as usize)
             .unwrap_or(0),
         via_turn: v.get("via_turn").and_then(|x| x.as_bool()).unwrap_or(false),
+        ips: v.get("ips")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str())
+                    .filter_map(|s| s.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn parse_hangup_by(s: Option<&str>) -> Option<crate::model::sip::HangupBy> {
+    use crate::model::sip::HangupBy::*;
+    match s {
+        Some("Caller") => Some(Caller),
+        Some("Callee") => Some(Callee),
+        Some("Cancel") => Some(Cancel),
+        Some("Reject") => Some(Reject),
+        _ => None,
     }
 }
 
@@ -349,6 +379,9 @@ mod tests {
             duration_ms: Some(5_000),
             pdd_ms: Some(150),
             setup_ms: Some(200),
+            ring_ms: Some(50),
+            ring_code: Some(180),
+            hangup_by: Some(crate::model::sip::HangupBy::Caller),
             hangup_code: Some(200),
             pkts_sip: 8,
             pkts_rtp: 100,
@@ -357,6 +390,7 @@ mod tests {
             critical_count: 0,
             stream_count: 1,
             via_turn: false,
+            ips: vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()],
         });
         snap.streams.push(StreamSummary {
             call_id: Some("abc@x".into()),
@@ -411,6 +445,12 @@ mod tests {
         assert_eq!(loaded.calls[0].call_id, "abc@x");
         assert_eq!(loaded.calls[0].state, CallState::Completed);
         assert_eq!(loaded.calls[0].pdd_ms, Some(150));
+        assert_eq!(loaded.calls[0].ring_ms, Some(50));
+        assert_eq!(
+            loaded.calls[0].hangup_by,
+            Some(crate::model::sip::HangupBy::Caller)
+        );
+        assert_eq!(loaded.calls[0].ips.len(), 2);
         assert_eq!(loaded.streams.len(), 1);
         assert_eq!(loaded.streams[0].call_id.as_deref(), Some("abc@x"));
         assert_eq!(loaded.streams[0].ssrc, 0xdeadbeef);

@@ -1,6 +1,6 @@
 //! Pure call state-machine transitions, applied to a `Call` for each SIP msg.
 
-use crate::model::sip::{Call, CallState, Method, Outcome, SipMsg};
+use crate::model::sip::{Call, CallState, HangupBy, Method, Outcome, SipMsg};
 
 /// Extract a user portion from a SIP From/To header value.
 pub fn user_of(value: &str) -> Option<String> {
@@ -52,6 +52,12 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
         if call.invite_key.is_none() {
             call.invite_key = Some(msg.flow.src.ip().to_string());
         }
+        // Track the signaling endpoints for the per-IP active-call counter.
+        if call.active_ips.is_empty() {
+            call.active_ips = vec![msg.flow.src.ip(), msg.flow.dst.ip()];
+        }
+        call.ips.push(msg.flow.src.ip());
+        call.ips.push(msg.flow.dst.ip());
         call.state = CallState::Dialing;
         return;
     }
@@ -61,6 +67,18 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
             Some(Method::Bye) => {
                 if call.bye_ts.is_none() {
                     call.bye_ts = Some(msg.ts_us);
+                }
+                // Who hung up: compare the BYE source to the caller (INVITE src).
+                if call.hangup_by.is_none() {
+                    call.hangup_by = match call
+                        .invite_key
+                        .as_deref()
+                        .and_then(|k| k.parse::<std::net::IpAddr>().ok())
+                    {
+                        Some(caller_ip) if caller_ip == msg.flow.src.ip() => Some(HangupBy::Caller),
+                        Some(_) => Some(HangupBy::Callee),
+                        None => None,
+                    };
                 }
                 // Hangup cause from the Reason header, if present.
                 if let Some((code, text)) = reason_from_raw(&msg.raw) {
@@ -75,6 +93,7 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
             {
                 call.state = CallState::Canceled;
                 call.end_ts = Some(msg.ts_us);
+                call.hangup_by.get_or_insert(HangupBy::Caller);
             }
             _ => {}
         }
@@ -98,6 +117,8 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
                 call.pdd_ms =
                     Some(((msg.ts_us - call.invite_ts.unwrap_or(msg.ts_us)) / 1000) as u32);
             }
+            // Record which provisional started the ring-back (180 vs 183 early media).
+            call.ring_code.get_or_insert(code);
             call.state = CallState::Ringing;
         } else if code >= 100 && call.trying_ts.is_none() {
             call.trying_ts = Some(msg.ts_us);
@@ -125,6 +146,9 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
             if let Some(inv) = call.invite_ts {
                 call.setup_ms = Some(((msg.ts_us - inv) / 1000) as u32);
             }
+            if let Some(r) = call.ringing_ts {
+                call.ring_ms = Some(((msg.ts_us - r) / 1000) as u32);
+            }
             call.state = CallState::Active;
             call.outcome = Outcome::Answered;
         }
@@ -148,6 +172,7 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
         if code == 487 {
             call.state = CallState::Canceled;
             call.outcome = Outcome::Canceled;
+            call.hangup_by.get_or_insert(HangupBy::Caller);
         } else if matches!(call.state, CallState::Dialing | CallState::Ringing) {
             call.state = CallState::Failed;
             call.outcome = if (400..500).contains(&code) {
@@ -155,6 +180,8 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
             } else {
                 Outcome::Failed
             };
+            // The callee side refused the INVITE.
+            call.hangup_by.get_or_insert(HangupBy::Reject);
             if call.end_ts.is_none() {
                 call.end_ts = Some(msg.ts_us);
             }
@@ -247,9 +274,11 @@ mod tests {
         apply_sip(&mut call, &mk(1_100_000, false, None, Some(180), None));
         assert_eq!(call.state, CallState::Ringing);
         assert_eq!(call.pdd_ms, Some(100));
+        assert_eq!(call.ring_code, Some(180));
         apply_sip(&mut call, &mk(1_500_000, false, None, Some(200), None));
         assert_eq!(call.state, CallState::Active);
         assert_eq!(call.setup_ms, Some(500));
+        assert_eq!(call.ring_ms, Some(400));
         let mut bye = mk(3_000_000, true, Some(Method::Bye), None, Some("x"));
         bye.cseq_method = Some("BYE".into());
         apply_sip(&mut call, &bye);
@@ -258,6 +287,77 @@ mod tests {
         apply_sip(&mut call, &bye_ok);
         assert_eq!(call.state, CallState::Completed);
         assert_eq!(call.outcome, Outcome::Answered);
+    }
+
+    #[test]
+    fn ring_code_183_and_ring_ms() {
+        let mut call = Call::new("c1".into());
+        apply_sip(
+            &mut call,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        apply_sip(&mut call, &mk(1_100_000, false, None, Some(183), None));
+        assert_eq!(call.state, CallState::Ringing);
+        assert_eq!(call.ring_code, Some(183));
+        apply_sip(&mut call, &mk(1_600_000, false, None, Some(200), None));
+        assert_eq!(call.ring_ms, Some(500));
+    }
+
+    #[test]
+    fn hangup_initiator_detection() {
+        // Caller sends the BYE.
+        let mut call = Call::new("c1".into());
+        apply_sip(
+            &mut call,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        apply_sip(&mut call, &mk(1_100_000, false, None, Some(180), None));
+        apply_sip(&mut call, &mk(1_500_000, false, None, Some(200), None));
+        let mut bye = mk(3_000_000, true, Some(Method::Bye), None, Some("x"));
+        bye.cseq_method = Some("BYE".into());
+        // BYE source = caller IP (1.1.1.1, the INVITE src).
+        apply_sip(&mut call, &bye);
+        assert_eq!(call.hangup_by, Some(HangupBy::Caller));
+
+        // Callee sends the BYE (source differs from the INVITE src).
+        let mut call2 = Call::new("c1".into());
+        apply_sip(
+            &mut call2,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        apply_sip(&mut call2, &mk(1_100_000, false, None, Some(180), None));
+        apply_sip(&mut call2, &mk(1_500_000, false, None, Some(200), None));
+        let mut bye2 = mk(3_000_000, true, Some(Method::Bye), None, Some("x"));
+        bye2.cseq_method = Some("BYE".into());
+        bye2.flow.src = "2.2.2.2:5060".parse().unwrap(); // callee side
+        apply_sip(&mut call2, &bye2);
+        assert_eq!(call2.hangup_by, Some(HangupBy::Callee));
+
+        // Cancel from the caller.
+        let mut call3 = Call::new("c1".into());
+        apply_sip(
+            &mut call3,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        apply_sip(&mut call3, &mk(1_100_000, false, None, Some(180), None));
+        apply_sip(
+            &mut call3,
+            &mk(2_000_000, true, Some(Method::Cancel), None, None),
+        );
+        assert_eq!(call3.state, CallState::Canceled);
+        assert_eq!(call3.hangup_by, Some(HangupBy::Caller));
+
+        // Reject from the callee.
+        let mut call4 = Call::new("c1".into());
+        apply_sip(
+            &mut call4,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        apply_sip(&mut call4, &mk(1_200_000, false, None, Some(486), None));
+        assert_eq!(call4.state, CallState::Failed);
+        assert_eq!(call4.outcome, Outcome::Rejected);
+        assert_eq!(call4.hangup_by, Some(HangupBy::Reject));
+        assert_eq!(call4.hangup.code, Some(486));
     }
 
     #[test]

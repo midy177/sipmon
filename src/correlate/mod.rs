@@ -20,6 +20,9 @@ pub struct Correlator {
     tcp_reasm: crate::decode::tcp_reasm::TcpReassembler,
     invite_rr: HashMap<String, bool>,
     terminal_done: std::collections::HashSet<String>,
+    /// Per-stream last-known lost count, for attributing loss deltas to the
+    /// per-IP network stats during the periodic flush.
+    last_lost: HashMap<StreamKey, u64>,
     min_severity: Severity,
     raw_truncate: Option<usize>,
     no_media: bool,
@@ -45,6 +48,7 @@ impl Correlator {
             tcp_reasm: crate::decode::tcp_reasm::TcpReassembler::new(),
             invite_rr: HashMap::new(),
             terminal_done: std::collections::HashSet::new(),
+            last_lost: HashMap::new(),
             min_severity: Severity::from_level(&config.diag_level),
             raw_truncate: config.raw_truncate,
             no_media: config.no_media,
@@ -56,6 +60,18 @@ impl Correlator {
 
     pub fn set_focus(&mut self, id: Option<String>) {
         self.reg.focus_hint = id;
+    }
+
+    /// Reset all in-memory state (TUI `x` clear): registry + correlator
+    /// bookkeeping. Evlog writing is unaffected.
+    pub fn clear(&mut self) {
+        self.reg.clear();
+        self.last_lost.clear();
+        self.invite_rr.clear();
+        self.terminal_done.clear();
+        self.pending_events.clear();
+        self.last_flush_us = None;
+        self.turn.clear();
     }
 
     /// Drain buffered evlog events (consumed by the pipeline's writer thread).
@@ -79,10 +95,23 @@ impl Correlator {
         // Periodic bounded-memory maintenance.
         self.reg.prune_heatmap();
         self.turn.prune();
-        for s in self.reg.streams.values_mut() {
+        let keys: Vec<StreamKey> = self.reg.streams.keys().copied().collect();
+        for key in keys {
+            let Some(s) = self.reg.streams.get_mut(&key) else {
+                continue;
+            };
             // Record a 5s throughput/quality sample for the waveform view.
             s.sample(ts_us);
             let sum = s.summary();
+            // Attribute the newly-observed lost packets to both endpoints of
+            // the stream in the per-IP network stats (1s bucket resolution).
+            let lost_now = sum.lost;
+            let lost_delta = lost_now.saturating_sub(self.last_lost.get(&key).copied().unwrap_or(0));
+            self.last_lost.insert(key, lost_now);
+            if lost_delta > 0 {
+                self.reg.ipstats.observe_lost(s.flow.src.ip(), ts_us, lost_delta);
+                self.reg.ipstats.observe_lost(s.flow.dst.ip(), ts_us, lost_delta);
+            }
             self.pending_events
                 .push(crate::store::evlog::Event::StreamSnap(
                     crate::store::evlog::StreamSnapEvt {
@@ -216,6 +245,9 @@ impl Correlator {
             self.invite_rr
                 .entry(call_id.clone())
                 .or_insert(msg.record_route_count > 0);
+            // Per-IP concurrent-call count (decremented at teardown).
+            self.reg.ipstats.add_active(msg.flow.src.ip(), 1);
+            self.reg.ipstats.add_active(msg.flow.dst.ip(), 1);
         }
 
         // Diagnostics that only need the message.
@@ -336,6 +368,9 @@ impl Correlator {
         len: usize,
         encap: Encap,
     ) {
+        // Per-IP network stats: attribute every packet to both endpoint IPs.
+        self.reg.ipstats.observe_packet(flow.src.ip(), ts, len);
+        self.reg.ipstats.observe_packet(flow.dst.ip(), ts, len);
         // Resolve call via SDP endpoints (two O(1) lookups).
         let Some(call_id) = self
             .reg
@@ -418,6 +453,15 @@ impl Correlator {
         if is_new {
             // New stream: register in indices and run creation-time diagnostics.
             self.reg.note_stream(&call_id, key);
+            // Remember this stream's endpoint IPs on the owning call (used by
+            // the per-IP network-stats drill-down).
+            if let Some(c) = self.reg.calls.get_mut(&call_id) {
+                for ip in [flow.src.ip(), flow.dst.ip()] {
+                    if !c.ips.contains(&ip) {
+                        c.ips.push(ip);
+                    }
+                }
+            }
             if let Some(neg) = &neg_for_new {
                 if let Some(d) =
                     rules::check_rtp_pt(ts, &call_id, header.ssrc, header.payload_type, neg)
@@ -664,6 +708,12 @@ impl Correlator {
         self.check_oneway_at_teardown(call_id);
         self.check_turn_legs(call_id);
         self.record_heatmap(call_id);
+        // Release the per-IP concurrent-call counters held by this call.
+        if let Some(c) = self.reg.calls.get(call_id) {
+            for ip in &c.active_ips {
+                self.reg.ipstats.add_active(*ip, -1);
+            }
+        }
         let terminal = self
             .reg
             .calls

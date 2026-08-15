@@ -28,6 +28,7 @@ impl Heatmap {
     }
 
     /// Record a terminated call's contributions into its (bucket, key) cell.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_call(
         &mut self,
         ts_us: u64,

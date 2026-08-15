@@ -2,6 +2,7 @@ pub mod app;
 pub mod call_detail;
 pub mod eventlog;
 pub mod heatmap;
+pub mod ipstats;
 pub mod overview;
 pub mod search;
 pub mod streams;
@@ -56,7 +57,7 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
         ),
     ]);
     let line2 = Line::from(Span::styled(
-        " Global: [Tab/Shift-Tab] pages [1-6] jump [/] search [Space] pause [e] export [b] bucket [Ctrl-C/q] quit",
+        " Global: [Tab/Shift-Tab] pages [1-7] jump [/] search [Space] pause [e] export [b] bucket [x] clear [Ctrl-C/q] quit",
         Style::default().fg(theme::MUTED),
     ));
     let line3 = if app.search_editing {
@@ -85,6 +86,7 @@ fn page_keys(page: Page) -> &'static str {
         Page::Heatmap => "[b] bucket granularity",
         Page::Streams => "[↑↓] select stream",
         Page::EventLog => "[↑↓] scroll",
+        Page::IpStats => "[↑↓] select [Enter] calls [s] sort [w] heatmap window",
     }
 }
 
@@ -98,6 +100,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Heatmap => heatmap::render(f, f.area(), &snap, app),
         Streams => streams::render(f, f.area(), &snap, app),
         EventLog => eventlog::render(f, f.area(), &snap, app),
+        IpStats => ipstats::render(f, f.area(), &snap, app),
     }
 }
 

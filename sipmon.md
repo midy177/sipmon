@@ -150,14 +150,15 @@ Top bar: source, duration, pps, packet count, lost count, pause state.
 
 | Page | Content | sngrep equivalent |
 |---|---|---|
-| **Overview** | Summary cards (active/completed/failed, avg PDD/jitter/loss, ASR) + call table | call list |
+| **Overview** | Summary cards (active/completed/failed, avg PDD/jitter/loss, ASR) + call table (PDD/setup/ring·180-183, hangup initiator) | call list |
 | **Search** | `/` searches Call-ID / From / To / remote IP / SSRC, fuzzy match, `Enter` on a result opens the call | call filter |
 | **Call Detail** | Fixed side-by-side: left **Flow** A→B chronological message table (select messages up/down); right sub-view cycled with `Tab`: ① **Raw** full headers+SDP of the selected message ② **Network** 5-tuple + SIP/RTP/RTCP packet counts + per-stream stats + RTT curve ③ **Diagnostics** call-level diagnostics | flow / message / — |
 | **Heatmap** | Grid time×remote-IP (`e` switches to time×local-endpoint); select a cell → call list in the bucket | — |
 | **Streams** | Per-RTP-stream live stats table | — |
 | **EventLog** | Tail of the own event log | — |
+| **IP Stats** | Per-IP table (concurrent calls, loss over 1s/5s/10s/20s/1m/10m/1h/all, bytes, pkts), bottom loss heatmap (`w` switches window), sort newest/max/min (`s`), `Enter` drills into the IP's calls | — |
 
-Keys: `Tab` cycles pages (inside Call Detail: cycles the right sub-view) / `1-6` direct jump / `/` search / `f` BPF filter / `Space` pause / `e` export / `b` bucket granularity / `q` quit.
+Keys: `Tab` cycles pages (inside Call Detail: cycles the right sub-view) / `1-7` direct jump / `/` search / `f` BPF filter / `Space` pause / `e` export / `b` bucket granularity / `x` clear / `q` quit.
 
 ## 6. CLI interface
 

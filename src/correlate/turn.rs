@@ -79,9 +79,15 @@ impl TurnTracker {
         }
     }
 
+    /// Reset learned state (TUI clear); configured servers are kept.
+    pub fn clear(&mut self) {
+        self.allocs.clear();
+        self.relays.clear();
+        self.pkts_turn = 0;
+    }
+
     /// Bounded-memory maintenance: cap sizes by evicting oldest allocations.
-    pub fn prune(&mut self) {
-        while self.allocs.len() > MAX_ALLOCS {
+    pub fn prune(&mut self) {        while self.allocs.len() > MAX_ALLOCS {
             let oldest = self
                 .allocs
                 .iter()

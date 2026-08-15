@@ -396,4 +396,109 @@ mod tests {
         out.extend_from_slice(&body);
         out
     }
+
+    /// A SIP message with a real SDP body (so the correlator learns the media
+    /// endpoints and can attribute subsequent RTP to the call).
+    #[allow(clippy::too_many_arguments)]
+    fn sdp_msg(ts: u64, call_id: &str, is_req: bool, method: Method, status: Option<u16>,
+               src: &str, dst: &str, sdp_ip: &str, port: u16, to_tag: bool) -> SipMsg {
+        let body = format!(
+            "v=0\r\no=- 1 1 IN IP4 {sdp_ip}\r\ns=-\r\nc=IN IP4 {sdp_ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        );
+        let start_line = if is_req {
+            format!("{} sip:x SIP/2.0", method.name())
+        } else {
+            format!("SIP/2.0 {} Something", status.unwrap_or(0))
+        };
+        let raw = format!(
+            "{start_line}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        SipMsg {
+            ts_us: ts,
+            flow: Flow5Tuple {
+                proto: Proto::Udp,
+                src: src.parse().unwrap(),
+                dst: dst.parse().unwrap(),
+            },
+            is_request: is_req,
+            method: Some(method),
+            status,
+            call_id: call_id.into(),
+            cseq: Some(1),
+            cseq_method: Some("INVITE".into()),
+            branch: Some("b".into()),
+            from_tag: Some("f".into()),
+            to_tag: to_tag.then(|| "t".to_string()),
+            from_uri: Some("<sip:a@1.1.1.1>".into()),
+            to_uri: Some("<sip:b@2.2.2.2>".into()),
+            raw: Bytes::from(raw),
+            contact_addr: None,
+            route_count: 0,
+            record_route_count: 0,
+            has_sdp: true,
+        }
+    }
+
+    /// Per-IP stats must count RTP packets against both endpoint IPs, and the
+    /// owning call must remember those IPs for the drill-down.
+    #[test]
+    fn per_ip_rtp_stats_attributed() {
+        use crate::correlate::turn::Encap;
+        use crate::decode::rtp::RtpHeader;
+        let mut corr = Correlator::new(&Config::default(), "ipstats".into());
+        let id = "ip-attr";
+        // INVITE (offer) + 200 OK (answer) with SDP, then ACK.
+        corr.ingest_sip(sdp_msg(1_000_000, id, true, Method::Invite, None,
+            "10.10.0.1:5060", "10.20.0.1:5060", "10.10.0.1", 20000, false));
+        corr.ingest_sip(sdp_msg(1_010_000, id, false, Method::Invite, Some(200),
+            "10.20.0.1:5060", "10.10.0.1:5060", "10.20.0.1", 30000, true));
+        // RTP toward the negotiated endpoints.
+        let flow = Flow5Tuple {
+            proto: Proto::Udp,
+            src: "10.10.0.1:20000".parse().unwrap(),
+            dst: "10.20.0.1:30000".parse().unwrap(),
+        };
+        for i in 0..10u16 {
+            corr.ingest_rtp(
+                1_100_000 + i as u64 * 20_000,
+                flow,
+                RtpHeader { version: 2, payload_type: 0, sequence_number: 1000 + i, timestamp: 16_000 + i as u32 * 160, ssrc: 0x1000 },
+                160,
+                Encap::Direct,
+            );
+        }
+        // Both endpoint IPs tracked with the right packet/byte counts.
+        let stats = corr.reg.ipstats.snapshot();
+        assert_eq!(stats.len(), 2, "both endpoints tracked");
+        let a = stats.iter().find(|s| s.ip == "10.10.0.1".parse::<std::net::IpAddr>().unwrap()).unwrap();
+        assert_eq!(a.pkts_total, 10);
+        assert_eq!(a.bytes_total, 1600);
+        let b = stats.iter().find(|s| s.ip == "10.20.0.1".parse::<std::net::IpAddr>().unwrap()).unwrap();
+        assert_eq!(b.pkts_total, 10);
+        // Call remembers the media IPs for the drill-down.
+        let call = corr.reg.calls.get(id).unwrap();
+        assert!(call.ips.contains(&"10.10.0.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(call.ips.contains(&"10.20.0.1".parse::<std::net::IpAddr>().unwrap()));
+        // Active-call counters for both signaling endpoints.
+        let a = stats.iter().find(|s| s.ip == "10.10.0.1".parse::<std::net::IpAddr>().unwrap()).unwrap();
+        assert_eq!(a.active_calls, 1);
+    }
+
+    /// clear() must wipe calls, streams, per-IP stats and counters.
+    #[test]
+    fn clear_resets_state() {
+        let mut corr = Correlator::new(&Config::default(), "clear".into());
+        corr.ingest_sip(sip(1_000_000, "x", Method::Invite, false));
+        corr.ingest_sip(sip(1_100_000, "x", Method::Bye, true));
+        corr.reg.ipstats.observe_packet("10.0.0.1".parse().unwrap(), 1_000_000, 100);
+        assert!(!corr.reg.calls.is_empty());
+        assert!(!corr.reg.ipstats.snapshot().is_empty());
+        corr.clear();
+        assert!(corr.reg.calls.is_empty());
+        assert!(corr.reg.order.is_empty());
+        assert_eq!(corr.reg.ipstats.snapshot().len(), 0);
+        assert_eq!(corr.reg.completed, 0);
+        assert_eq!(corr.reg.failed, 0);
+    }
 }

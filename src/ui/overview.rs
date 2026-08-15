@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
+use crate::model::sip::HangupBy;
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
 use crate::ui::{fmt_dur, fmt_ms, fmt_time, fmt_u32, theme};
@@ -55,7 +56,8 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 
     // Call table.
     let header = [
-        "Time", "From", "To", "State", "PDD", "Setup", "Dur", "MOS", "RTP", "Diag", "Call-ID",
+        "Time", "From", "To", "State", "PDD", "Setup", "Ring", "Dur", "MOS", "RTP", "Diag",
+        "End", "Call-ID",
     ];
     // Keep the highlight anchored to the same call as new calls arrive, then
     // apply the state filter (`f` cycles all/pending/success/failed/canceled).
@@ -89,10 +91,12 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             Cell::from(c.state.label()).style(state_color(c.state)),
             Cell::from(fmt_u32(c.pdd_ms)),
             Cell::from(fmt_u32(c.setup_ms)),
+            Cell::from(fmt_ring(c.ring_ms, c.ring_code)).style(ring_style(c.ring_code)),
             Cell::from(fmt_dur(c.duration_ms)),
             Cell::from(fmt_ms(c.best_mos)),
             Cell::from(c.pkts_rtp.to_string()),
             diag_cell,
+            Cell::from(fmt_end(c.hangup_by, c.hangup_code)).style(end_style(c.hangup_by)),
             Cell::from(c.call_id.clone()).style(Style::default().fg(theme::MUTED)),
         ])
     });
@@ -106,10 +110,12 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             Constraint::Length(10),
             Constraint::Length(6),
             Constraint::Length(7),
+            Constraint::Length(9),
             Constraint::Length(8),
             Constraint::Length(5),
             Constraint::Length(7),
             Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Min(10),
         ],
     )
@@ -117,7 +123,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         Row::new(header.iter().map(|h| Cell::from(*h))).style(Style::default().fg(theme::WARNING)),
     )
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Calls ({}/{}) — Enter=detail, f=filter:{}",
+        "Calls ({}/{}) — Enter=detail, f=filter:{}  [PDD=INV→ring, Setup=INV→200, Ring=dur·code]",
         visible.len(),
         snap.calls.len(),
         app.filter.label()
@@ -134,5 +140,45 @@ pub fn state_color(state: crate::model::sip::CallState) -> Style {
         Completed => Style::default().fg(theme::PRIMARY),
         Failed => Style::default().fg(theme::ERROR),
         Canceled => Style::default().fg(theme::ACCENT),
+    }
+}
+
+/// Ring column: ringing duration + the provisional code that started it
+/// (180 Ringing / 183 early media), e.g. "3.4s·183".
+fn fmt_ring(ms: Option<u32>, code: Option<u16>) -> String {
+    let t = match ms {
+        None => "-".into(),
+        Some(ms) if ms < 60_000 => format!("{}.{}s", ms / 1000, (ms % 1000) / 100),
+        Some(ms) => format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1000),
+    };
+    match code {
+        Some(c) => format!("{t}·{c}"),
+        None => t,
+    }
+}
+
+fn ring_style(code: Option<u16>) -> Style {
+    // 183 = early media, worth highlighting.
+    match code {
+        Some(183) => Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        _ => Style::default(),
+    }
+}
+
+/// End column: who initiated the hangup (caller/callee BYE, cancel, reject).
+fn fmt_end(by: Option<HangupBy>, code: Option<u32>) -> String {
+    match (by, code) {
+        (Some(b), Some(code)) if b == HangupBy::Reject => format!("{}·{code}", b.label()),
+        (Some(b), _) => b.label().to_string(),
+        (None, Some(code)) => format!("{code}"),
+        (None, None) => "-".into(),
+    }
+}
+
+fn end_style(by: Option<HangupBy>) -> Style {
+    match by {
+        Some(HangupBy::Reject) | Some(HangupBy::Cancel) => Style::default().fg(theme::ERROR),
+        Some(HangupBy::Caller) | Some(HangupBy::Callee) => Style::default().fg(theme::MUTED),
+        None => Style::default(),
     }
 }

@@ -287,6 +287,17 @@ def build_call_events(rng, call, base_ip_a, base_ip_b, t0, talk_s, loss_p, reord
     ev.append((t0, eth_ip_udp(invite, ip_a, ip_b, sip_a, sip_b)))
     ev.append((t0 + 2_000, eth_ip_udp(
         sip_msg(["SIP/2.0 100 Trying", f"Call-ID: {call_id}", "CSeq: 1 INVITE"]), ip_b, ip_a, sip_b, sip_a)))
+    # Ring-back provisional: 180 Ringing for even calls, 183 Session Progress
+    # (early media) for odd calls — exercises PDD/ring timing + ring-code tag.
+    ring_code = 180 if call % 2 == 0 else 183
+    ev.append((t0 + 6_000, eth_ip_udp(
+        sip_msg([
+            f"SIP/2.0 {ring_code} " + ("Ringing" if ring_code == 180 else "Session Progress"),
+            f"Via: SIP/2.0/UDP {ip_a}:{sip_a};branch={branch_i}",
+            f"From: <sip:caller{call}@load.test>;tag={tag_a}",
+            f"To: <sip:callee{call}@load.test>;tag={tag_b}",
+            f"Call-ID: {call_id}", "CSeq: 1 INVITE",
+        ]), ip_b, ip_a, sip_b, sip_a)))
     ok200 = sip_msg(
         [
             "SIP/2.0 200 OK",
