@@ -22,9 +22,28 @@ pub struct NegotiatedMedia {
     pub codecs: Vec<String>,
 }
 
+/// One periodic (5s) throughput/quality sample for a stream.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct RatePoint {
+    /// End of the sample window (unix microseconds).
+    pub ts_us: u64,
+    /// Bytes of RTP observed within the window.
+    pub bytes: u64,
+    /// Packets observed within the window.
+    pub packets: u64,
+    /// Cumulative loss % at this point.
+    pub loss_pct: f64,
+    /// Cumulative jitter at this point.
+    pub jitter_ms: Option<f64>,
+    /// Cumulative MOS estimate at this point.
+    pub mos: Option<f64>,
+}
+
 /// Final summary for a single RTP stream, computed at snapshot/teardown.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct StreamSummary {
+    /// Owning call (if known at snapshot time).
+    pub call_id: Option<String>,
     pub ssrc: u32,
     pub flow: Option<Flow5Tuple>,
     pub codec: Option<String>,
@@ -34,6 +53,8 @@ pub struct StreamSummary {
     pub expected: u64,
     pub loss_pct: f64,
     pub jitter_ms: Option<f64>,
+    pub first_ts_us: Option<u64>,
+    pub last_ts_us: Option<u64>,
     pub rtt_min_ms: Option<f64>,
     pub rtt_avg_ms: Option<f64>,
     pub rtt_max_ms: Option<f64>,
@@ -44,4 +65,8 @@ pub struct StreamSummary {
     pub leg: Option<String>,
     /// True if this stream traversed a learned TURN relay.
     pub via_turn: bool,
+    /// Cumulative RTP bytes observed.
+    pub bytes: u64,
+    /// Periodic 5s throughput/quality samples (oldest first, capped).
+    pub history: Vec<RatePoint>,
 }

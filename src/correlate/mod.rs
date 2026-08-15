@@ -79,7 +79,9 @@ impl Correlator {
         // Periodic bounded-memory maintenance.
         self.reg.prune_heatmap();
         self.turn.prune();
-        for s in self.reg.streams.values() {
+        for s in self.reg.streams.values_mut() {
+            // Record a 5s throughput/quality sample for the waveform view.
+            s.sample(ts_us);
             let sum = s.summary();
             self.pending_events
                 .push(crate::store::evlog::Event::StreamSnap(
@@ -144,7 +146,7 @@ impl Correlator {
         match rtpp::classify(payload) {
             rtpp::MediaKind::Rtp => {
                 if let Some(h) = rtpp::parse_rtp_header(payload) {
-                    self.ingest_rtp(ts, flow, h, Encap::Direct);
+                    self.ingest_rtp(ts, flow, h, payload.len(), Encap::Direct);
                 }
             }
             rtpp::MediaKind::Rtcp => {
@@ -177,7 +179,7 @@ impl Correlator {
         match rtpp::classify(bytes) {
             rtpp::MediaKind::Rtp => {
                 if let Some(h) = rtpp::parse_rtp_header(bytes) {
-                    self.ingest_rtp(ts, flow, h, encap);
+                    self.ingest_rtp(ts, flow, h, bytes.len(), encap);
                 }
             }
             rtpp::MediaKind::Rtcp => {
@@ -326,7 +328,14 @@ impl Correlator {
 
     // ----------------------------- RTP -----------------------------
 
-    pub fn ingest_rtp(&mut self, ts: u64, flow: Flow5Tuple, header: rtpp::RtpHeader, encap: Encap) {
+    pub fn ingest_rtp(
+        &mut self,
+        ts: u64,
+        flow: Flow5Tuple,
+        header: rtpp::RtpHeader,
+        len: usize,
+        encap: Encap,
+    ) {
         // Resolve call via SDP endpoints (two O(1) lookups).
         let Some(call_id) = self
             .reg
@@ -395,7 +404,7 @@ impl Correlator {
                     stream.via_turn = true;
                 }
             }
-            stream.observe(ts, header);
+            stream.observe(ts, header, len);
             if reverse_exists {
                 stream.reverse_seen = true;
             }

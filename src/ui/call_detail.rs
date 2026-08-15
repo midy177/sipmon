@@ -1,13 +1,18 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{
+    Axis, Block, Borders, Cell, Chart, Dataset, GraphType, LegendPosition, Paragraph, Row, Table,
+    Tabs,
+};
 
+use crate::model::media::StreamSummary;
 use crate::model::sip::{Method, SipMsg};
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
-use crate::ui::{fmt_ms, fmt_time};
+use crate::ui::{fmt_bytes, fmt_ms, fmt_rate, fmt_time, theme};
 
 /// Right-pane sub-views (selected message vs call-level content).
 const TABS: [&str; 3] = ["Raw", "Network", "Diagnostics"];
@@ -45,13 +50,39 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             ""
         },
     );
-    let p = Paragraph::new(Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    f.render_widget(p, chunks[1]);
+    let caller = format!(
+        "{} @ {}",
+        focus.caller_ua.as_deref().unwrap_or("?"),
+        focus
+            .caller_addr
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "?".into())
+    );
+    let callee = format!(
+        "{} @ {}",
+        focus.callee_ua.as_deref().unwrap_or("?"),
+        focus
+            .callee_addr
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "?".into())
+    );
+    let lines = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(theme::INFO)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Caller ← {}", caller),
+            Style::default().fg(theme::SUCCESS),
+        )),
+        Line::from(Span::styled(
+            format!("Callee → {}", callee),
+            Style::default().fg(theme::WARNING),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), chunks[1]);
 
     // Fixed left-right split: left = flow list, right = selected-message / call detail.
     let cols = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -63,7 +94,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         .select(app.detail_tab)
         .highlight_style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::WARNING)
                 .add_modifier(Modifier::BOLD),
         )
         .block(Block::default().borders(Borders::ALL));
@@ -115,15 +146,15 @@ fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
         let label = label_of(m);
         let style = if m.is_request {
             match m.method {
-                Some(Method::Invite) => Style::default().fg(Color::Green),
-                Some(Method::Bye) | Some(Method::Cancel) => Style::default().fg(Color::Red),
-                _ => Style::default().fg(Color::Cyan),
+                Some(Method::Invite) => Style::default().fg(theme::SUCCESS),
+                Some(Method::Bye) | Some(Method::Cancel) => Style::default().fg(theme::ERROR),
+                _ => Style::default().fg(theme::INFO),
             }
         } else {
             match m.status {
-                Some(s) if (200..300).contains(&s) => Style::default().fg(Color::Green),
-                Some(s) if s >= 300 => Style::default().fg(Color::Red),
-                _ => Style::default().fg(Color::Yellow),
+                Some(s) if (200..300).contains(&s) => Style::default().fg(theme::SUCCESS),
+                Some(s) if s >= 300 => Style::default().fg(theme::ERROR),
+                _ => Style::default().fg(theme::WARNING),
             }
         };
         Row::new(vec![
@@ -135,7 +166,6 @@ fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
                 short(&m.flow.dst.to_string())
             )),
             Cell::from(label).style(style),
-            Cell::from(m.call_id.clone()).style(Style::default().fg(Color::DarkGray)),
         ])
     });
     let table = Table::new(
@@ -144,12 +174,11 @@ fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(24),
-            Constraint::Length(20),
-            Constraint::Min(12),
+            Constraint::Min(20),
         ],
     )
     .header(Row::new(
-        ["Time", "Rel ms", "Src→Dst", "Msg", "Call-ID"]
+        ["Time", "Rel ms", "Src→Dst", "Msg"]
             .iter()
             .map(|h| Cell::from(*h)),
     ))
@@ -158,7 +187,7 @@ fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
             .borders(Borders::ALL)
             .title(format!("Flow ({} msgs)", messages.len())),
     )
-    .row_highlight_style(Style::default().bg(Color::DarkGray));
+    .row_highlight_style(Style::default().bg(theme::MUTED));
     f.render_stateful_widget(table, area, &mut app.flow_state);
 }
 
@@ -191,7 +220,61 @@ fn render_raw(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
 }
 
 fn render_network(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus) {
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).split(area);
+    let chunks = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(0),
+        Constraint::Length(10),
+    ])
+    .split(area);
+
+    // Cumulative TX/RX bytes + average rates, split by the caller side.
+    let caller = focus.caller_addr;
+    let mut tx_bytes = 0u64;
+    let mut rx_bytes = 0u64;
+    let mut tx_rate = 0.0f64;
+    let mut rx_rate = 0.0f64;
+    for s in &focus.streams {
+        let rate = stream_bytes_per_sec(s);
+        if s.flow.map(|fl| fl.src) == caller {
+            tx_bytes += s.bytes;
+            tx_rate += rate;
+        } else {
+            rx_bytes += s.bytes;
+            rx_rate += rate;
+        }
+    }
+    let neg = focus
+        .negotiated_endpoints
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let totals = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!(
+                "↑ TX {} @ {}    ↓ RX {} @ {}",
+                fmt_bytes(tx_bytes),
+                fmt_rate(tx_rate),
+                fmt_bytes(rx_bytes),
+                fmt_rate(rx_rate)
+            ),
+            Style::default().fg(theme::SUCCESS),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "SDP endpoints: {}   SIP msgs: {}",
+                if neg.is_empty() { "-" } else { &neg },
+                focus.messages.len()
+            ),
+            Style::default().fg(theme::MUTED),
+        )),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Traffic (TX=caller side)"),
+    );
+    f.render_widget(totals, chunks[0]);
 
     let rows = focus.streams.iter().map(|s| {
         let leg = match (s.via_turn, s.leg.as_deref()) {
@@ -207,33 +290,39 @@ fn render_network(f: &mut Frame, area: Rect, focus: &crate::store::registry::Foc
                 short(&s.flow.map(|f| f.src.to_string()).unwrap_or_default()),
                 short(&s.flow.map(|f| f.dst.to_string()).unwrap_or_default())
             )),
-            Cell::from(leg).style(Style::default().fg(Color::Magenta)),
+            Cell::from(leg).style(Style::default().fg(theme::ACCENT)),
             Cell::from(s.packets.to_string()),
             Cell::from(s.lost.to_string()),
             Cell::from(format!("{:.1}", s.loss_pct)),
             Cell::from(fmt_ms(s.jitter_ms)),
             Cell::from(fmt_ms(s.rtt_avg_ms)),
             Cell::from(fmt_ms(s.mos)),
+            Cell::from(fmt_bytes(s.bytes)),
+            Cell::from(fmt_rate(stream_bytes_per_sec(s))),
         ])
     });
     let table = Table::new(
         rows,
         [
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(26),
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Length(7),
+            Constraint::Length(11),
             Constraint::Length(9),
-            Constraint::Length(9),
+            Constraint::Length(22),
+            Constraint::Length(10),
             Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Length(10),
         ],
     )
+    .column_spacing(1)
     .header(Row::new(
         [
             "SSRC", "Codec", "Flow", "Leg", "Pkts", "Lost", "Loss%", "Jitter", "RTT", "MOS",
+            "Bytes", "Rate",
         ]
         .iter()
         .map(|h| Cell::from(*h)),
@@ -243,23 +332,100 @@ fn render_network(f: &mut Frame, area: Rect, focus: &crate::store::registry::Foc
             .borders(Borders::ALL)
             .title("Media streams (Leg: turn-client/turn-peer = TURN-relayed)"),
     );
-    f.render_widget(table, chunks[0]);
+    f.render_widget(table, chunks[1]);
 
-    let neg = focus
-        .negotiated_endpoints
+    render_waveform(f, chunks[2], focus);
+}
+
+/// Per-stream average rate (bytes/sec) over its observed lifetime.
+fn stream_bytes_per_sec(s: &StreamSummary) -> f64 {
+    match (s.bytes, s.first_ts_us, s.last_ts_us) {
+        (b, Some(a), Some(z)) if z > a => b as f64 / ((z - a) as f64 / 1_000_000.0),
+        _ => 0.0,
+    }
+}
+
+/// Bidirectional throughput waveform: one series per stream, plotted from the
+/// per-stream 5s sample history (KB/s).
+type Series = (String, Vec<(f64, f64)>, Color);
+
+fn render_waveform(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus) {
+    const COLORS: [Color; 6] = [
+        theme::SUCCESS,
+        theme::ERROR,
+        theme::WARNING,
+        theme::INFO,
+        theme::ACCENT,
+        theme::PRIMARY,
+    ];
+    const WINDOW_US: f64 = 5_000_000.0;
+
+    let mut series: Vec<Series> = Vec::new();
+    let mut x_max = 1.0f64;
+    let mut y_max = 1.0f64;
+    for (i, s) in focus.streams.iter().enumerate() {
+        if s.history.is_empty() {
+            continue;
+        }
+        let start = s.history[0].ts_us;
+        let mut pts = Vec::with_capacity(s.history.len());
+        for (j, h) in s.history.iter().enumerate() {
+            let x = (h.ts_us.saturating_sub(start)) as f64 / 1_000_000.0;
+            let dt_us = if j == 0 {
+                WINDOW_US
+            } else {
+                h.ts_us.saturating_sub(s.history[j - 1].ts_us).max(1) as f64
+            };
+            let kbps = h.bytes as f64 / (dt_us / 1_000_000.0) / 1024.0;
+            x_max = x_max.max(x);
+            y_max = y_max.max(kbps);
+            pts.push((x, kbps));
+        }
+        let cur = pts.last().map(|p| p.1).unwrap_or(0.0);
+        let label = match s.flow {
+            Some(fl) => format!(
+                "{}→{} {:.0}KB/s",
+                short(&fl.src.to_string()),
+                short(&fl.dst.to_string()),
+                cur
+            ),
+            None => format!("{:#x}", s.ssrc),
+        };
+        series.push((label, pts, COLORS[i % COLORS.len()]));
+    }
+
+    let datasets: Vec<Dataset> = series
         .iter()
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let info = Paragraph::new(vec![
-        Line::from(Span::styled(
-            format!("SDP endpoints: {}", if neg.is_empty() { "-" } else { &neg }),
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(format!("SIP msgs: {}", focus.messages.len())),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Negotiated"));
-    f.render_widget(info, chunks[1]);
+        .map(|(name, pts, color)| {
+            Dataset::default()
+                .name(name.as_str())
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(*color))
+                .data(pts.as_slice())
+        })
+        .collect();
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Throughput KB/s (5s buckets)"),
+        )
+        .x_axis(
+            Axis::default()
+                .title(Span::styled("elapsed s", Style::default().fg(theme::MUTED)))
+                .style(Style::default().fg(theme::MUTED))
+                .bounds([0.0, x_max]),
+        )
+        .y_axis(
+            Axis::default()
+                .title(Span::styled("KB/s", Style::default().fg(theme::MUTED)))
+                .style(Style::default().fg(theme::MUTED))
+                .bounds([0.0, y_max]),
+        )
+        .legend_position(Some(LegendPosition::TopLeft));
+    f.render_widget(chart, area);
 }
 
 fn render_diag(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus) {
@@ -268,9 +434,9 @@ fn render_diag(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus)
         .iter()
         .map(|d| {
             let color = match d.severity {
-                crate::diagnostics::Severity::Critical => Color::Red,
-                crate::diagnostics::Severity::Warn => Color::Yellow,
-                crate::diagnostics::Severity::Info => Color::Gray,
+                crate::diagnostics::Severity::Critical => theme::ERROR,
+                crate::diagnostics::Severity::Warn => theme::WARNING,
+                crate::diagnostics::Severity::Info => theme::MUTED,
             };
             Line::from(Span::styled(
                 format!(

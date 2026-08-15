@@ -830,6 +830,10 @@ fn build_jsonl_focus(
         state: Some(call.state),
         from_user: call.from_user.clone(),
         to_user: call.to_user.clone(),
+        caller_ua: None,
+        callee_ua: None,
+        caller_addr: None,
+        callee_addr: None,
         messages: Vec::new(),
         streams: Vec::new(),
         diagnostics: base
@@ -934,6 +938,7 @@ fn run_export(
             Event::StreamSnap(e) => {
                 if in_range(e.ts_us) {
                     streams_extra.push(model::media::StreamSummary {
+                        call_id: Some(e.call_id.clone()),
                         ssrc: e.ssrc,
                         flow: Some(e.flow),
                         codec: e.codec.clone(),
@@ -943,6 +948,8 @@ fn run_export(
                         expected: e.expected,
                         loss_pct: e.loss_pct,
                         jitter_ms: e.jitter_ms,
+                        first_ts_us: None,
+                        last_ts_us: None,
                         rtt_min_ms: None,
                         rtt_avg_ms: None,
                         rtt_max_ms: None,
@@ -951,6 +958,8 @@ fn run_export(
                         direction: e.direction.clone(),
                         leg: None,
                         via_turn: false,
+                        bytes: 0,
+                        history: Vec::new(),
                     });
                 }
             }

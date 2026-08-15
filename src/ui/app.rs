@@ -5,7 +5,53 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
 
-use crate::store::registry::Snapshot;
+use crate::model::sip::CallState;
+use crate::store::registry::{CallSummary, Snapshot};
+
+/// Overview call-list filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallFilter {
+    All,
+    Pending,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+impl CallFilter {
+    pub const ALL: [CallFilter; 5] = [
+        CallFilter::All,
+        CallFilter::Pending,
+        CallFilter::Completed,
+        CallFilter::Failed,
+        CallFilter::Canceled,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            CallFilter::All => "all",
+            CallFilter::Pending => "pending",
+            CallFilter::Completed => "success",
+            CallFilter::Failed => "failed",
+            CallFilter::Canceled => "canceled",
+        }
+    }
+    pub fn matches(self, s: CallState) -> bool {
+        match self {
+            CallFilter::All => true,
+            CallFilter::Pending => matches!(
+                s,
+                CallState::Dialing | CallState::Ringing | CallState::Active
+            ),
+            CallFilter::Completed => s == CallState::Completed,
+            CallFilter::Failed => s == CallState::Failed,
+            CallFilter::Canceled => s == CallState::Canceled,
+        }
+    }
+    pub fn next(self) -> CallFilter {
+        let i = Self::ALL.iter().position(|&x| x == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -51,6 +97,10 @@ pub struct App {
     /// has not republished into the snapshot yet — used to avoid a misleading
     /// "No call selected" flash on the Call Detail page.
     pub focus_pending: Option<String>,
+    /// Call-id currently selected in the Overview table (anchored so new calls
+    /// don't shift the highlight).
+    pub selected_call: Option<String>,
+    pub filter: CallFilter,
     pub streams_state: TableState,
     pub eventlog_scroll: u16,
     pub detail_tab: usize, // right pane: 0=Raw 1=Network 2=Diagnostics
@@ -78,6 +128,8 @@ impl App {
             search_state: TableState::default(),
             table_state: TableState::default(),
             focus_pending: None,
+            selected_call: None,
+            filter: CallFilter::All,
             streams_state: TableState::default(),
             eventlog_scroll: 0,
             detail_tab: 0,
@@ -197,6 +249,10 @@ impl App {
                 };
                 self.set_status(format!("bucket = {}s", self.bucket_secs));
             }
+            KeyCode::Char('f') => {
+                self.filter = self.filter.next();
+                self.set_status(format!("filter = {}", self.filter.label()));
+            }
             _ => self.page_key(code),
         }
     }
@@ -220,6 +276,7 @@ impl App {
     /// page. `focus_pending` hides the "No call selected" placeholder until the
     /// pipeline republishes the snapshot with the focused detail.
     fn open_detail(&mut self, call_id: String) {
+        self.selected_call = Some(call_id.clone());
         if let Ok(mut f) = self.focus_id.lock() {
             *f = Some(call_id.clone());
         }
@@ -229,21 +286,60 @@ impl App {
         self.raw_scroll = 0;
     }
 
+    /// Calls currently visible under `filter`, in display order.
+    fn filtered_calls<'a>(&self, snap: &'a Snapshot) -> Vec<&'a CallSummary> {
+        snap.calls
+            .iter()
+            .filter(|c| self.filter.matches(c.state))
+            .collect()
+    }
+
+    /// Re-anchor the Overview selection to `selected_call`, which is stable
+    /// across list reorderings/insertions (new calls only shift the index).
+    /// Called from the render path only.
+    pub fn anchor_overview_selection(&mut self, snap: &Snapshot) {
+        let visible = self.filtered_calls(snap);
+        if let Some(id) = self.selected_call.clone() {
+            self.table_state
+                .select(visible.iter().position(|c| c.call_id == id));
+        } else if let Some(i) = self.table_state.selected() {
+            self.selected_call = visible.get(i).map(|c| c.call_id.clone());
+        }
+    }
+
+    /// Record the call-id at the current table index as the selection anchor.
+    /// Called right after Up/Down so subsequent anchors follow the new row.
+    fn sync_overview_selection(&mut self, snap: &Snapshot) {
+        let visible = self.filtered_calls(snap);
+        self.selected_call = self
+            .table_state
+            .selected()
+            .and_then(|i| visible.get(i))
+            .map(|c| c.call_id.clone());
+    }
+
     fn page_key(&mut self, code: KeyCode) {
         let snap = self.snapshot();
         match self.page {
             Page::Overview => match code {
-                KeyCode::Down => self.table_state.select_next(),
-                KeyCode::Up => self.table_state.select_previous(),
+                KeyCode::Down => {
+                    self.table_state.select_next();
+                    self.sync_overview_selection(&snap);
+                }
+                KeyCode::Up => {
+                    self.table_state.select_previous();
+                    self.sync_overview_selection(&snap);
+                }
                 KeyCode::Enter => {
                     // Enter opens the selected call (first row when none is
                     // selected yet).
+                    let visible = self.filtered_calls(&snap);
                     let idx = self
                         .table_state
                         .selected()
-                        .or_else(|| (!snap.calls.is_empty()).then_some(0));
+                        .or_else(|| (!visible.is_empty()).then_some(0));
                     if let Some(i) = idx
-                        && let Some(c) = snap.calls.get(i)
+                        && let Some(c) = visible.get(i)
                     {
                         self.open_detail(c.call_id.clone());
                     }

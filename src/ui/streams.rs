@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
-use crate::ui::fmt_ms;
+use crate::ui::{fmt_ms, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
@@ -62,6 +62,6 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             .borders(Borders::ALL)
             .title(format!("RTP streams ({})", streams.len())),
     )
-    .row_highlight_style(Style::default().bg(ratatui::style::Color::DarkGray));
+    .row_highlight_style(Style::default().bg(theme::MUTED));
     f.render_stateful_widget(table, chunks[1], &mut app.streams_state);
 }

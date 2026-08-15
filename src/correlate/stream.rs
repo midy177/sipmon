@@ -1,7 +1,11 @@
 use crate::analyze::media_stats::{MediaStats, MediaStatsAccumulator};
 use crate::analyze::mos;
-use crate::model::media::StreamSummary;
+use crate::model::media::{RatePoint, StreamSummary};
 use crate::model::packet::Flow5Tuple;
+
+/// Periodic sample window (capture microseconds) and retention cap.
+const SAMPLE_WINDOW_US: u64 = 5_000_000;
+const MAX_SAMPLES: usize = 120; // 5s x 120 = 10 minutes
 
 /// One observed RTP stream (directed flow + ssrc).
 #[allow(dead_code)]
@@ -24,6 +28,12 @@ pub struct RtpStream {
     /// TURN relay leg (client/peer) if this stream traverses a relay.
     pub leg: Option<crate::correlate::turn::Leg>,
     pub via_turn: bool,
+    /// Cumulative RTP bytes observed.
+    pub bytes: u64,
+    /// Periodic 5s throughput/quality samples (oldest first, capped).
+    pub history: Vec<RatePoint>,
+    last_sample_bytes: u64,
+    last_sample_packets: u64,
 }
 
 impl RtpStream {
@@ -45,14 +55,19 @@ impl RtpStream {
             reverse_seen: false,
             leg: None,
             via_turn: false,
+            bytes: 0,
+            history: Vec::new(),
+            last_sample_bytes: 0,
+            last_sample_packets: 0,
         }
     }
 
-    pub fn observe(&mut self, ts_us: u64, header: crate::decode::rtp::RtpHeader) {
+    pub fn observe(&mut self, ts_us: u64, header: crate::decode::rtp::RtpHeader, len: usize) {
         if self.first_ts_us.is_none() {
             self.first_ts_us = Some(ts_us);
         }
         self.last_ts_us = Some(ts_us);
+        self.bytes += len as u64;
         let stats_header = crate::analyze::media_stats::RtpStatsHeader {
             payload_type: header.payload_type,
             sequence_number: header.sequence_number,
@@ -66,6 +81,39 @@ impl RtpStream {
             ));
         self.acc.observe(ts_us, Some(stats_header));
         self.last_pt = Some(header.payload_type);
+    }
+
+    /// Append a 5s throughput/quality sample (at most one per window).
+    pub fn sample(&mut self, ts_us: u64) {
+        if self
+            .history
+            .last()
+            .is_some_and(|h| ts_us.saturating_sub(h.ts_us) < SAMPLE_WINDOW_US)
+        {
+            return;
+        }
+        let st = self.acc.snapshot();
+        let oneway =
+            mean(&self.oneway_samples).or_else(|| mean(&self.rtt_samples).map(|r| r / 2.0));
+        self.history.push(RatePoint {
+            ts_us,
+            bytes: self.bytes.saturating_sub(self.last_sample_bytes),
+            packets: st.packet_count.saturating_sub(self.last_sample_packets),
+            loss_pct: st.loss_percent,
+            jitter_ms: st.jitter_ms,
+            mos: mos::estimate_mos(
+                self.codec.as_deref(),
+                self.payload_type,
+                st.loss_percent,
+                oneway,
+                st.jitter_ms,
+            ),
+        });
+        if self.history.len() > MAX_SAMPLES {
+            self.history.remove(0);
+        }
+        self.last_sample_bytes = self.bytes;
+        self.last_sample_packets = st.packet_count;
     }
 
     pub fn snapshot_stats(&self) -> MediaStats {
@@ -90,6 +138,7 @@ impl RtpStream {
             st.jitter_ms,
         );
         StreamSummary {
+            call_id: Some(self.call_id.clone()),
             ssrc: self.ssrc,
             flow: Some(self.flow),
             codec: self.codec.clone(),
@@ -99,6 +148,8 @@ impl RtpStream {
             expected: st.expected_packets,
             loss_pct: st.loss_percent,
             jitter_ms: st.jitter_ms,
+            first_ts_us: self.first_ts_us,
+            last_ts_us: self.last_ts_us,
             rtt_min_ms: rtt_min,
             rtt_avg_ms: rtt_avg,
             rtt_max_ms: rtt_max,
@@ -107,6 +158,8 @@ impl RtpStream {
             direction: self.direction.clone(),
             leg: self.leg.map(|l| l.label().to_string()),
             via_turn: self.via_turn,
+            bytes: self.bytes,
+            history: self.history.clone(),
         }
     }
 }

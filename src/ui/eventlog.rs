@@ -1,11 +1,12 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
+use crate::ui::theme;
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
@@ -26,7 +27,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     } else {
         lines
     })
-    .style(Style::default().fg(Color::Gray))
+    .style(Style::default().fg(theme::MUTED))
     .block(
         Block::default()
             .borders(Borders::ALL)

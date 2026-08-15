@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::diagnostics::Diagnostic;
 use crate::model::media::StreamSummary;
-use crate::model::sip::{Call, CallState, Outcome, SipMsg};
+use crate::model::sip::{Call, CallState, Method, Outcome, SipMsg};
 
 /// Focused-call detail payload for the Call Detail page.
 #[derive(Debug, Clone, Default)]
@@ -11,6 +11,14 @@ pub struct Focus {
     pub state: Option<CallState>,
     pub from_user: Option<String>,
     pub to_user: Option<String>,
+    /// Caller-side UA string (User-Agent of the initial INVITE).
+    pub caller_ua: Option<String>,
+    /// Callee-side UA string (Server/User-Agent of the first response).
+    pub callee_ua: Option<String>,
+    /// Caller signaling address (src of the initial INVITE).
+    pub caller_addr: Option<std::net::SocketAddr>,
+    /// Callee signaling address (src of the first response).
+    pub callee_addr: Option<std::net::SocketAddr>,
     pub messages: Vec<SipMsg>,
     pub streams: Vec<StreamSummary>,
     pub diagnostics: Vec<Diagnostic>,
@@ -469,6 +477,18 @@ impl Registry {
         } else {
             call.messages.clone()
         };
+        // Party identities from the SIP messages: the initial INVITE identifies
+        // the caller, the first response identifies the callee.
+        let invite = msgs.iter().find(|m| {
+            m.is_request && matches!(m.method, Some(Method::Invite)) && m.to_tag.is_none()
+        });
+        let response = msgs.iter().find(|m| !m.is_request);
+        let caller_ua = invite.and_then(|m| sip_header(&m.raw, "User-Agent"));
+        let callee_ua = response
+            .and_then(|m| sip_header(&m.raw, "Server"))
+            .or_else(|| response.and_then(|m| sip_header(&m.raw, "User-Agent")));
+        let caller_addr = invite.map(|m| m.flow.src);
+        let callee_addr = response.map(|m| m.flow.src);
         let streams = self
             .call_stream_keys(call_id)
             .iter()
@@ -486,6 +506,10 @@ impl Registry {
             state: Some(call.state),
             from_user: call.from_user.clone(),
             to_user: call.to_user.clone(),
+            caller_ua,
+            callee_ua,
+            caller_addr,
+            callee_addr,
             messages: msgs,
             streams,
             diagnostics,
@@ -529,4 +553,15 @@ impl Registry {
     pub fn call_messages(&self, call_id: &str) -> Option<&[crate::model::sip::SipMsg]> {
         self.calls.get(call_id).map(|c| c.messages.as_slice())
     }
+}
+
+/// Extract the value of a single-line SIP header from raw message bytes.
+fn sip_header(raw: &[u8], name: &str) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    text.lines().find_map(|line| {
+        let (n, v) = line.split_once(':')?;
+        n.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| v.trim().to_string())
+    })
 }

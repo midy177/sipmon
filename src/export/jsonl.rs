@@ -43,6 +43,7 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
     for s in &snap.streams {
         let line = json!({
             "kind": "stream",
+            "call_id": s.call_id,
             "ssrc": format!("{:#x}", s.ssrc),
             "flow_src": s.flow.map(|f| f.src.to_string()),
             "flow_dst": s.flow.map(|f| f.dst.to_string()),
@@ -50,6 +51,7 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
             "pt": s.payload_type,
             "packets": s.packets,
             "lost": s.lost,
+            "bytes": s.bytes,
             "loss_pct": round2(s.loss_pct),
             "jitter_ms": s.jitter_ms.map(round2),
             "rtt_avg_ms": s.rtt_avg_ms.map(round2),
@@ -258,6 +260,7 @@ fn import_stream(v: &Value) -> StreamSummary {
     let packets = v.get("packets").and_then(|x| x.as_u64()).unwrap_or(0);
     let lost = v.get("lost").and_then(|x| x.as_u64()).unwrap_or(0);
     StreamSummary {
+        call_id: opt_str(v, "call_id"),
         ssrc: parse_ssrc(v),
         flow,
         codec: opt_str(v, "codec"),
@@ -267,6 +270,8 @@ fn import_stream(v: &Value) -> StreamSummary {
         expected: packets + lost,
         loss_pct: v.get("loss_pct").and_then(|x| x.as_f64()).unwrap_or(0.0),
         jitter_ms: opt_f64(v, "jitter_ms"),
+        first_ts_us: None,
+        last_ts_us: None,
         rtt_min_ms: None,
         rtt_avg_ms: opt_f64(v, "rtt_avg_ms"),
         rtt_max_ms: None,
@@ -275,6 +280,8 @@ fn import_stream(v: &Value) -> StreamSummary {
         direction: opt_str(v, "direction"),
         leg: opt_str(v, "leg"),
         via_turn: v.get("via_turn").and_then(|x| x.as_bool()).unwrap_or(false),
+        bytes: v.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0),
+        history: Vec::new(),
     }
 }
 
@@ -352,6 +359,7 @@ mod tests {
             via_turn: false,
         });
         snap.streams.push(StreamSummary {
+            call_id: Some("abc@x".into()),
             ssrc: 0xdeadbeef,
             flow: Some(Flow5Tuple {
                 proto: Proto::Udp,
@@ -365,6 +373,8 @@ mod tests {
             expected: 102,
             loss_pct: 2.0,
             jitter_ms: Some(1.5),
+            first_ts_us: None,
+            last_ts_us: None,
             rtt_min_ms: None,
             rtt_avg_ms: Some(12.3),
             rtt_max_ms: None,
@@ -373,6 +383,8 @@ mod tests {
             direction: Some("sendrecv".into()),
             leg: None,
             via_turn: false,
+            bytes: 0,
+            history: Vec::new(),
         });
         snap.diagnostics.push(Diagnostic {
             ts_us: 1_001_000,
@@ -400,6 +412,7 @@ mod tests {
         assert_eq!(loaded.calls[0].state, CallState::Completed);
         assert_eq!(loaded.calls[0].pdd_ms, Some(150));
         assert_eq!(loaded.streams.len(), 1);
+        assert_eq!(loaded.streams[0].call_id.as_deref(), Some("abc@x"));
         assert_eq!(loaded.streams[0].ssrc, 0xdeadbeef);
         assert_eq!(loaded.streams[0].codec.as_deref(), Some("PCMU"));
         assert_eq!(loaded.diagnostics.len(), 1);

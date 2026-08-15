@@ -1,11 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
-use crate::ui::fmt_time;
+use crate::ui::{fmt_time, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let mut area = area;
@@ -46,16 +46,16 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             if let Some((_, _, m)) = snap.buckets.iter().find(|(bb, kk, _)| kk == k && bb == b) {
                 let asr = m.asr();
                 let style = if asr >= 95.0 {
-                    Style::default().fg(Color::Green)
+                    Style::default().fg(theme::SUCCESS)
                 } else if asr >= 80.0 {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(theme::WARNING)
                 } else {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(theme::ERROR)
                 };
                 let cell = format!("{:.0}%", asr);
                 cells.push(Cell::from(cell).style(style));
             } else {
-                cells.push(Cell::from("·").style(Style::default().fg(Color::DarkGray)));
+                cells.push(Cell::from("·").style(Style::default().fg(theme::MUTED)));
             }
         }
         Row::new(cells)

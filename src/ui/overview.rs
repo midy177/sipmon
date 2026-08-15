@@ -1,12 +1,12 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
-use crate::ui::{fmt_dur, fmt_ms, fmt_time, fmt_u32};
+use crate::ui::{fmt_dur, fmt_ms, fmt_time, fmt_u32, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([
@@ -25,15 +25,15 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
                 " calls {} | active {} | done {} | fail {} ",
                 snap.calls_total, snap.active, snap.completed, snap.failed
             ),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme::INFO),
         ),
         Span::raw("│"),
         Span::styled(
             format!(" ASR {:.1}% ", snap.asr),
             Style::default().fg(if snap.asr < 80.0 {
-                Color::Red
+                theme::ERROR
             } else {
-                Color::Green
+                theme::SUCCESS
             }),
         ),
         Span::raw("│"),
@@ -47,7 +47,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
                 fmt_ms(Some(snap.avg_rtt_ms)),
                 fmt_ms(Some(snap.avg_mos)),
             ),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::MUTED),
         ),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Summary"));
@@ -57,14 +57,25 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let header = [
         "Time", "From", "To", "State", "PDD", "Setup", "Dur", "MOS", "RTP", "Diag", "Call-ID",
     ];
-    let rows = snap.calls.iter().map(|c| {
+    // Keep the highlight anchored to the same call as new calls arrive, then
+    // apply the state filter (`f` cycles all/pending/success/failed/canceled).
+    app.anchor_overview_selection(snap);
+    let visible: Vec<&crate::store::registry::CallSummary> = snap
+        .calls
+        .iter()
+        .filter(|c| app.filter.matches(c.state))
+        .collect();
+    let rows = visible.iter().map(|c| {
         let diag_cell = if c.critical_count > 0 {
-            Cell::from(format!("{}C/{}W", c.critical_count, c.warn_count))
-                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            Cell::from(format!("{}C/{}W", c.critical_count, c.warn_count)).style(
+                Style::default()
+                    .fg(theme::ERROR)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else if c.warn_count > 0 {
-            Cell::from(format!("{}", c.warn_count)).style(Style::default().fg(Color::Yellow))
+            Cell::from(format!("{}", c.warn_count)).style(Style::default().fg(theme::WARNING))
         } else {
-            Cell::from("·").style(Style::default().fg(Color::DarkGray))
+            Cell::from("·").style(Style::default().fg(theme::MUTED))
         };
         let turn_mark = if c.via_turn { " [T]" } else { "" };
         Row::new(vec![
@@ -82,7 +93,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             Cell::from(fmt_ms(c.best_mos)),
             Cell::from(c.pkts_rtp.to_string()),
             diag_cell,
-            Cell::from(c.call_id.clone()).style(Style::default().fg(Color::DarkGray)),
+            Cell::from(c.call_id.clone()).style(Style::default().fg(theme::MUTED)),
         ])
     });
 
@@ -103,24 +114,25 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         ],
     )
     .header(
-        Row::new(header.iter().map(|h| Cell::from(*h))).style(Style::default().fg(Color::Yellow)),
+        Row::new(header.iter().map(|h| Cell::from(*h))).style(Style::default().fg(theme::WARNING)),
     )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Calls ({}) — Enter=detail", snap.calls.len())),
-    )
-    .row_highlight_style(Style::default().bg(Color::DarkGray));
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Calls ({}/{}) — Enter=detail, f=filter:{}",
+        visible.len(),
+        snap.calls.len(),
+        app.filter.label()
+    )))
+    .row_highlight_style(Style::default().bg(theme::MUTED));
     f.render_stateful_widget(table, chunks[2], &mut app.table_state);
 }
 
 pub fn state_color(state: crate::model::sip::CallState) -> Style {
     use crate::model::sip::CallState::*;
     match state {
-        Dialing | Ringing => Style::default().fg(Color::Cyan),
-        Active => Style::default().fg(Color::Green),
-        Completed => Style::default().fg(Color::Blue),
-        Failed => Style::default().fg(Color::Red),
-        Canceled => Style::default().fg(Color::Magenta),
+        Dialing | Ringing => Style::default().fg(theme::INFO),
+        Active => Style::default().fg(theme::SUCCESS),
+        Completed => Style::default().fg(theme::PRIMARY),
+        Failed => Style::default().fg(theme::ERROR),
+        Canceled => Style::default().fg(theme::ACCENT),
     }
 }

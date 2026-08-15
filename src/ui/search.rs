@@ -1,11 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::store::registry::Snapshot;
 use crate::ui::app::{App, search_results};
-use crate::ui::{fmt_dur, fmt_ms, fmt_time};
+use crate::ui::{fmt_dur, fmt_ms, fmt_time, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
@@ -13,7 +13,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 
     let prompt = if app.search_editing { ">" } else { " " };
     let input = Paragraph::new(format!("{prompt} {}", app.search_query))
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(theme::WARNING))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -66,6 +66,6 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             .borders(Borders::ALL)
             .title(format!("Results ({}) — Enter=detail", results.len())),
     )
-    .row_highlight_style(Style::default().bg(Color::DarkGray));
+    .row_highlight_style(Style::default().bg(theme::MUTED));
     f.render_stateful_widget(table, inner, &mut app.search_state);
 }
