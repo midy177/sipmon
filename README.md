@@ -4,7 +4,7 @@ A passive SIP/RTP signaling and media quality monitoring tool. A standalone Rust
 executable deployed on a mirrored port / packet capture box, **with no dependency
 on a running PBX**. Inputs may be a live capture, a pcap file, a stdin stream, or a
 previously recorded event log; output is a live TUI monitor plus exportable
-analysis results (SQLite / JSONL).
+analysis results (JSONL).
 
 ## Demo
 
@@ -24,7 +24,7 @@ a live `sipbot` caller/callee pair plus a synthetic load pcap). Source recording
 - **Diagnostics**: 20+ rules for Contact reachability, Record-Route, SDP/RTP consistency, one-way media, TURN allocation/refresh, etc.
 - **TUI**: Overview / Search / Call Detail (side-by-side) / Heatmap / Streams / EventLog / IP Stats
 - **Call analysis**: PDD/setup/ring timing, ring-back type (180 vs 183 early media), hangup initiator (caller/callee BYE, CANCEL, reject), per-IP loss over 1s…1h windows
-- **Export**: SQLite / JSONL on exit or via the `export` subcommand; `query` fetches a Call-ID flow for scripting
+- **Export**: JSONL on exit or via the `export` subcommand; `query` fetches a Call-ID flow for scripting
 
 ## Build
 
@@ -87,7 +87,7 @@ tcpdump -i eth0 -w - | sipmon -
 | `file` | Offline pcap/pcapng. `--rate 1x` replays at a real-time speed multiplier, `--no-tui` for headless output, `--print-events` prints structured events |
 | `replay` | Replay an event log (TUI / `--no-tui`) |
 | `query` | No TUI; exports flow + stream stats + RTT + diagnostics for a Call-ID from an event log (script friendly) |
-| `export` | Rebuilds a snapshot from an event log and exports SQLite/JSONL, with `--from/--to` time filtering (Unix seconds) |
+| `export` | Rebuilds a snapshot from an event log and exports JSONL, with `--from/--to` time filtering (Unix seconds) |
 
 ### Common options
 
@@ -102,7 +102,6 @@ tcpdump -i eth0 -w - | sipmon -
 --bucket 15m|1h|1d   Heatmap bucket granularity (default 15m)
 -w/--evlog PATH      Write the binary event log to PATH
 --export-jsonl PATH  Export JSONL on exit
---export-sqlite PATH Export SQLite on exit
 ```
 
 ## TUI usage

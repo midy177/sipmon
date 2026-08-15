@@ -174,18 +174,6 @@ fn evlog_roundtrip_and_query() {
     assert!(content.contains("\"kind\":\"call\""));
     assert!(content.contains("\"kind\":\"stream\""));
     assert!(content.contains("PCMU"));
-
-    // export sqlite
-    let db = dir.path().join("t.db");
-    let s = bin()
-        .args(["export", "-l"])
-        .arg(&evlog)
-        .arg("--sqlite")
-        .arg(&db)
-        .output()
-        .unwrap();
-    assert!(s.status.success());
-    assert!(db.exists() && db.metadata().unwrap().len() > 0);
 }
 
 #[test]

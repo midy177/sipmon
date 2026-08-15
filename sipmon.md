@@ -4,14 +4,14 @@ A SIP/RTP signaling and media quality monitoring tool. A standalone Rust
 executable deployed on a mirrored port / packet capture box, **with no dependency
 on a running PBX**.
 
-Input = live capture (libpcap) / pcap file / stdin `tcpdump -w -` stream / own event-log replay / **event log recorded by `record`**; output = live TUI monitoring + exportable analysis results (event log → SQLite/JSONL).
+Input = live capture (libpcap) / pcap file / stdin `tcpdump -w -` stream / own event-log replay / **event log recorded by `record`**; output = live TUI monitoring + exportable analysis results (event log → JSONL).
 
 ```
 [mirrored interface] ──┐
 [*.pcap]            ──┤──▶ Capture ─▶ Decode ─▶ Parse ─▶ Correlate ─▶ Analyze ─▶ In-Memory ─▶ TUI
 [tcpdump -w-]        ─┘                       (L2/L3/L4)   (SIP)   (Call+RTP)   (metrics)   (AppState)   │
 [sipmon record] ─▶ evlog ─▶ replay ─┘                                                                   ▼
-                                                                                        event log ─▶ SQLite/JSONL export
+                                                                                        event log ─▶ JSONL export
 ```
 
 ## Technical decisions
@@ -65,7 +65,6 @@ sipmon/
 │   ├── heatmap.rs       aggregation buckets (time×IP / time×endpoint)
 │   └── evlog.rs         event-log binary read/write
 ├── export/
-│   ├── sqlite.rs        rusqlite export
 │   └── jsonl.rs
 └── ui/                  ratatui TUI
     ├── overview.rs      summary cards + call table
@@ -171,9 +170,9 @@ sipmon -                                          # read a pcap stream from stdi
 sipmon file   -r cap.pcap [--pcapng] [--rate 1x]       # offline pcap analysis + TUI (speed adjustable)
 sipmon replay -l sipmon.evlog                         # replay an event log + TUI
 sipmon query  -l sipmon.evlog -c <callid>             # no TUI; query flow+stats by Call-ID (script friendly)
-sipmon export -l sipmon.evlog --sqlite out.db|--jsonl out.jsonl [--from --to]
+sipmon export -l sipmon.evlog --jsonl out.jsonl [--from --to]
 sipmon cap.pcap | cap.evlog | out.jsonl          # default mode: no subcommand, dispatch by extension to file/replay/jsonl view
-common: --raw-truncate 1024 --bucket 15m --ring-hours 24 --export-jsonl/--export-sqlite --dry-run
+common: --raw-truncate 1024 --bucket 15m --ring-hours 24 --export-jsonl --dry-run
 ```
 
 Mode matrix:
@@ -195,7 +194,6 @@ Mode matrix:
 | L2-L4 decoding | etherparse | 0.16 |
 | SIP parsing | rsipstack | 0.6.2 |
 | RTP/RTCP/jitter/loss | **vendor** media_stats.rs | — |
-| SQLite export | rusqlite (bundled feature) | 0.32 |
 | Runtime | tokio (full) | 1.52 |
 | Other | chrono, serde, serde_json, bytes, clap, anyhow, tracing, tracing-subscriber, dashmap | — |
 
@@ -214,7 +212,7 @@ Mode matrix:
 - Verify: all TUI pages usable under both live and file sources; Call-ID search hits historical calls and shows the flow
 
 **M3 — export and replay**
-- sqlite/jsonl export + `query` subcommand + `replay` re-analysis from the event log + offline pcap speed control
+- jsonl export + `query` subcommand + `replay` re-analysis from the event log + offline pcap speed control
 - Verify: SQL queries after export reproduce the heatmap; replay rebuilds consistently with live
 
 **M4 — polish**

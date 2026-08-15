@@ -12,8 +12,6 @@ pub enum Error {
     Decode(String),
     #[error("evlog: {0}")]
     Evlog(String),
-    #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
     #[error("{0}")]
     Other(String),
 }

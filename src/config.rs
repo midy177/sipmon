@@ -32,7 +32,6 @@ pub struct Config {
     #[allow(dead_code)]
     pub ring_hours: u64,
     pub export_jsonl: Option<PathBuf>,
-    pub export_sqlite: Option<PathBuf>,
     pub no_media: bool,
     pub bpf: Option<String>,
     /// Binary event-log output path (None = no event logging).
@@ -59,7 +58,6 @@ impl Default for Config {
             bucket: Bucket::FifteenMin,
             ring_hours: 24,
             export_jsonl: None,
-            export_sqlite: None,
             no_media: false,
             bpf: None,
             evlog: None,

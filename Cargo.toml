@@ -1,8 +1,8 @@
 [package]
 name = "sipmon"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
-description = "Passive SIP/RTP signaling & media quality monitoring (pcap/live, TUI + SQLite/JSONL export)"
+description = "Passive SIP/RTP signaling & media quality monitoring (pcap/live, TUI + JSONL export)"
 license = "MIT"
 authors = ["sipmon"]
 repository = "https://github.com/shenjinti/sipmon"
@@ -40,8 +40,6 @@ libc = "0.2"
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
-# export
-rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

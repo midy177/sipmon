@@ -76,9 +76,6 @@ struct Cli {
     /// Export final snapshot as JSONL on exit
     #[arg(long)]
     export_jsonl: Option<PathBuf>,
-    /// Export final snapshot as SQLite on exit
-    #[arg(long)]
-    export_sqlite: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -147,12 +144,10 @@ enum Cmd {
         #[arg(short = 'c', long)]
         call_id: String,
     },
-    /// Export an event log to sqlite/jsonl
+    /// Export an event log to JSONL
     Export {
         #[arg(short = 'l', long)]
         evlog: String,
-        #[arg(long)]
-        sqlite: Option<PathBuf>,
         #[arg(long)]
         jsonl: Option<PathBuf>,
         /// Filter from (unix seconds)
@@ -266,11 +261,10 @@ fn main() -> Result<()> {
         Some(Cmd::Query { evlog, call_id }) => run_query(&evlog, &call_id),
         Some(Cmd::Export {
             evlog,
-            sqlite,
             jsonl,
             from,
             to,
-        }) => run_export(&cfg, &evlog, sqlite, jsonl, from, to),
+        }) => run_export(&cfg, &evlog, jsonl, from, to),
         None => {
             // No subcommand: a bare FILE defaults to the matching mode,
             // otherwise start a live capture on the default interface.
@@ -336,7 +330,6 @@ fn build_config(cli: &Cli) -> Config {
         turn_servers: cli.turn_servers.clone(),
         bucket: Bucket::from_str_lossy(&cli.bucket),
         export_jsonl: cli.export_jsonl.clone(),
-        export_sqlite: cli.export_sqlite.clone(),
         evlog: cli.evlog.clone(),
         ..Config::default()
     };
@@ -677,11 +670,6 @@ fn final_exports(cfg: &Config, shared: &Shared) -> Result<()> {
             .with_context(|| format!("export jsonl {}", p.display()))?;
         eprintln!("exported {}", p.display());
     }
-    if let Some(p) = &cfg.export_sqlite {
-        export::sqlite::export_snapshot(p, &snap)
-            .with_context(|| format!("export sqlite {}", p.display()))?;
-        eprintln!("exported {}", p.display());
-    }
     Ok(())
 }
 
@@ -939,7 +927,6 @@ fn run_query(evlog: &str, call_id: &str) -> Result<()> {
 fn run_export(
     cfg: &Config,
     evlog: &str,
-    sqlite: Option<PathBuf>,
     jsonl: Option<PathBuf>,
     from: Option<u64>,
     to: Option<u64>,
@@ -1024,12 +1011,8 @@ fn run_export(
         export::jsonl::export_snapshot(p, &snap)?;
         eprintln!("exported {}", p.display());
     }
-    if let Some(p) = sqlite.as_ref() {
-        export::sqlite::export_snapshot(p, &snap)?;
-        eprintln!("exported {}", p.display());
-    }
-    if jsonl.is_none() && sqlite.is_none() {
-        eprintln!("nothing to do: pass --jsonl and/or --sqlite");
+    if jsonl.is_none() {
+        eprintln!("nothing to do: pass --jsonl");
     }
     Ok(())
 }
