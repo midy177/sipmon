@@ -1,4 +1,6 @@
-//! Per-IP network-stats page: time-windowed loss table + heatmap + drill-down.
+//! Per-IP network-stats page: a directional (TX/RX) loss/volume table, a loss
+//! heatmap, and a per-IP call drill-down. A loss-only summary mode collapses
+//! the table down to just the two loss columns for a selectable window.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -7,13 +9,19 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
-use crate::store::ipstats::{IpStats, WINDOWS};
+use crate::store::ipstats::{Dir, IpStats, WINDOWS};
 use crate::store::registry::{CallSummary, Snapshot};
 use crate::ui::app::{App, IpSort};
 use crate::ui::{fmt_bytes, fmt_time, theme};
 
-/// The IP rows of the page, sorted per the current sort mode.
+/// How often the IP row order is re-derived from the live sort key. Between
+/// refreshes the previous order is kept so the list doesn't reshuffle on every
+/// frame while traffic keeps moving the loss numbers.
+const SORT_REFRESH: Duration = Duration::from_secs(5);
+
+/// The IP rows of the page, ordered by the current sort mode.
 pub fn sorted_rows(snap: &Snapshot, sort: IpSort) -> Vec<&IpStats> {
     let mut v: Vec<&IpStats> = snap.ip_stats.iter().collect();
     match sort {
@@ -23,17 +31,41 @@ pub fn sorted_rows(snap: &Snapshot, sort: IpSort) -> Vec<&IpStats> {
                 .cmp(&a.last_seen_us.unwrap_or(0))
         }),
         IpSort::MaxLoss => v.sort_by(|a, b| {
-            b.loss_pct(0)
+            b.loss_pct_total(0)
                 .unwrap_or(0.0)
-                .partial_cmp(&a.loss_pct(0).unwrap_or(0.0))
+                .partial_cmp(&a.loss_pct_total(0).unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
         IpSort::MinLoss => v.sort_by(|a, b| {
-            a.loss_pct(0)
+            a.loss_pct_total(0)
                 .unwrap_or(0.0)
-                .partial_cmp(&b.loss_pct(0).unwrap_or(0.0))
+                .partial_cmp(&b.loss_pct_total(0).unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
+    }
+    v
+}
+
+/// Row order with a 5-second-stable cache: the full re-sort runs at most once
+/// per `SORT_REFRESH`; new IPs are appended in between. Used by both the table
+/// and the heatmap so the two stay aligned and don't jump around.
+pub fn ordered_rows<'a>(snap: &'a Snapshot, app: &mut App) -> Vec<&'a IpStats> {
+    if app.ip_sort_order.is_empty() || app.ip_sort_last.elapsed() >= SORT_REFRESH {
+        app.ip_sort_order = sorted_rows(snap, app.ip_sort).iter().map(|s| s.ip).collect();
+        app.ip_sort_last = Instant::now();
+    }
+    let by_ip: std::collections::HashMap<IpAddr, &IpStats> =
+        snap.ip_stats.iter().map(|s| (s.ip, s)).collect();
+    let mut v: Vec<&IpStats> = app
+        .ip_sort_order
+        .iter()
+        .filter_map(|ip| by_ip.get(ip).copied())
+        .collect();
+    for s in &snap.ip_stats {
+        if !app.ip_sort_order.contains(&s.ip) {
+            app.ip_sort_order.push(s.ip);
+            v.push(s);
+        }
     }
     v
 }
@@ -57,7 +89,9 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     } else {
         render_table(f, chunks[1], snap, app);
     }
-    render_heatmap(f, chunks[2], snap, app);
+    if !app.ip_loss_only {
+        render_loss_heatmap(f, chunks[2], snap, app);
+    }
 }
 
 fn loss_cell(pct: Option<f64>) -> Cell<'static> {
@@ -77,48 +111,93 @@ fn loss_cell(pct: Option<f64>) -> Cell<'static> {
 }
 
 fn render_table(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
-    let rows = sorted_rows(snap, app.ip_sort);
-    let data_rows = rows.iter().map(|s| {
-        let mut cells = vec![
-            Cell::from(s.ip.to_string()),
-            Cell::from(s.active_calls.to_string()).style(Style::default().fg(theme::ACCENT)),
-        ];
-        for (w, _) in &WINDOWS {
-            cells.push(loss_cell(s.loss_pct(*w)));
-        }
-        cells.push(Cell::from(fmt_bytes(s.bytes_total)));
-        cells.push(Cell::from(s.pkts_total.to_string()));
-        Row::new(cells)
-    });
+    let rows = ordered_rows(snap, app);
 
-    let widths = vec![
-        Constraint::Length(16),
-        Constraint::Length(4),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(11),
-        Constraint::Length(9),
-    ];
-    let mut header_cells: Vec<Cell> = vec!["IP".into(), "Act".into()];
-    header_cells.extend(WINDOWS.iter().map(|(_, l)| Cell::from(*l)));
-    header_cells.push(Cell::from("Bytes"));
-    header_cells.push(Cell::from("Pkts"));
+    let (data_rows, header_cells, widths, title) = if app.ip_loss_only {
+        let label = WINDOWS
+            .iter()
+            .find(|(s, _)| *s == app.ip_summary_window)
+            .map(|(_, l)| *l)
+            .unwrap_or("all");
+        let data_rows: Vec<Row> = rows
+            .iter()
+            .map(|s| {
+                Row::new(vec![
+                    Cell::from(s.ip.to_string()),
+                    Cell::from(s.active_calls.to_string()).style(Style::default().fg(theme::ACCENT)),
+                    loss_cell(s.loss_pct(app.ip_summary_window, Dir::Tx)),
+                    loss_cell(s.loss_pct(app.ip_summary_window, Dir::Rx)),
+                ])
+            })
+            .collect();
+        let header_cells = vec![
+            Cell::from("IP"),
+            Cell::from("Act"),
+            Cell::from("TX loss%"),
+            Cell::from("RX loss%"),
+        ];
+        let widths = vec![
+            Constraint::Length(16),
+            Constraint::Length(4),
+            Constraint::Length(9),
+            Constraint::Length(9),
+        ];
+        let title = format!(
+            "IP loss summary (window {label}, {} IPs) — Enter=calls s=sort:{} w=window c=full",
+            rows.len(),
+            app.ip_sort.label()
+        );
+        (data_rows, header_cells, widths, title)
+    } else {
+        let data_rows: Vec<Row> = rows
+            .iter()
+            .map(|s| {
+                Row::new(vec![
+                    Cell::from(s.ip.to_string()),
+                    Cell::from(s.active_calls.to_string()).style(Style::default().fg(theme::ACCENT)),
+                    Cell::from(s.pkts_tx.to_string()),
+                    Cell::from(s.pkts_rx.to_string()),
+                    Cell::from(fmt_bytes(s.bytes_tx)),
+                    Cell::from(fmt_bytes(s.bytes_rx)),
+                    loss_cell(s.loss_pct(0, Dir::Tx)),
+                    loss_cell(s.loss_pct(0, Dir::Rx)),
+                ])
+            })
+            .collect();
+        let header_cells = vec![
+            Cell::from("IP"),
+            Cell::from("Act"),
+            Cell::from("TX pkts"),
+            Cell::from("RX pkts"),
+            Cell::from("TX bytes"),
+            Cell::from("RX bytes"),
+            Cell::from("TX loss%"),
+            Cell::from("RX loss%"),
+        ];
+        let widths = vec![
+            Constraint::Length(16),
+            Constraint::Length(4),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
+        ];
+        let title = format!(
+            "IP network stats ({} IPs, TX=out RX=in) — Enter=calls s=sort:{} c=loss-only",
+            rows.len(),
+            app.ip_sort.label()
+        );
+        (data_rows, header_cells, widths, title)
+    };
 
     let table = Table::new(data_rows, widths)
         .header(
-            Row::new(header_cells).style(Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD)),
+            Row::new(header_cells)
+                .style(Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD)),
         )
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            "IP network stats ({} IPs) — Enter=call list, s=sort:{}",
-            rows.len(),
-            app.ip_sort.label()
-        )))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(theme::MUTED));
     f.render_stateful_widget(table, area, &mut app.ip_table_state);
 }
@@ -171,8 +250,9 @@ fn render_drill(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     f.render_stateful_widget(table, area, &mut app.ip_drill_state);
 }
 
-/// Bottom heatmap: rows = IPs, columns = time buckets, color = loss%.
-fn render_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
+/// Per-IP loss heatmap: rows = IPs, columns = time buckets, color = loss%.
+/// Shared between the IP Stats page and the dedicated Heatmap page.
+pub fn render_loss_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let window = app.ip_window_secs;
     let col_secs = if window <= 600 {
         window.div_ceil(60).max(1)
@@ -189,7 +269,7 @@ fn render_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         .unwrap_or(0);
     let axis_start = now.saturating_sub(col_us * cols as u64);
 
-    let rows = sorted_rows(snap, app.ip_sort);
+    let rows = ordered_rows(snap, app);
     let height = (area.height as usize).saturating_sub(2);
     let visible: Vec<&IpStats> = rows.into_iter().take(height).collect();
 
@@ -205,7 +285,7 @@ fn render_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let body = visible.iter().map(|s| {
         let mut cells = vec![
             Cell::from(s.ip.to_string()),
-            Cell::from(format!("{:.1}", s.loss_pct(0).unwrap_or(0.0))),
+            Cell::from(format!("{:.1}", s.loss_pct_total(0).unwrap_or(0.0))),
         ];
         let cols_series = s.heatmap_columns(window, 60);
         let mut grid = vec![None; cols];
@@ -274,18 +354,10 @@ mod tests {
         let mut st = crate::store::ipstats::IpStatsStore::new();
         let ts = 1_800_000_000_000_000u64;
         for i in 0..30u64 {
-            st.observe_packet(
-                "10.10.0.8".parse().unwrap(),
-                ts + i * 1_000_000,
-                160,
-            );
-            st.observe_packet(
-                "10.20.0.8".parse().unwrap(),
-                ts + i * 1_000_000,
-                160,
-            );
+            st.observe_packet("10.10.0.8".parse().unwrap(), ts + i * 1_000_000, 160, Dir::Tx);
+            st.observe_packet("10.20.0.8".parse().unwrap(), ts + i * 1_000_000, 160, Dir::Rx);
             if i % 10 == 0 {
-                st.observe_lost("10.20.0.8".parse().unwrap(), ts + i * 1_000_000, 1);
+                st.observe_lost("10.20.0.8".parse().unwrap(), ts + i * 1_000_000, 1, Dir::Rx);
             }
         }
         st.add_active("10.10.0.8".parse().unwrap(), 2);
@@ -333,7 +405,6 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
         terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();
-        // Both IPs present in the table; all 8 window headers present.
         let text: String = (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
@@ -344,9 +415,42 @@ mod tests {
             .join("\n");
         assert!(text.contains("10.10.0.8"));
         assert!(text.contains("10.20.0.8"));
-        for (_, label) in crate::store::ipstats::WINDOWS {
-            assert!(text.contains(label), "window header {label} missing");
-        }
+        // Directional columns present, e.g. the TX loss% header.
+        assert!(text.contains("TX loss%"));
+        assert!(text.contains("RX loss%"));
+        assert!(text.contains("TX pkts"));
+        assert!(text.contains("RX pkts"));
+    }
+
+    #[test]
+    fn ip_loss_only_renders() {
+        let snap = Arc::new(Mutex::new(sample_snapshot()));
+        let mut app = App::new(
+            snap,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.page = Page::IpStats;
+        app.ip_loss_only = true;
+        app.ip_summary_window = 0;
+        let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("IP loss summary"));
+        assert!(text.contains("TX loss%"));
+        assert!(text.contains("RX loss%"));
+        // No bytes / heatmap in loss-only mode.
+        assert!(!text.contains("TX bytes"));
+        assert!(!text.contains("Loss% heatmap"));
     }
 
     #[test]

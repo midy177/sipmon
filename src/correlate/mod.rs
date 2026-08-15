@@ -100,17 +100,29 @@ impl Correlator {
             let Some(s) = self.reg.streams.get_mut(&key) else {
                 continue;
             };
-            // Record a 5s throughput/quality sample for the waveform view.
+            // Record a 5s throughput/quality sample and derive the loss delta.
             s.sample(ts_us);
             let sum = s.summary();
             // Attribute the newly-observed lost packets to both endpoints of
             // the stream in the per-IP network stats (1s bucket resolution).
+            // From each IP's viewpoint: lost egress packets at the source,
+            // lost ingress packets at the destination.
             let lost_now = sum.lost;
             let lost_delta = lost_now.saturating_sub(self.last_lost.get(&key).copied().unwrap_or(0));
             self.last_lost.insert(key, lost_now);
             if lost_delta > 0 {
-                self.reg.ipstats.observe_lost(s.flow.src.ip(), ts_us, lost_delta);
-                self.reg.ipstats.observe_lost(s.flow.dst.ip(), ts_us, lost_delta);
+                self.reg.ipstats.observe_lost(
+                    s.flow.src.ip(),
+                    ts_us,
+                    lost_delta,
+                    crate::store::ipstats::Dir::Tx,
+                );
+                self.reg.ipstats.observe_lost(
+                    s.flow.dst.ip(),
+                    ts_us,
+                    lost_delta,
+                    crate::store::ipstats::Dir::Rx,
+                );
             }
             self.pending_events
                 .push(crate::store::evlog::Event::StreamSnap(
@@ -368,9 +380,14 @@ impl Correlator {
         len: usize,
         encap: Encap,
     ) {
-        // Per-IP network stats: attribute every packet to both endpoint IPs.
-        self.reg.ipstats.observe_packet(flow.src.ip(), ts, len);
-        self.reg.ipstats.observe_packet(flow.dst.ip(), ts, len);
+        // Per-IP network stats: attribute every packet to both endpoint IPs —
+        // egress from the source, ingress to the destination.
+        self.reg
+            .ipstats
+            .observe_packet(flow.src.ip(), ts, len, crate::store::ipstats::Dir::Tx);
+        self.reg
+            .ipstats
+            .observe_packet(flow.dst.ip(), ts, len, crate::store::ipstats::Dir::Rx);
         // Resolve call via SDP endpoints (two O(1) lookups).
         let Some(call_id) = self
             .reg

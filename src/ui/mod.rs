@@ -57,7 +57,7 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
         ),
     ]);
     let line2 = Line::from(Span::styled(
-        " Global: [Tab/Shift-Tab] pages [1-7] jump [/] search [Space] pause [e] export [b] bucket [x] clear [Ctrl-C/q] quit",
+        " Global: [Tab/Shift-Tab] pages [1-7] jump [/] search [Space] pause [e] export [x] clear [Ctrl-C/q] quit",
         Style::default().fg(theme::MUTED),
     ));
     let line3 = if app.search_editing {
@@ -81,27 +81,78 @@ fn page_keys(page: Page) -> &'static str {
         Page::Overview => "[↑↓] select [Enter] open call detail",
         Page::Search => "[↑↓] select [Enter] open call detail [/] new query",
         Page::CallDetail => {
-            "[↑↓] select msg [Tab] right pane [PgUp/PgDn] scroll raw [←/Esc] back to list"
+            "[↑↓] select msg [PgUp/PgDn] scroll raw [←/Esc] back to list"
         }
-        Page::Heatmap => "[b] bucket granularity",
+        Page::Heatmap => "[s] sort [w] loss window",
         Page::Streams => "[↑↓] select stream",
         Page::EventLog => "[↑↓] scroll",
-        Page::IpStats => "[↑↓] select [Enter] calls [s] sort [w] heatmap window",
+        Page::IpStats => "[↑↓] select [Enter] calls [s] sort [w] window [c] loss-only",
     }
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let snap = app.snapshot();
+    let area = f.area();
+    // Reserve the last row for the 1-7 page tab bar.
+    let body = Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    };
     use app::Page::*;
     match app.page {
-        Overview => overview::render(f, f.area(), &snap, app),
-        Search => search::render(f, f.area(), &snap, app),
-        CallDetail => call_detail::render(f, f.area(), &snap, app),
-        Heatmap => heatmap::render(f, f.area(), &snap, app),
-        Streams => streams::render(f, f.area(), &snap, app),
-        EventLog => eventlog::render(f, f.area(), &snap, app),
-        IpStats => ipstats::render(f, f.area(), &snap, app),
+        Overview => overview::render(f, body, &snap, app),
+        Search => search::render(f, body, &snap, app),
+        CallDetail => call_detail::render(f, body, &snap, app),
+        Heatmap => heatmap::render(f, body, &snap, app),
+        Streams => streams::render(f, body, &snap, app),
+        EventLog => eventlog::render(f, body, &snap, app),
+        IpStats => ipstats::render(f, body, &snap, app),
     }
+    render_page_tabs(
+        f,
+        Rect {
+            y: body.height,
+            height: 1,
+            ..area
+        },
+        app,
+    );
+}
+
+/// Bottom page tab bar: `1 Overview … 7 IP Stats`, with the active page
+/// highlighted. `Tab`/`Shift-Tab` walk across them continuously.
+fn render_page_tabs(f: &mut Frame, area: Rect, app: &App) {
+    const TABS: [(u8, &str); 7] = [
+        (1, "Overview"),
+        (2, "Search"),
+        (3, "Detail"),
+        (4, "Heatmap"),
+        (5, "Streams"),
+        (6, "EventLog"),
+        (7, "IP Stats"),
+    ];
+    let active = app.page.index();
+    let spans: Vec<Span> = TABS
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (n, name))| {
+            let sep = if i == 0 { Vec::new() } else { vec![Span::raw("  ")] };
+            let selected = i == active;
+            let style = if selected {
+                Style::default()
+                    .fg(theme::INK)
+                    .bg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::MUTED)
+            };
+            sep.into_iter()
+                .chain(std::iter::once(Span::styled(format!("{n} {name}"), style)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let p = Paragraph::new(Line::from(spans));
+    f.render_widget(p, area);
 }
 
 /// Format a capture timestamp (us) as HH:MM:SS.

@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
@@ -90,6 +90,11 @@ impl Page {
         Page::EventLog,
         Page::IpStats,
     ];
+
+    /// 0-based position within `ALL` (used by the bottom 1-7 tab bar).
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
+    }
 }
 
 /// Sort modes for the per-IP network-stats page.
@@ -138,16 +143,22 @@ pub struct App {
     pub filter: CallFilter,
     pub streams_state: TableState,
     pub eventlog_scroll: u16,
-    pub detail_tab: usize, // right pane: 0=Raw 1=Network 2=Diagnostics
     pub raw_scroll: usize,
     pub flow_state: TableState,
     pub should_quit: bool,
     pub status: String,
     pub export_path: Option<std::path::PathBuf>,
-    pub bucket_secs: u64,
     /// Per-IP network-stats page state.
     pub ip_table_state: TableState,
     pub ip_sort: IpSort,
+    /// Cached row order (IPs) so the list doesn't reshuffle on every frame;
+    /// re-derived at most once per `SORT_REFRESH` (see ipstats::ordered_rows).
+    pub ip_sort_order: Vec<std::net::IpAddr>,
+    pub ip_sort_last: Instant,
+    /// Loss-only summary mode: table collapses to just the directional loss.
+    pub ip_loss_only: bool,
+    /// Loss window shown in loss-only mode (secs, 0 = all-time).
+    pub ip_summary_window: u64,
     pub ip_window_secs: u64, // heatmap window: 60s / 10m / 1h
     pub ip_drill: Option<std::net::IpAddr>,
     pub ip_drill_state: TableState,
@@ -175,15 +186,17 @@ impl App {
             filter: CallFilter::All,
             streams_state: TableState::default(),
             eventlog_scroll: 0,
-            detail_tab: 0,
             raw_scroll: 0,
             flow_state: TableState::default(),
             should_quit: false,
             status: String::new(),
             export_path: None,
-            bucket_secs: 900,
             ip_table_state: TableState::default(),
             ip_sort: IpSort::Newest,
+            ip_sort_order: Vec::new(),
+            ip_sort_last: Instant::now(),
+            ip_loss_only: false,
+            ip_summary_window: 0,
             ip_window_secs: 60,
             ip_drill: None,
             ip_drill_state: TableState::default(),
@@ -264,20 +277,8 @@ impl App {
                     self.ip_drill = None;
                 }
             }
-            KeyCode::Tab => {
-                if self.page == Page::CallDetail {
-                    self.detail_tab = (self.detail_tab + 1) % 3;
-                } else {
-                    self.cycle_page(true);
-                }
-            }
-            KeyCode::BackTab => {
-                if self.page == Page::CallDetail {
-                    self.detail_tab = (self.detail_tab + 2) % 3;
-                } else {
-                    self.cycle_page(false);
-                }
-            }
+            KeyCode::Tab => self.cycle_page(true),
+            KeyCode::BackTab => self.cycle_page(false),
             KeyCode::Char(' ') => {
                 let paused = !self.pause.load(Ordering::Relaxed);
                 self.pause.store(paused, Ordering::Relaxed);
@@ -295,14 +296,6 @@ impl App {
                 self.search_editing = true;
             }
             KeyCode::Char('e') => self.do_export(),
-            KeyCode::Char('b') => {
-                self.bucket_secs = match self.bucket_secs {
-                    900 => 3600,
-                    3600 => 86_400,
-                    _ => 900,
-                };
-                self.set_status(format!("bucket = {}s", self.bucket_secs));
-            }
             KeyCode::Char('f') => {
                 self.filter = self.filter.next();
                 self.set_status(format!("filter = {}", self.filter.label()));
@@ -317,6 +310,29 @@ impl App {
             }
             _ => self.page_key(code),
         }
+    }
+
+    /// Cycle the loss-heatmap window: 60s → 10m → 1h → 60s.
+    fn cycle_ip_window(&mut self) {
+        self.ip_window_secs = match self.ip_window_secs {
+            60 => 600,
+            600 => 3600,
+            _ => 60,
+        };
+        self.set_status(format!("IP heatmap window = {}s", self.ip_window_secs));
+    }
+
+    /// Cycle the loss-only summary window through the supported windows.
+    fn cycle_ip_summary_window(&mut self) {
+        let vals = crate::store::ipstats::WINDOWS.map(|(s, _)| s);
+        let i = vals.iter().position(|&x| x == self.ip_summary_window).unwrap_or(0);
+        self.ip_summary_window = vals[(i + 1) % vals.len()];
+        let label = crate::store::ipstats::WINDOWS
+            .iter()
+            .find(|(s, _)| *s == self.ip_summary_window)
+            .map(|(_, l)| *l)
+            .unwrap_or("all");
+        self.set_status(format!("IP loss window = {label}"));
     }
 
     fn do_export(&mut self) {
@@ -344,7 +360,6 @@ impl App {
         }
         self.focus_pending = Some(call_id);
         self.page = Page::CallDetail;
-        self.detail_tab = 0;
         self.raw_scroll = 0;
     }
 
@@ -443,8 +458,19 @@ impl App {
                 _ => {}
             },
             Page::IpStats => self.ip_key(code, &snap),
-            Page::Heatmap => {}
+            Page::Heatmap => match code {
+                KeyCode::Char('s') => self.next_ip_sort(),
+                KeyCode::Char('w') => self.cycle_ip_window(),
+                _ => {}
+            },
         }
+    }
+
+    fn next_ip_sort(&mut self) {
+        self.ip_sort = self.ip_sort.next();
+        // Drop the cached row order so the new sort applies right away.
+        self.ip_sort_order.clear();
+        self.set_status(format!("IP sort = {}", self.ip_sort.label()));
     }
 
     fn ip_key(&mut self, code: KeyCode, snap: &Snapshot) {
@@ -477,7 +503,7 @@ impl App {
                 self.ip_table_state.select_previous();
             }
             KeyCode::Enter => {
-                let rows = crate::ui::ipstats::sorted_rows(snap, self.ip_sort);
+                let rows = crate::ui::ipstats::ordered_rows(snap, self);
                 let idx = self
                     .ip_table_state
                     .selected()
@@ -490,17 +516,21 @@ impl App {
                     self.set_status(format!("IP {} — calls (Enter to open, Esc back)", r.ip));
                 }
             }
-            KeyCode::Char('s') => {
-                self.ip_sort = self.ip_sort.next();
-                self.set_status(format!("IP sort = {}", self.ip_sort.label()));
-            }
+            KeyCode::Char('s') => self.next_ip_sort(),
             KeyCode::Char('w') => {
-                self.ip_window_secs = match self.ip_window_secs {
-                    60 => 600,
-                    600 => 3600,
-                    _ => 60,
-                };
-                self.set_status(format!("IP heatmap window = {}s", self.ip_window_secs));
+                if self.ip_loss_only {
+                    self.cycle_ip_summary_window();
+                } else {
+                    self.cycle_ip_window();
+                }
+            }
+            KeyCode::Char('c') => {
+                self.ip_loss_only = !self.ip_loss_only;
+                self.set_status(if self.ip_loss_only {
+                    "IP view: loss-only summary"
+                } else {
+                    "IP view: full"
+                });
             }
             _ => {}
         }
@@ -530,4 +560,67 @@ pub fn search_results<'a>(
                     .unwrap_or(false)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn app() -> App {
+        App::new(
+            Arc::new(Mutex::new(Snapshot::default())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[test]
+    fn tab_cycles_all_seven_pages_including_call_detail() {
+        let mut a = app();
+        // From Call Detail, Tab advances to the next page (not the pane).
+        a.page = Page::CallDetail;
+        a.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(a.page, Page::Heatmap);
+        // Shift-Tab goes back to the previous page.
+        a.on_key(KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(a.page, Page::CallDetail);
+        // A full wrap of 7 Tab presses lands back on the start page.
+        a.page = Page::Overview;
+        for _ in 0..Page::ALL.len() {
+            a.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        }
+        assert_eq!(a.page, Page::Overview);
+    }
+
+    #[test]
+    fn bottom_tab_bar_renders_and_highlights_selected() {
+        let mut a = app();
+        a.page = Page::IpStats;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut a)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let last_y = buf.area.height - 1;
+        let row: String = (0..buf.area.width).map(|x| buf[(x, last_y)].symbol()).collect();
+        for label in [
+            "1 Overview",
+            "2 Search",
+            "3 Detail",
+            "4 Heatmap",
+            "5 Streams",
+            "6 EventLog",
+            "7 IP Stats",
+        ] {
+            assert!(row.contains(label), "tab bar missing {label}: {row:?}");
+        }
+        // The selected page (7 IP Stats) is highlighted with the accent bg.
+        let start = row.find("7 IP Stats").unwrap();
+        assert_eq!(
+            buf[(start as u16, last_y)].bg,
+            crate::ui::theme::ACCENT,
+            "selected tab must be highlighted"
+        );
+    }
 }

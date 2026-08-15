@@ -472,10 +472,10 @@ mod tests {
         let stats = corr.reg.ipstats.snapshot();
         assert_eq!(stats.len(), 2, "both endpoints tracked");
         let a = stats.iter().find(|s| s.ip == "10.10.0.1".parse::<std::net::IpAddr>().unwrap()).unwrap();
-        assert_eq!(a.pkts_total, 10);
-        assert_eq!(a.bytes_total, 1600);
+        assert_eq!(a.pkts_tx + a.pkts_rx, 10);
+        assert_eq!(a.bytes_tx + a.bytes_rx, 1600);
         let b = stats.iter().find(|s| s.ip == "10.20.0.1".parse::<std::net::IpAddr>().unwrap()).unwrap();
-        assert_eq!(b.pkts_total, 10);
+        assert_eq!(b.pkts_tx + b.pkts_rx, 10);
         // Call remembers the media IPs for the drill-down.
         let call = corr.reg.calls.get(id).unwrap();
         assert!(call.ips.contains(&"10.10.0.1".parse::<std::net::IpAddr>().unwrap()));
@@ -491,7 +491,9 @@ mod tests {
         let mut corr = Correlator::new(&Config::default(), "clear".into());
         corr.ingest_sip(sip(1_000_000, "x", Method::Invite, false));
         corr.ingest_sip(sip(1_100_000, "x", Method::Bye, true));
-        corr.reg.ipstats.observe_packet("10.0.0.1".parse().unwrap(), 1_000_000, 100);
+        corr.reg
+            .ipstats
+            .observe_packet("10.0.0.1".parse().unwrap(), 1_000_000, 100, crate::store::ipstats::Dir::Tx);
         assert!(!corr.reg.calls.is_empty());
         assert!(!corr.reg.ipstats.snapshot().is_empty());
         corr.clear();

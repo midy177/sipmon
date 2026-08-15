@@ -1,10 +1,12 @@
-//! Per-IP network statistics: time-windowed packet loss / volume.
+//! Per-IP network statistics: time-windowed packet loss / volume, split by
+//! direction (TX = this IP sent, RX = this IP received).
 //!
 //! For every observed endpoint IP we keep two rolling ring buffers — per-second
-//! buckets (60s of 1s buckets) and per-minute buckets (60m of 1m buckets) — plus
-//! all-time totals. Loss rates for the 1s/5s/10s/20s/1m/10m/1h/all windows are
-//! derived by summing the relevant buckets, so the UI can show short-term and
-//! long-term quality side by side. The 1s series also feeds the per-IP heatmap.
+//! buckets (600s of 1s buckets) and per-minute buckets (60m of 1m buckets) — plus
+//! all-time directional totals. Loss rates for the 1s/5s/10s/20s/1m/10m/1h/all
+//! windows are derived by summing the relevant buckets, so the UI can show
+//! short-term and long-term quality side by side. The 1s series also feeds the
+//! per-IP heatmap.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -24,12 +26,33 @@ pub const WINDOWS: [(u64, &str); 8] = [
 const SEC1_RETAIN: u64 = 600; // 600 one-second buckets (10 minutes)
 const SEC60_RETAIN: u64 = 60; // 60 one-minute buckets (1 hour)
 
-/// One fixed-width time bucket.
+/// Direction of a packet relative to the tracked IP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    /// The IP is the source: it sent the packet (egress).
+    Tx,
+    /// The IP is the destination: it received the packet (ingress).
+    Rx,
+}
+
+/// One fixed-width time bucket, split by direction.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Bucket {
-    pub packets: u64,
-    pub lost: u64,
-    pub bytes: u64,
+    pub pkts_tx: u64,
+    pub pkts_rx: u64,
+    pub lost_tx: u64,
+    pub lost_rx: u64,
+    pub bytes_tx: u64,
+    pub bytes_rx: u64,
+}
+
+impl Bucket {
+    fn packets(&self) -> u64 {
+        self.pkts_tx + self.pkts_rx
+    }
+    fn lost(&self) -> u64 {
+        self.lost_tx + self.lost_rx
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -37,10 +60,13 @@ pub struct IpStats {
     pub ip: IpAddr,
     /// Concurrent calls involving this IP (decremented at call teardown).
     pub active_calls: u32,
-    /// All-time totals.
-    pub pkts_total: u64,
-    pub lost_total: u64,
-    pub bytes_total: u64,
+    /// All-time directional totals (TX = sent by this IP, RX = received).
+    pub pkts_tx: u64,
+    pub pkts_rx: u64,
+    pub lost_tx: u64,
+    pub lost_rx: u64,
+    pub bytes_tx: u64,
+    pub bytes_rx: u64,
     pub first_seen_us: Option<u64>,
     pub last_seen_us: Option<u64>,
     /// 1s buckets, oldest first (bounded to SEC1_RETAIN).
@@ -54,9 +80,12 @@ impl IpStats {
         Self {
             ip,
             active_calls: 0,
-            pkts_total: 0,
-            lost_total: 0,
-            bytes_total: 0,
+            pkts_tx: 0,
+            pkts_rx: 0,
+            lost_tx: 0,
+            lost_rx: 0,
+            bytes_tx: 0,
+            bytes_rx: 0,
             first_seen_us: None,
             last_seen_us: None,
             sec1: VecDeque::new(),
@@ -104,62 +133,134 @@ impl IpStats {
         }
     }
 
-    fn add_packet(&mut self, ts_us: u64, len: usize) {
+    fn add_packet(&mut self, ts_us: u64, len: usize, dir: Dir) {
         if self.first_seen_us.is_none() {
             self.first_seen_us = Some(ts_us);
         }
         self.last_seen_us = Some(ts_us);
-        self.pkts_total += 1;
-        self.bytes_total += len as u64;
+        match dir {
+            Dir::Tx => self.pkts_tx += 1,
+            Dir::Rx => self.pkts_rx += 1,
+        }
+        match dir {
+            Dir::Tx => self.bytes_tx += len as u64,
+            Dir::Rx => self.bytes_rx += len as u64,
+        }
         let b = Self::bucket_mut(&mut self.sec1, ts_us, 1_000_000, SEC1_RETAIN);
-        b.packets += 1;
-        b.bytes += len as u64;
+        match dir {
+            Dir::Tx => {
+                b.pkts_tx += 1;
+                b.bytes_tx += len as u64;
+            }
+            Dir::Rx => {
+                b.pkts_rx += 1;
+                b.bytes_rx += len as u64;
+            }
+        }
         let b = Self::bucket_mut(&mut self.sec60, ts_us, 60_000_000, SEC60_RETAIN);
-        b.packets += 1;
-        b.bytes += len as u64;
+        match dir {
+            Dir::Tx => {
+                b.pkts_tx += 1;
+                b.bytes_tx += len as u64;
+            }
+            Dir::Rx => {
+                b.pkts_rx += 1;
+                b.bytes_rx += len as u64;
+            }
+        }
     }
 
-    fn add_lost(&mut self, ts_us: u64, lost: u64) {
+    fn add_lost(&mut self, ts_us: u64, lost: u64, dir: Dir) {
         if lost == 0 {
             return;
         }
         if self.last_seen_us.is_none() {
             self.last_seen_us = Some(ts_us);
         }
-        self.lost_total += lost;
+        match dir {
+            Dir::Tx => self.lost_tx += lost,
+            Dir::Rx => self.lost_rx += lost,
+        }
         let b = Self::bucket_mut(&mut self.sec1, ts_us, 1_000_000, SEC1_RETAIN);
-        b.lost += lost;
+        match dir {
+            Dir::Tx => b.lost_tx += lost,
+            Dir::Rx => b.lost_rx += lost,
+        }
         let b = Self::bucket_mut(&mut self.sec60, ts_us, 60_000_000, SEC60_RETAIN);
-        b.lost += lost;
+        match dir {
+            Dir::Tx => b.lost_tx += lost,
+            Dir::Rx => b.lost_rx += lost,
+        }
     }
 
     fn active_add(&mut self, delta: i32) {
         self.active_calls = self.active_calls.saturating_add_signed(delta);
     }
 
-    /// Aggregate (packets, lost) over the last `window_secs` (0 = all-time).
-    fn window(&self, window_secs: u64) -> (u64, u64) {
-        if window_secs == 0 {
-            return (self.pkts_total, self.lost_total);
+    /// All-time packet count in one direction.
+    pub fn pkts_total(&self, dir: Dir) -> u64 {
+        match dir {
+            Dir::Tx => self.pkts_tx,
+            Dir::Rx => self.pkts_rx,
         }
-        if window_secs <= SEC1_RETAIN {
-            return Self::sum_ring(&self.sec1, window_secs);
-        }
-        Self::sum_ring(&self.sec60, window_secs.div_ceil(60))
     }
 
-    fn sum_ring(ring: &VecDeque<(u64, Bucket)>, n: u64) -> (u64, u64) {
+    /// All-time lost-packet count in one direction.
+    pub fn lost_total(&self, dir: Dir) -> u64 {
+        match dir {
+            Dir::Tx => self.lost_tx,
+            Dir::Rx => self.lost_rx,
+        }
+    }
+
+    /// All-time bytes in one direction.
+    #[allow(dead_code)]
+    pub fn bytes_total(&self, dir: Dir) -> u64 {
+        match dir {
+            Dir::Tx => self.bytes_tx,
+            Dir::Rx => self.bytes_rx,
+        }
+    }
+
+    /// All-time bytes in both directions.
+    #[allow(dead_code)]
+    pub fn bytes_total_all(&self) -> u64 {
+        self.bytes_tx + self.bytes_rx
+    }
+
+    /// Aggregate (packets, lost) over the last `window_secs` (0 = all-time)
+    /// for one direction.
+    fn window(&self, window_secs: u64, dir: Dir) -> (u64, u64) {
+        if window_secs == 0 {
+            return (self.pkts_total(dir), self.lost_total(dir));
+        }
+        if window_secs <= SEC1_RETAIN {
+            return Self::sum_ring(&self.sec1, window_secs, dir);
+        }
+        Self::sum_ring(&self.sec60, window_secs.div_ceil(60), dir)
+    }
+
+    fn sum_ring(ring: &VecDeque<(u64, Bucket)>, n: u64, dir: Dir) -> (u64, u64) {
         let (mut pkts, mut lost) = (0u64, 0u64);
         for (_, b) in ring.iter().rev().take(n as usize) {
-            pkts += b.packets;
-            lost += b.lost;
+            match dir {
+                Dir::Tx => {
+                    pkts += b.pkts_tx;
+                    lost += b.lost_tx;
+                }
+                Dir::Rx => {
+                    pkts += b.pkts_rx;
+                    lost += b.lost_rx;
+                }
+            }
         }
         (pkts, lost)
     }
 
-    /// Loss percentage (0..100) for a window, or None when no packets observed.
-    pub fn loss_pct(&self, window_secs: u64) -> Option<f64> {
-        let (pkts, lost) = self.window(window_secs);
+    /// Loss percentage (0..100) for a window and direction, or None when no
+    /// packets were observed in that direction.
+    pub fn loss_pct(&self, window_secs: u64, dir: Dir) -> Option<f64> {
+        let (pkts, lost) = self.window(window_secs, dir);
         if pkts == 0 {
             None
         } else {
@@ -167,26 +268,49 @@ impl IpStats {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn pkts_in(&self, window_secs: u64) -> u64 {
-        self.window(window_secs).0
+    /// Merged TX+RX loss percentage (sort keys, compact summaries).
+    pub fn loss_pct_total(&self, window_secs: u64) -> Option<f64> {
+        let (p1, l1) = self.window(window_secs, Dir::Tx);
+        let (p2, l2) = self.window(window_secs, Dir::Rx);
+        let pkts = p1 + p2;
+        if pkts == 0 {
+            None
+        } else {
+            Some((l1 + l2) as f64 / pkts as f64 * 100.0)
+        }
     }
 
+    /// Packets in a window for one direction.
     #[allow(dead_code)]
-    pub fn bytes_in(&self, window_secs: u64) -> u64 {
+    pub fn pkts_in(&self, window_secs: u64, dir: Dir) -> u64 {
+        self.window(window_secs, dir).0
+    }
+
+    /// Bytes in a window for one direction.
+    #[allow(dead_code)]
+    pub fn bytes_in(&self, window_secs: u64, dir: Dir) -> u64 {
         if window_secs == 0 {
-            return self.bytes_total;
+            return self.bytes_total(dir);
         }
-        if window_secs <= SEC1_RETAIN {
-            self.sec1.iter().rev().take(window_secs as usize).map(|(_, b)| b.bytes).sum()
+        let (ring, n) = if window_secs <= SEC1_RETAIN {
+            (&self.sec1, window_secs)
         } else {
-            self.sec60.iter().rev().take(window_secs.div_ceil(60) as usize).map(|(_, b)| b.bytes).sum()
+            (&self.sec60, window_secs.div_ceil(60))
+        };
+        let mut bytes = 0u64;
+        for (_, b) in ring.iter().rev().take(n as usize) {
+            match dir {
+                Dir::Tx => bytes += b.bytes_tx,
+                Dir::Rx => bytes += b.bytes_rx,
+            }
         }
+        bytes
     }
 
     /// Column series for the bottom heatmap: up to `cols` buckets covering the
     /// last `window_secs`, each a (bucket_start_us, loss_pct). Uses the 1s ring
-    /// (aggregated) for ≤10m windows and the 1m ring for longer ones.
+    /// (aggregated) for ≤10m windows and the 1m ring for longer ones. Loss is
+    /// the merged TX+RX rate.
     pub fn heatmap_columns(&self, window_secs: u64, cols: u64) -> Vec<(u64, f64)> {
         let (ring, bucket_us, secs_per_key) = if window_secs <= SEC1_RETAIN * 10 {
             (&self.sec1, 1_000_000u64, 1u64)
@@ -200,8 +324,8 @@ impl IpStats {
         for (key, b) in ring {
             let g = key / group;
             let e = map.entry(g).or_default();
-            e.0 += b.packets;
-            e.1 += b.lost;
+            e.0 += b.packets();
+            e.1 += b.lost();
         }
         map.into_iter()
             .map(|(g, (p, l))| {
@@ -231,12 +355,12 @@ impl IpStatsStore {
         self.map.entry(ip).or_insert_with(|| IpStats::new(ip))
     }
 
-    pub fn observe_packet(&mut self, ip: IpAddr, ts_us: u64, len: usize) {
-        self.entry(ip).add_packet(ts_us, len);
+    pub fn observe_packet(&mut self, ip: IpAddr, ts_us: u64, len: usize, dir: Dir) {
+        self.entry(ip).add_packet(ts_us, len, dir);
     }
 
-    pub fn observe_lost(&mut self, ip: IpAddr, ts_us: u64, lost: u64) {
-        self.entry(ip).add_lost(ts_us, lost);
+    pub fn observe_lost(&mut self, ip: IpAddr, ts_us: u64, lost: u64, dir: Dir) {
+        self.entry(ip).add_lost(ts_us, lost, dir);
     }
 
     pub fn add_active(&mut self, ip: IpAddr, delta: i32) {
@@ -263,21 +387,51 @@ mod tests {
         for i in 0..30 {
             let ts = 1_000_000 + i * 1_000_000;
             for _ in 0..10 {
-                st.observe_packet(ip, ts, 160);
+                st.observe_packet(ip, ts, 160, Dir::Tx);
             }
             if i % 10 == 0 {
-                st.observe_lost(ip, ts, 1); // 1 lost / 100 pkts = 1%
+                st.observe_lost(ip, ts, 1, Dir::Tx); // 1 lost / 100 pkts = 1%
             }
         }
         let s = st.snapshot().pop().unwrap();
-        assert_eq!(s.pkts_total, 300);
-        assert_eq!(s.bytes_total, 300 * 160);
-        assert_eq!(s.lost_total, 3);
-        assert!((s.loss_pct(0).unwrap() - 1.0).abs() < 1e-9); // all-time
-        assert!((s.loss_pct(10).unwrap() - 1.0).abs() < 1e-9); // 10s window includes one lost
-        assert_eq!(s.loss_pct(1).unwrap(), 0.0); // last 1s: no loss
-        assert_eq!(s.pkts_in(10), 100);
-        assert_eq!(s.bytes_in(5), 5 * 10 * 160);
+        assert_eq!(s.pkts_total(Dir::Tx), 300);
+        assert_eq!(s.pkts_tx, 300);
+        assert_eq!(s.pkts_rx, 0);
+        assert_eq!(s.bytes_total(Dir::Tx), 300 * 160);
+        assert_eq!(s.lost_total(Dir::Tx), 3);
+        assert!((s.loss_pct(0, Dir::Tx).unwrap() - 1.0).abs() < 1e-9); // all-time
+        assert!((s.loss_pct(10, Dir::Tx).unwrap() - 1.0).abs() < 1e-9); // 10s window includes one lost
+        assert_eq!(s.loss_pct(1, Dir::Tx).unwrap(), 0.0); // last 1s: no loss
+        assert_eq!(s.pkts_in(10, Dir::Tx), 100);
+        assert_eq!(s.bytes_in(5, Dir::Tx), 5 * 10 * 160);
+        // RX untouched → no loss rate.
+        assert_eq!(s.loss_pct(0, Dir::Rx), None);
+        assert!((s.loss_pct_total(0).unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn directions_stay_separate() {
+        let mut st = IpStatsStore::new();
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let ts = 1_000_000;
+        for _ in 0..10 {
+            st.observe_packet(ip, ts, 100, Dir::Tx);
+        }
+        for _ in 0..20 {
+            st.observe_packet(ip, ts, 200, Dir::Rx);
+        }
+        st.observe_lost(ip, ts, 2, Dir::Tx);
+        st.observe_lost(ip, ts, 4, Dir::Rx);
+        let s = st.snapshot().pop().unwrap();
+        assert_eq!(s.pkts_tx, 10);
+        assert_eq!(s.pkts_rx, 20);
+        assert_eq!(s.bytes_tx, 10 * 100);
+        assert_eq!(s.bytes_rx, 20 * 200);
+        assert!((s.loss_pct(0, Dir::Tx).unwrap() - 20.0).abs() < 1e-9);
+        assert!((s.loss_pct(0, Dir::Rx).unwrap() - 20.0).abs() < 1e-9);
+        // Merged view is the sum.
+        assert!((s.loss_pct_total(0).unwrap() - 20.0).abs() < 1e-9);
+        assert_eq!(s.bytes_total_all(), 10 * 100 + 20 * 200);
     }
 
     #[test]
@@ -297,9 +451,9 @@ mod tests {
         let ip: IpAddr = "10.1.2.3".parse().unwrap();
         let ts = 1_000_000;
         for _ in 0..8 {
-            st.observe_packet(ip, ts, 160);
+            st.observe_packet(ip, ts, 160, Dir::Tx);
         }
-        st.observe_lost(ip, ts, 2);
+        st.observe_lost(ip, ts, 2, Dir::Tx);
         let s = st.snapshot().pop().unwrap();
         let cols = s.heatmap_columns(60, 60);
         assert_eq!(cols.len(), 1);

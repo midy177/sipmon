@@ -113,7 +113,7 @@ tcpdump -i eth0 -w - | sipmon -
 | **Overview** | `1` | Summary cards (active/completed/failed, avg PDD/jitter/loss, ASR) + call table |
 | **Search** | `2` or `/` | Search Call-ID / From / To / remote IP / SSRC; `Enter` opens the call |
 | **Call Detail** | `3` | Details for the opened call (see below) |
-| **Heatmap** | `4` | ASR grid over time × remote IP; `b` switches bucket granularity |
+| **Heatmap** | `4` | Per-IP packet-loss grid over time; `s` sort, `w` window |
 | **Streams** | `5` | Per-RTP-stream live stats table (SSRC/Codec/loss/jitter/RTT/MOS) |
 | **Event Log** | `6` | Diagnostics and call-state-change events |
 | **IP Stats** | `7` | Per-IP network stats: time-windowed loss, volume, heatmap, drill-down |
@@ -125,15 +125,17 @@ tcpdump -i eth0 -w - | sipmon -
 ### Global keys
 
 ```
-Tab / Shift-Tab   Switch page (inside Call Detail: switch the right pane sub-view)
+Tab / Shift-Tab   Switch page (1 → 7 → 1 …; the bottom tab bar highlights it)
 1-7               Jump to the matching page
 /                 Search (enters Search edit mode)
 Space             Pause / resume
 e                 Export the current snapshot as JSONL (sipmon-export-*.jsonl)
-b                 Switch heatmap bucket granularity (15m→1h→1d)
 x                 Clear all calls/stats (in-memory; the evlog keeps writing)
 q / Esc / Ctrl-C  Quit
 ```
+
+A 1-7 page tab bar is pinned to the bottom of every page; the active page is
+highlighted.
 
 ### Call table columns
 
@@ -147,44 +149,52 @@ Setup  INVITE → 200 OK (answer)                End    who hung up: BYE→ (cal
 ### IP Stats page
 
 Per-IP network conditions, aggregated from every RTP/RTCP packet and stream
-loss (all endpoints of each stream are credited):
+loss. Each IP's traffic is split by direction — **TX** = sent by the IP
+(egress), **RX** = received by the IP (ingress):
 
 ```
-IP   Act  1s   5s   10s  20s  1m   10m  1h   all  Bytes    Pkts
-Act  concurrent active calls involving the IP
-1s..all  loss % over each sliding window (1s/5s/10s/20s/1m/10m/1h/all-time)
-Bytes / Pkts  cumulative traffic volume and packet count for the IP
+IP   Act  TX pkts  RX pkts  TX bytes  RX bytes  TX loss%  RX loss%
+Act        concurrent active calls involving the IP
+TX/RX      count, bytes and loss % for each direction (all-time)
 ```
 
+- **Loss-only summary**: `c` collapses the table to just `IP  Act  TX loss%
+  RX loss%` for a single window; `w` cycles the window (1s→…→1h→all). `c`
+  again restores the full table.
 - **Bottom heatmap**: loss% over time for every IP; `w` cycles the window
-  (last 1m → 10m → 1h).
-- **Sort**: `s` cycles `newest` → `max-loss` → `min-loss`.
+  (last 1m → 10m → 1h). Hidden in loss-only mode.
+- **Sort**: `s` cycles `newest` → `max-loss` → `min-loss`. The row order
+  refreshes at most every 5s so the list doesn't reshuffle while traffic
+  updates the loss numbers.
 - **Drill-down**: `Enter` on an IP lists the calls involving it (with their
   packet/MOS/hangup summary); `Enter` on a call opens the full Call Detail,
   `Esc`/`←` returns to the IP list.
 
 ### Call Detail side-by-side layout
 
-Opening a call shows a fixed two-pane layout: **left = Flow message table**, **right = selected message / call details**. In Overview/Search, `Enter` opens the selected call (defaults to the first row when nothing is selected).
+Opening a call shows a fixed four-pane layout. In Overview/Search, `Enter` opens the selected call (defaults to the first row when nothing is selected):
 
 ```
 ┌ Top bar ───────────────────────────────────────────┐
 │ Call <id> (from → to) [state]                      │
-├───────────────┬────────────────────────────────────┤
-│ Left: Flow    │ Right: [Raw|Network|Diagnostics]   │
-│ message table │   Raw        = full bytes of the   │
-│ (selectable)  │                 selected message   │
-│               │   Network    = call-level media     │
-│               │                 stream stats        │
-│               │   Diagnostics= call-level diagnostics│
-└───────────────┴────────────────────────────────────┘
+├───────────────────┬────────────────────────────────┤
+│ Flow message list │ Raw (headers + SDP of the      │
+│ (selectable) 4/5  │ selected message) 2/3          │
+│                   │                                │
+├───────────────────┤────────────────────────────────┤
+│ Diagnostics 1/5   │ Network (media stream stats) 1/3│
+└───────────────────┴────────────────────────────────┘
 ```
+
+- **Left top (4/5)**: Flow — chronological SIP message list; `↑`/`↓` selects a message.
+- **Left bottom (1/5)**: Diagnostics for the call.
+- **Right top (2/3)**: Raw — full bytes of the selected message (`PgUp`/`PgDn` scrolls long text).
+- **Right bottom (1/3)**: Network — traffic totals (TX=caller) + per-stream media table.
 
 Keys inside Call Detail:
 
 ```
 ↑ / ↓        Select a message in the left Flow table (Raw follows)
-Tab          Cycle the right sub-view Raw → Network → Diagnostics
 PgUp/PgDn   Scroll long Raw text
 ← / Esc      Back to the list (Overview)
 ```
