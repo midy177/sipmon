@@ -4,3 +4,7 @@ target/
 *.pcap
 __pycache__/
 .opencode/
+
+# local marketing drafts (not tracked)
+docs/zhihu.md
+docs/rustcc.md
