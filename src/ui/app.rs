@@ -1,0 +1,315 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::widgets::TableState;
+
+use crate::store::registry::Snapshot;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    Overview,
+    Search,
+    CallDetail,
+    Heatmap,
+    Streams,
+    EventLog,
+}
+
+impl Page {
+    pub fn title(self) -> &'static str {
+        match self {
+            Page::Overview => "Overview",
+            Page::Search => "Search",
+            Page::CallDetail => "Call Detail",
+            Page::Heatmap => "Heatmap",
+            Page::Streams => "Streams",
+            Page::EventLog => "Event Log",
+        }
+    }
+    pub const ALL: [Page; 6] = [
+        Page::Overview,
+        Page::Search,
+        Page::CallDetail,
+        Page::Heatmap,
+        Page::Streams,
+        Page::EventLog,
+    ];
+}
+
+pub struct App {
+    pub snap: Arc<Mutex<Snapshot>>,
+    pub pause: Arc<AtomicBool>,
+    pub focus_id: Arc<Mutex<Option<String>>>,
+    pub page: Page,
+    pub search_query: String,
+    pub search_editing: bool,
+    pub search_state: TableState,
+    pub table_state: TableState,
+    /// Call-id the user just selected (Enter) but whose focus detail the worker
+    /// has not republished into the snapshot yet — used to avoid a misleading
+    /// "No call selected" flash on the Call Detail page.
+    pub focus_pending: Option<String>,
+    pub streams_state: TableState,
+    pub eventlog_scroll: u16,
+    pub detail_tab: usize, // right pane: 0=Raw 1=Network 2=Diagnostics
+    pub raw_scroll: usize,
+    pub flow_state: TableState,
+    pub should_quit: bool,
+    pub status: String,
+    pub export_path: Option<std::path::PathBuf>,
+    pub bucket_secs: u64,
+}
+
+impl App {
+    pub fn new(
+        snap: Arc<Mutex<Snapshot>>,
+        pause: Arc<AtomicBool>,
+        focus: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            snap,
+            pause,
+            focus_id: focus,
+            page: Page::Overview,
+            search_query: String::new(),
+            search_editing: false,
+            search_state: TableState::default(),
+            table_state: TableState::default(),
+            focus_pending: None,
+            streams_state: TableState::default(),
+            eventlog_scroll: 0,
+            detail_tab: 0,
+            raw_scroll: 0,
+            flow_state: TableState::default(),
+            should_quit: false,
+            status: String::new(),
+            export_path: None,
+            bucket_secs: 900,
+        }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.snap.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    pub fn set_status(&mut self, s: impl Into<String>) {
+        self.status = s.into();
+    }
+
+    /// Main event loop tick. Returns false when the app should exit.
+    pub fn poll(&mut self, timeout: Duration) -> bool {
+        if event::poll(timeout).unwrap_or(false)
+            && let Ok(Event::Key(key)) = event::read()
+            && key.kind == KeyEventKind::Press
+        {
+            self.on_key(key.code, key.modifiers);
+        }
+        !self.should_quit
+    }
+
+    fn cycle_page(&mut self, fwd: bool) {
+        let idx = Page::ALL.iter().position(|p| *p == self.page).unwrap_or(0);
+        let n = Page::ALL.len();
+        let next = if fwd {
+            (idx + 1) % n
+        } else {
+            (idx + n - 1) % n
+        };
+        self.page = Page::ALL[next];
+    }
+
+    fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // Global: quit / pause / page switching / export.
+        if self.search_editing {
+            match code {
+                KeyCode::Esc => {
+                    self.search_editing = false;
+                }
+                KeyCode::Enter => {
+                    self.search_editing = false;
+                    self.search_state.select(Some(0));
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                }
+                KeyCode::Char(c) => self.search_query.push(c),
+                _ => {}
+            }
+            return;
+        }
+
+        match code {
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.should_quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if self.page == Page::CallDetail {
+                    // Esc goes back to the previous list view.
+                    self.page = Page::Overview;
+                    self.focus_pending = None;
+                    self.focus_id.lock().ok().map(|mut f| f.take());
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            KeyCode::Left => {
+                if self.page == Page::CallDetail {
+                    self.page = Page::Overview;
+                    self.focus_pending = None;
+                    self.focus_id.lock().ok().map(|mut f| f.take());
+                }
+            }
+            KeyCode::Tab => {
+                if self.page == Page::CallDetail {
+                    self.detail_tab = (self.detail_tab + 1) % 3;
+                } else {
+                    self.cycle_page(true);
+                }
+            }
+            KeyCode::BackTab => {
+                if self.page == Page::CallDetail {
+                    self.detail_tab = (self.detail_tab + 2) % 3;
+                } else {
+                    self.cycle_page(false);
+                }
+            }
+            KeyCode::Char(' ') => {
+                let paused = !self.pause.load(Ordering::Relaxed);
+                self.pause.store(paused, Ordering::Relaxed);
+                self.set_status(if paused { "paused" } else { "resumed" });
+            }
+            KeyCode::Char('1') => self.page = Page::Overview,
+            KeyCode::Char('2') => self.page = Page::Search,
+            KeyCode::Char('3') => self.page = Page::CallDetail,
+            KeyCode::Char('4') => self.page = Page::Heatmap,
+            KeyCode::Char('5') => self.page = Page::Streams,
+            KeyCode::Char('6') => self.page = Page::EventLog,
+            KeyCode::Char('/') => {
+                self.page = Page::Search;
+                self.search_editing = true;
+            }
+            KeyCode::Char('e') => self.do_export(),
+            KeyCode::Char('b') => {
+                self.bucket_secs = match self.bucket_secs {
+                    900 => 3600,
+                    3600 => 86_400,
+                    _ => 900,
+                };
+                self.set_status(format!("bucket = {}s", self.bucket_secs));
+            }
+            _ => self.page_key(code),
+        }
+    }
+
+    fn do_export(&mut self) {
+        let snap = self.snapshot();
+        let path = std::path::PathBuf::from(format!(
+            "sipmon-export-{}.jsonl",
+            chrono::Utc::now().format("%Y%m%d%H%M%S")
+        ));
+        match crate::export::jsonl::export_snapshot(&path, &snap) {
+            Ok(()) => {
+                self.set_status(format!("exported {}", path.display()));
+                self.export_path = Some(path);
+            }
+            Err(e) => self.set_status(format!("export failed: {e}")),
+        }
+    }
+
+    /// Request the focus detail for `call_id` and switch to the Call Detail
+    /// page. `focus_pending` hides the "No call selected" placeholder until the
+    /// pipeline republishes the snapshot with the focused detail.
+    fn open_detail(&mut self, call_id: String) {
+        if let Ok(mut f) = self.focus_id.lock() {
+            *f = Some(call_id.clone());
+        }
+        self.focus_pending = Some(call_id);
+        self.page = Page::CallDetail;
+        self.detail_tab = 0;
+        self.raw_scroll = 0;
+    }
+
+    fn page_key(&mut self, code: KeyCode) {
+        let snap = self.snapshot();
+        match self.page {
+            Page::Overview => match code {
+                KeyCode::Down => self.table_state.select_next(),
+                KeyCode::Up => self.table_state.select_previous(),
+                KeyCode::Enter => {
+                    // Enter opens the selected call (first row when none is
+                    // selected yet).
+                    let idx = self
+                        .table_state
+                        .selected()
+                        .or_else(|| (!snap.calls.is_empty()).then_some(0));
+                    if let Some(i) = idx
+                        && let Some(c) = snap.calls.get(i)
+                    {
+                        self.open_detail(c.call_id.clone());
+                    }
+                }
+                _ => {}
+            },
+            Page::Search => match code {
+                KeyCode::Down => self.search_state.select_next(),
+                KeyCode::Up => self.search_state.select_previous(),
+                KeyCode::Enter => {
+                    let results = search_results(&snap, &self.search_query);
+                    let idx = self
+                        .search_state
+                        .selected()
+                        .or_else(|| (!results.is_empty()).then_some(0));
+                    if let Some(i) = idx
+                        && let Some(c) = results.get(i)
+                    {
+                        self.open_detail(c.call_id.clone());
+                    }
+                }
+                _ => {}
+            },
+            Page::CallDetail => match code {
+                KeyCode::Down => self.flow_state.select_next(),
+                KeyCode::Up => self.flow_state.select_previous(),
+                KeyCode::PageDown => self.raw_scroll = self.raw_scroll.saturating_add(1),
+                KeyCode::PageUp => self.raw_scroll = self.raw_scroll.saturating_sub(1),
+                _ => {}
+            },
+            Page::Streams => match code {
+                KeyCode::Down => self.streams_state.select_next(),
+                KeyCode::Up => self.streams_state.select_previous(),
+                _ => {}
+            },
+            Page::EventLog => match code {
+                KeyCode::Down => self.eventlog_scroll = self.eventlog_scroll.saturating_add(1),
+                KeyCode::Up => self.eventlog_scroll = self.eventlog_scroll.saturating_sub(1),
+                _ => {}
+            },
+            Page::Heatmap => {}
+        }
+    }
+}
+
+/// sngrep-style search: Call-ID / From / To / remote IP / SSRC substring.
+pub fn search_results<'a>(
+    snap: &'a Snapshot,
+    query: &str,
+) -> Vec<&'a crate::store::registry::CallSummary> {
+    let q = query.trim().to_ascii_lowercase();
+    snap.calls
+        .iter()
+        .filter(|c| {
+            if q.is_empty() {
+                return true;
+            }
+            c.call_id.to_ascii_lowercase().contains(&q)
+                || c.from_user
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(&q))
+                    .unwrap_or(false)
+                || c.to_user
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(&q))
+                    .unwrap_or(false)
+        })
+        .collect()
+}
