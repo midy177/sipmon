@@ -227,15 +227,44 @@ fn render_network(f: &mut Frame, area: Rect, focus: &crate::store::registry::Foc
     ])
     .split(area);
 
-    // Cumulative TX/RX bytes + average rates, split by the caller side.
-    let caller = focus.caller_addr;
+    // Split the call's media into TX (from the caller) / RX (toward the caller).
+    // Match streams to the caller by IP; when both parties share an IP
+    // (loopback), pair the reverse flows so each direction lands in its own
+    // bucket instead of everything collapsing into one side.
+    let caller_ip = focus.caller_ip;
+    let streams = &focus.streams;
+    let flows: Vec<Option<crate::model::packet::Flow5Tuple>> =
+        streams.iter().map(|s| s.flow).collect();
+    let mut is_tx = vec![false; streams.len()];
+    let mut paired = vec![false; streams.len()];
+    for i in 0..streams.len() {
+        if paired[i] {
+            continue;
+        }
+        let rev = flows[i].map(|f| f.reverse());
+        let j = flows.iter().position(|f| *f == rev);
+        if let Some(j) = j.filter(|&j| j != i) {
+            let i_tx = caller_ip
+                .map(|cip| flows[i].map(|f| f.src.ip()) == Some(cip))
+                .unwrap_or(true);
+            is_tx[i] = i_tx;
+            paired[i] = true;
+            is_tx[j] = !i_tx;
+            paired[j] = true;
+        }
+    }
     let mut tx_bytes = 0u64;
     let mut rx_bytes = 0u64;
     let mut tx_rate = 0.0f64;
     let mut rx_rate = 0.0f64;
-    for s in &focus.streams {
+    for (i, s) in streams.iter().enumerate() {
         let rate = stream_bytes_per_sec(s);
-        if s.flow.map(|fl| fl.src) == caller {
+        let tx = if paired[i] {
+            is_tx[i]
+        } else {
+            flows[i].map(|f| f.src.ip()) == caller_ip
+        };
+        if tx {
             tx_bytes += s.bytes;
             tx_rate += rate;
         } else {
@@ -346,8 +375,11 @@ fn stream_bytes_per_sec(s: &StreamSummary) -> f64 {
 }
 
 /// Bidirectional throughput waveform: one series per stream, plotted from the
-/// per-stream 5s sample history (KB/s).
+/// per-stream 5s sample history (KB/s). Shows a rolling 60s window so the
+/// shape stays readable while the call runs.
 type Series = (String, Vec<(f64, f64)>, Color);
+
+const WAVE_WINDOW_US: u64 = 60_000_000; // 60s of visible history
 
 fn render_waveform(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus) {
     const COLORS: [Color; 6] = [
@@ -360,6 +392,15 @@ fn render_waveform(f: &mut Frame, area: Rect, focus: &crate::store::registry::Fo
     ];
     const WINDOW_US: f64 = 5_000_000.0;
 
+    // Rolling window: the newest 5s sample across all streams is "now".
+    let now = focus
+        .streams
+        .iter()
+        .filter_map(|s| s.history.last().map(|h| h.ts_us))
+        .max()
+        .unwrap_or(0);
+    let window_start = now.saturating_sub(WAVE_WINDOW_US);
+
     let mut series: Vec<Series> = Vec::new();
     let mut x_max = 1.0f64;
     let mut y_max = 1.0f64;
@@ -367,19 +408,27 @@ fn render_waveform(f: &mut Frame, area: Rect, focus: &crate::store::registry::Fo
         if s.history.is_empty() {
             continue;
         }
-        let start = s.history[0].ts_us;
-        let mut pts = Vec::with_capacity(s.history.len());
-        for (j, h) in s.history.iter().enumerate() {
-            let x = (h.ts_us.saturating_sub(start)) as f64 / 1_000_000.0;
-            let dt_us = if j == 0 {
-                WINDOW_US
-            } else {
-                h.ts_us.saturating_sub(s.history[j - 1].ts_us).max(1) as f64
+        let mut pts = Vec::new();
+        let mut prev_ts: Option<u64> = None;
+        for h in &s.history {
+            if h.ts_us < window_start {
+                // Keep as the rate reference for the first visible point.
+                prev_ts = Some(h.ts_us);
+                continue;
+            }
+            let x = (h.ts_us.saturating_sub(window_start)) as f64 / 1_000_000.0;
+            let dt_us = match prev_ts {
+                Some(p) => h.ts_us.saturating_sub(p).max(1) as f64,
+                None => WINDOW_US,
             };
+            prev_ts = Some(h.ts_us);
             let kbps = h.bytes as f64 / (dt_us / 1_000_000.0) / 1024.0;
             x_max = x_max.max(x);
             y_max = y_max.max(kbps);
             pts.push((x, kbps));
+        }
+        if pts.is_empty() {
+            continue;
         }
         let cur = pts.last().map(|p| p.1).unwrap_or(0.0);
         let label = match s.flow {
@@ -410,11 +459,14 @@ fn render_waveform(f: &mut Frame, area: Rect, focus: &crate::store::registry::Fo
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Throughput KB/s (5s buckets)"),
+                .title("Throughput KB/s (last 60s, 5s buckets)"),
         )
         .x_axis(
             Axis::default()
-                .title(Span::styled("elapsed s", Style::default().fg(theme::MUTED)))
+                .title(Span::styled(
+                    "elapsed s (rolling 60s)",
+                    Style::default().fg(theme::MUTED),
+                ))
                 .style(Style::default().fg(theme::MUTED))
                 .bounds([0.0, x_max]),
         )

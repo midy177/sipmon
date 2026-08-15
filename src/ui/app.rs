@@ -12,16 +12,20 @@ use crate::store::registry::{CallSummary, Snapshot};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallFilter {
     All,
-    Pending,
+    Dialing,
+    Ringing,
+    Active,
     Completed,
     Failed,
     Canceled,
 }
 
 impl CallFilter {
-    pub const ALL: [CallFilter; 5] = [
+    pub const ALL: [CallFilter; 7] = [
         CallFilter::All,
-        CallFilter::Pending,
+        CallFilter::Dialing,
+        CallFilter::Ringing,
+        CallFilter::Active,
         CallFilter::Completed,
         CallFilter::Failed,
         CallFilter::Canceled,
@@ -29,7 +33,9 @@ impl CallFilter {
     pub fn label(self) -> &'static str {
         match self {
             CallFilter::All => "all",
-            CallFilter::Pending => "pending",
+            CallFilter::Dialing => "dialing",
+            CallFilter::Ringing => "ringing",
+            CallFilter::Active => "active",
             CallFilter::Completed => "success",
             CallFilter::Failed => "failed",
             CallFilter::Canceled => "canceled",
@@ -38,10 +44,9 @@ impl CallFilter {
     pub fn matches(self, s: CallState) -> bool {
         match self {
             CallFilter::All => true,
-            CallFilter::Pending => matches!(
-                s,
-                CallState::Dialing | CallState::Ringing | CallState::Active
-            ),
+            CallFilter::Dialing => s == CallState::Dialing,
+            CallFilter::Ringing => s == CallState::Ringing,
+            CallFilter::Active => s == CallState::Active,
             CallFilter::Completed => s == CallState::Completed,
             CallFilter::Failed => s == CallState::Failed,
             CallFilter::Canceled => s == CallState::Canceled,

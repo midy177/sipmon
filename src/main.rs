@@ -183,6 +183,12 @@ impl Shared {
 }
 
 fn main() -> Result<()> {
+    // Never die on a closed pipe (e.g. `sipmon ... | head`): ignore SIGPIPE.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     // `sipmon -` == stdin pcap stream mode.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("-") {
@@ -833,6 +839,7 @@ fn build_jsonl_focus(
         caller_ua: None,
         callee_ua: None,
         caller_addr: None,
+        caller_ip: None,
         callee_addr: None,
         messages: Vec::new(),
         streams: Vec::new(),

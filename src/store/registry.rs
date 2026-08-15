@@ -17,6 +17,9 @@ pub struct Focus {
     pub callee_ua: Option<String>,
     /// Caller signaling address (src of the initial INVITE).
     pub caller_addr: Option<std::net::SocketAddr>,
+    /// Caller signaling IP (from the initial INVITE; survives message trimming
+    /// via the call's `invite_key`). Used to split media into TX/RX.
+    pub caller_ip: Option<std::net::IpAddr>,
     /// Callee signaling address (src of the first response).
     pub callee_addr: Option<std::net::SocketAddr>,
     pub messages: Vec<SipMsg>,
@@ -489,6 +492,10 @@ impl Registry {
             .or_else(|| response.and_then(|m| sip_header(&m.raw, "User-Agent")));
         let caller_addr = invite.map(|m| m.flow.src);
         let callee_addr = response.map(|m| m.flow.src);
+        // Caller IP survives message trimming via the call's invite_key.
+        let caller_ip = invite
+            .map(|m| m.flow.src.ip())
+            .or_else(|| call.invite_key.as_deref().and_then(|k| k.parse().ok()));
         let streams = self
             .call_stream_keys(call_id)
             .iter()
@@ -509,6 +516,7 @@ impl Registry {
             caller_ua,
             callee_ua,
             caller_addr,
+            caller_ip,
             callee_addr,
             messages: msgs,
             streams,

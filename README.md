@@ -6,6 +6,14 @@ on a running PBX**. Inputs may be a live capture, a pcap file, a stdin stream, o
 previously recorded event log; output is a live TUI monitor plus exportable
 analysis results (SQLite / JSONL).
 
+## Demo
+
+Animated walkthrough (recorded with [asciinema](https://asciinema.org), driven by
+a live `sipbot` caller/callee pair plus a synthetic load pcap). Source recording:
+`demo/demo.cast` — replay it with `asciinema play demo/demo.cast`.
+
+![sipmon demo](demo/sipmon-demo.svg)
+
 ## Features
 
 - **Multiple input sources**: live interface (libpcap + BPF), offline pcap/pcapng, stdin `tcpdump -w -` stream, event-log replay
