@@ -3,3 +3,4 @@ target/
 *.log
 *.pcap
 __pycache__/
+.opencode/
