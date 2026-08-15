@@ -193,7 +193,7 @@ Mode matrix:
 | Live capture | pcap | 2.4 |
 | Offline pcap/pcapng | pcap-file | 3.0 |
 | L2-L4 decoding | etherparse | 0.16 |
-| SIP parsing | rsipstack (path dependency) | 0.5.24 |
+| SIP parsing | rsipstack | 0.6.2 |
 | RTP/RTCP/jitter/loss | **vendor** media_stats.rs | — |
 | SQLite export | rusqlite (bundled feature) | 0.32 |
 | Runtime | tokio (full) | 1.52 |

@@ -1,6 +1,6 @@
 [package]
 name = "sipmon"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Passive SIP/RTP signaling & media quality monitoring (pcap/live, TUI + SQLite/JSONL export)"
 license = "MIT"
@@ -31,8 +31,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 dashmap = "6"
 # decode
 etherparse = "0.16"
-# SIP parsing (transport features are not feature-gated upstream; parser usage only)
-rsipstack = { path = "../rsipstack", version = "0.5" }
+# SIP parsing (parser + message model only; no network stack)
+rsipstack = "0.6.2"
 # capture
 pcap = "2.4"
 # daemonization / signal handling (record -d)
