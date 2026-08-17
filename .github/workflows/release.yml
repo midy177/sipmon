@@ -34,6 +34,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools make flex bison autoconf automake libtool linux-libc-dev
+          # musl-dev ships no kernel-header symlinks on a fresh runner; point
+          # the musl include dir at linux-libc-dev's UAPI headers so musl-gcc
+          # can find linux/if.h, linux/if_packet.h, etc.
+          sudo ln -sfn /usr/include/linux /usr/include/x86_64-linux-musl/linux
+          sudo ln -sfn /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
+          sudo ln -sfn /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic
 
       - name: Build static libpcap for musl
         run: |
