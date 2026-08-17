@@ -125,7 +125,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 
     let right = Layout::vertical([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)]).split(cols[1]);
     render_raw(f, right[0], &focus.messages, app);
-    render_network(f, right[1], focus, privacy);
+    render_network(f, right[1], focus, privacy, &app.local_ips);
 }
 
 fn display_user(v: Option<&str>, privacy: bool, fallback: &str) -> String {
@@ -180,6 +180,7 @@ fn short_reason(code: u16) -> &'static str {
 fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
     let base = messages.first().map(|m| m.ts_us).unwrap_or(0);
     let privacy = app.privacy;
+    let local = &app.local_ips;
     let flow_w = messages
         .iter()
         .map(|m| {
@@ -208,15 +209,18 @@ fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
         Row::new(vec![
             Cell::from(fmt_time(m.ts_us)),
             Cell::from(format!("{:>8.3}", (m.ts_us - base) as f64 / 1000.0)),
-            Cell::from(format!(
-                "{:<flow_w$} → {:>flow_w$}",
-                short_ip(m.flow.src, privacy),
-                short_ip(m.flow.dst, privacy)
+            Cell::from(dir_flow(
+                m.flow.src.ip(),
+                m.flow.dst.ip(),
+                &short_ip(m.flow.src, privacy),
+                &short_ip(m.flow.dst, privacy),
+                local,
+                flow_w,
             )),
             Cell::from(label).style(style),
         ])
     });
-    let flow_col = flow_w * 2 + 3;
+    let flow_col = flow_w * 2 + 4;
     let table = Table::new(
         rows,
         [
@@ -227,14 +231,21 @@ fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
         ],
     )
     .header(Row::new(
-        ["Time", "Rel ms", "Src→Dst", "Msg"]
+        ["Time", "Rel ms", "Flow", "Msg"]
             .iter()
             .map(|h| Cell::from(*h)),
     ))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!("Flow ({} msgs)", messages.len())),
+            .title(if local.is_empty() {
+                format!("Flow ({} msgs)", messages.len())
+            } else {
+                format!(
+                    "Flow ({} msgs · right=local ->in <-out)",
+                    messages.len()
+                )
+            }),
     )
     .row_highlight_style(Style::default().bg(theme::MUTED));
     f.render_stateful_widget(table, area, &mut app.flow_state);
@@ -249,10 +260,38 @@ fn short_ip(a: std::net::SocketAddr, privacy: bool) -> String {
     }
 }
 
+/// Directional flow cell: the local (monitored) machine is pinned to the right
+/// column and the remote party to the left, with the arrow pointing at the
+/// recipient — `X -> LOCAL` is an inbound message (ingress), `X <- LOCAL` is an
+/// outbound one (egress). Falls back to the raw `left → right` when neither (or
+/// both) endpoint is local. `left`/`right` are the already-masked display
+/// strings, `src_ip`/`dst_ip` the real endpoints used for matching.
+pub(super) fn dir_flow(
+    src_ip: std::net::IpAddr,
+    dst_ip: std::net::IpAddr,
+    left: &str,
+    right: &str,
+    local: &[std::net::IpAddr],
+    w: usize,
+) -> String {
+    let (arrow, l, r) = match (local.contains(&src_ip), local.contains(&dst_ip)) {
+        (false, true) => ("->", left, right), // inbound: remote -> local
+        (true, false) => ("<-", right, left), // outbound: remote <- local
+        _ => ("→", left, right),              // raw: no local anchor
+    };
+    format!("{l:<w$} {arrow} {r:>w$}")
+}
+
 /// Media flow label: IP:port→IP:port (ports included so the RTP endpoints are
-/// fully visible). Both endpoints are padded to width `w` so the → stays
-/// centered across rows.
-fn flow_ip(f: Option<crate::model::packet::Flow5Tuple>, privacy: bool, w: usize) -> String {
+/// fully visible). With a local IP anchor the local endpoint is pinned to the
+/// right and the arrow shows the media direction; both endpoints are padded to
+/// width `w` so the arrow stays centered across rows.
+fn flow_ip(
+    f: Option<crate::model::packet::Flow5Tuple>,
+    privacy: bool,
+    local: &[std::net::IpAddr],
+    w: usize,
+) -> String {
     match f {
         Some(fl) => {
             let src = if privacy {
@@ -265,7 +304,7 @@ fn flow_ip(f: Option<crate::model::packet::Flow5Tuple>, privacy: bool, w: usize)
             } else {
                 fl.dst.to_string()
             };
-            format!("{src:<w$} → {dst:>w$}")
+            dir_flow(fl.src.ip(), fl.dst.ip(), &src, &dst, local, w)
         }
         None => "-".into(),
     }
@@ -612,7 +651,13 @@ fn timeline_line(
     ])
 }
 
-fn render_network(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus, privacy: bool) {
+fn render_network(
+    f: &mut Frame,
+    area: Rect,
+    focus: &crate::store::registry::Focus,
+    privacy: bool,
+    local: &[std::net::IpAddr],
+) {
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
 
     // Split the call's media into TX (from the caller) / RX (toward the caller).
@@ -729,7 +774,7 @@ fn render_network(f: &mut Frame, area: Rect, focus: &crate::store::registry::Foc
         Row::new(vec![
             Cell::from(format!("{:#x}", s.ssrc)),
             Cell::from(s.codec.clone().unwrap_or_else(|| "-".into())),
-            Cell::from(flow_ip(s.flow, privacy, flow_w)),
+            Cell::from(flow_ip(s.flow, privacy, local, flow_w)),
             Cell::from(leg).style(Style::default().fg(theme::ACCENT)),
             Cell::from(s.packets.to_string()),
             Cell::from(s.lost.to_string()),
@@ -744,7 +789,7 @@ fn render_network(f: &mut Frame, area: Rect, focus: &crate::store::registry::Foc
         [
             Constraint::Length(8),
             Constraint::Length(6),
-            Constraint::Length((flow_w * 2 + 3) as u16),
+            Constraint::Length((flow_w * 2 + 4) as u16),
             Constraint::Length(3),
             Constraint::Length(6),
             Constraint::Length(5),
@@ -1008,8 +1053,62 @@ mod tests {
     }
 
     #[test]
-    fn privacy_masks_ips_and_users_in_detail() {
-        let focus = Focus {
+    fn dir_flow_pins_local_to_right_with_arrows() {
+        let local = ["10.20.0.8".parse().unwrap()];
+        // Inbound: remote -> local (arrow points at the local box).
+        let s = dir_flow(
+            "10.10.0.8".parse().unwrap(),
+            "10.20.0.8".parse().unwrap(),
+            "10.10.0.8",
+            "10.20.0.8",
+            &local,
+            9,
+        );
+        assert!(s.contains("->"), "inbound must use ->: {s}");
+        assert!(
+            s.trim_start().starts_with("10.10.0.8"),
+            "remote must stay left: {s}"
+        );
+        assert!(s.ends_with("10.20.0.8"), "local must stay right: {s}");
+        // Outbound: remote <- local.
+        let s = dir_flow(
+            "10.20.0.8".parse().unwrap(),
+            "10.10.0.8".parse().unwrap(),
+            "10.20.0.8",
+            "10.10.0.8",
+            &local,
+            9,
+        );
+        assert!(s.contains("<-"), "outbound must use <-: {s}");
+        assert!(s.trim_start().starts_with("10.10.0.8"));
+        assert!(s.ends_with("10.20.0.8"));
+        // No local match → raw arrow, endpoints unchanged.
+        let s = dir_flow(
+            "10.1.0.1".parse().unwrap(),
+            "10.1.0.2".parse().unwrap(),
+            "10.1.0.1",
+            "10.1.0.2",
+            &local,
+            9,
+        );
+        assert!(s.contains('→'), "no anchor must keep →: {s}");
+        assert!(s.trim_start().starts_with("10.1.0.1"));
+        assert!(s.ends_with("10.1.0.2"));
+        // Both local (loopback) → raw arrow too.
+        let local_lo = ["127.0.0.1".parse().unwrap()];
+        let s = dir_flow(
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1",
+            "127.0.0.1",
+            &local_lo,
+            9,
+        );
+        assert!(s.contains('→'), "loopback must fall back to raw: {s}");
+    }
+
+    #[test]
+    fn privacy_masks_ips_and_users_in_detail() {        let focus = Focus {
             call_id: "c1".into(),
             state: Some(crate::model::sip::CallState::Active),
             from_user: Some("13812345678".into()),

@@ -177,6 +177,9 @@ pub struct App {
     pub record: RecordState,
     /// Privacy mode: masks IPs and caller/callee identifiers (screenshot-safe).
     pub privacy: bool,
+    /// Local (monitored) machine IPs: the Call Detail flow/media views pin the
+    /// local endpoint to the right and draw ingress/egress arrows (`->`/`<-`).
+    pub local_ips: Vec<std::net::IpAddr>,
 }
 
 impl App {
@@ -218,6 +221,7 @@ impl App {
             ip_drill_state: TableState::default(),
             record,
             privacy: false,
+            local_ips: Vec::new(),
         }
     }
 

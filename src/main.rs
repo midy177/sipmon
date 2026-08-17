@@ -65,6 +65,11 @@ struct Cli {
     /// Comma-separated TURN server IPs (optional; also auto-learned)
     #[arg(long, value_delimiter = ',')]
     turn_servers: Vec<std::net::IpAddr>,
+    /// Comma-separated local (monitored) machine IPs; anchors Call Detail flow
+    /// so the local endpoint is always on the right with ingress/egress arrows.
+    /// Defaults to this host's own interface addresses.
+    #[arg(long, value_delimiter = ',')]
+    local_ips: Vec<std::net::IpAddr>,
     /// Truncate stored raw SIP messages to N bytes
     #[arg(long)]
     raw_truncate: Option<usize>,
@@ -338,6 +343,7 @@ fn build_config(cli: &Cli) -> Config {
         max_diagnostics: cli.max_diagnostics,
         diag_level: cli.diag_level.clone(),
         turn_servers: cli.turn_servers.clone(),
+        local_ips: config::resolve_local_ips(&cli.local_ips),
         bucket: Bucket::from_str_lossy(&cli.bucket),
         export_jsonl: cli.export_jsonl.clone(),
         evlog: cli.evlog.clone(),
@@ -606,7 +612,7 @@ fn run_capture_loop(
     });
 
     if with_tui {
-        run_tui(shared.clone())?;
+        run_tui(shared.clone(), &cfg.local_ips)?;
         shared.quit.store(true, Ordering::Relaxed);
         handle
             .join()
@@ -815,7 +821,7 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
     });
 
     if with_tui {
-        run_tui(shared.clone())?;
+        run_tui(shared.clone(), &cfg.local_ips)?;
         shared.quit.store(true, Ordering::Relaxed);
         handle
             .join()
@@ -873,7 +879,7 @@ fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Resul
     });
 
     if with_tui {
-        run_tui(shared.clone())?;
+        run_tui(shared.clone(), &cfg.local_ips)?;
         shared.quit.store(true, Ordering::Relaxed);
         handle
             .join()
@@ -1078,7 +1084,7 @@ fn run_export(
 
 // ----------------------------- TUI -----------------------------
 
-fn run_tui(shared: Arc<Shared>) -> Result<()> {
+fn run_tui(shared: Arc<Shared>, local_ips: &[std::net::IpAddr]) -> Result<()> {
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     crossterm::terminal::enable_raw_mode()?;
@@ -1091,6 +1097,7 @@ fn run_tui(shared: Arc<Shared>) -> Result<()> {
         shared.clear.clone(),
         shared.record.clone(),
     );
+    app.local_ips = local_ips.to_vec();
     let r = (|| -> Result<()> {
         loop {
             terminal.draw(|f| ui::render(f, &mut app))?;

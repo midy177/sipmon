@@ -1,6 +1,6 @@
 [package]
 name = "sipmon"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Passive SIP/RTP signaling & media quality monitoring (pcap/live, TUI + JSONL export)"
 license = "MIT"
@@ -9,7 +9,6 @@ repository = "https://github.com/miuda-ai/sipmon"
 documentation = "https://docs.rs/sipmon"
 keywords = ["sip", "rtp", "monitoring", "pcap", "voip"]
 categories = ["command-line-utilities", "network-programming"]
-exclude = ["demo/"]
 
 [[bin]]
 name = "sipmon"

@@ -14,6 +14,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let mut streams = snap.streams.clone();
     streams.sort_by_key(|s| s.ssrc);
     let privacy = app.privacy;
+    let local = &app.local_ips;
     let flow_w = streams
         .iter()
         .filter_map(|s| s.flow)
@@ -45,7 +46,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
                 } else {
                     f.dst.to_string()
                 };
-                format!("{src:<flow_w$}->{dst:>flow_w$}")
+                super::call_detail::dir_flow(f.src.ip(), f.dst.ip(), &src, &dst, local, flow_w)
             }
             None => "-".into(),
         };
@@ -72,7 +73,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(4),
-            Constraint::Length((flow_w * 2 + 2) as u16),
+            Constraint::Length((flow_w * 2 + 4) as u16),
             Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Length(7),

@@ -131,7 +131,7 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
     // Brand watermark on the top-right corner of the top bar.
     let brand = Paragraph::new(Line::from(Span::styled(
         "by miuda.ai",
-        Style::default().fg(theme::MUTED),
+        Style::default().fg(theme::WARNING),
     )))
     .alignment(ratatui::layout::Alignment::Right);
     let brand_area = Rect {
