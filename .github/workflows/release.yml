@@ -33,15 +33,18 @@ jobs:
       - name: Install musl toolchain + build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools make flex bison
+          sudo apt-get install -y musl-tools make flex bison autoconf automake libtool
 
       - name: Build static libpcap for musl
         run: |
           set -euxo pipefail
           cd /tmp
-          curl -fL -O https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz
-          tar xzf libpcap-1.10.5.tar.gz
-          cd libpcap-1.10.5
+          # Source from the libpcap GitHub repo: github.com is always reachable
+          # from Actions, unlike tcpdump.org (which can be blocked by CDN).
+          git clone --depth 1 --branch libpcap-1.10.5 \
+            https://github.com/the-tcpdump-group/libpcap libpcap-gh
+          cd libpcap-gh
+          autoreconf -i
           CC=musl-gcc AR=ar RANLIB=ranlib ./configure \
             --host=x86_64-linux-musl \
             --disable-shared --enable-static \
@@ -52,7 +55,7 @@ jobs:
 
       - name: Build release binary
         env:
-          LIBPCAP_LIBDIR: /tmp/libpcap-1.10.5
+          LIBPCAP_LIBDIR: /tmp/libpcap-gh
           LIBPCAP_VER: "1.10.5"
         run: cargo build --release --target x86_64-unknown-linux-musl
 
