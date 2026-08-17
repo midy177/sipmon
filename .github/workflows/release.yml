@@ -25,14 +25,14 @@ jobs:
             ar: ar
             ranlib: ranlib
             linker: musl-gcc
-            toolchain_url: ""
+            cross_image: ""
           - target: aarch64-unknown-linux-musl
             host: aarch64-linux-musl
             cc: aarch64-linux-musl-gcc
             ar: aarch64-linux-musl-ar
             ranlib: aarch64-linux-musl-ranlib
             linker: aarch64-linux-musl-gcc
-            toolchain_url: https://musl.cc/aarch64-linux-musl-cross.tgz
+            cross_image: ghcr.io/cross-rs/aarch64-unknown-linux-musl:main
     steps:
       - uses: actions/checkout@v4
 
@@ -51,7 +51,7 @@ jobs:
       - name: Install musl cross toolchain
         run: |
           set -euxo pipefail
-          if [ -z "${{ matrix.toolchain_url }}" ]; then
+          if [ -z "${{ matrix.cross_image }}" ]; then
             sudo apt-get update
             sudo apt-get install -y musl-tools make flex bison autoconf automake libtool linux-libc-dev
             # musl-dev ships no kernel-header symlinks on a fresh runner; point
@@ -63,10 +63,15 @@ jobs:
           else
             sudo apt-get update
             sudo apt-get install -y make flex bison autoconf automake libtool
-            cd /tmp
-            curl -fL --retry 5 --retry-delay 5 -O "${{ matrix.toolchain_url }}"
-            tar xzf "$(basename ${{ matrix.toolchain_url }})"
-            echo "/tmp/$(basename ${{ matrix.toolchain_url }} .tgz)/bin" >> "$GITHUB_PATH"
+            # Pull the cross-rs aarch64-musl toolchain from ghcr.io (GitHub's
+            # CDN — fast on runners, unlike musl.cc which throttles) and overlay
+            # its /usr/local onto the runner. Extracting to the same absolute
+            # path keeps the gcc driver's internal libexec/sysroot paths valid.
+            docker pull "${{ matrix.cross_image }}"
+            cid=$(docker create "${{ matrix.cross_image }}")
+            docker cp "$cid:/usr/local" /tmp/xlocal
+            docker rm "$cid"
+            sudo cp -a /tmp/xlocal/. /usr/local/
             ${{ matrix.cc }} --version
           fi
 
