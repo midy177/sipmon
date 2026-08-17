@@ -8,10 +8,16 @@
 use crate::model::sip::{Call, CallState, Outcome};
 
 /// Post-Dial Delay: time from INVITE to the first provisional response (1xx,
-/// typically 180 Ringing / 183). If only a final response is seen, PDD = setup.
+/// typically 100 Trying or 180 Ringing / 183). If only a final response is
+/// seen, no provisional exists and PDD is unavailable.
 pub fn compute_pdd_ms(call: &Call) -> Option<u32> {
     let invite = call.invite_ts?;
-    let provisional = call.ringing_ts.or(call.trying_ts)?;
+    let provisional = match (call.trying_ts, call.ringing_ts) {
+        (Some(t), Some(r)) => Some(t.min(r)),
+        (Some(t), None) => Some(t),
+        (None, Some(r)) => Some(r),
+        (None, None) => None,
+    }?;
     Some(((provisional - invite) / 1000) as u32)
 }
 

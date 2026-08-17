@@ -111,14 +111,21 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
         && cm.is_none_or(|m| m.eq_ignore_ascii_case("INVITE"))
         && matches!(call.state, CallState::Dialing | CallState::Ringing)
     {
+        // PDD = INVITE → first provisional (100 Trying or 180 Ringing/183).
+        if call.trying_ts.is_none() && call.ringing_ts.is_none() {
+            call.pdd_ms =
+                Some(((msg.ts_us - call.invite_ts.unwrap_or(msg.ts_us)) / 1000) as u32);
+        }
         if (180..190).contains(&code) || code == 183 {
             if call.ringing_ts.is_none() {
                 call.ringing_ts = Some(msg.ts_us);
-                call.pdd_ms =
-                    Some(((msg.ts_us - call.invite_ts.unwrap_or(msg.ts_us)) / 1000) as u32);
             }
             // Record which provisional started the ring-back (180 vs 183 early media).
             call.ring_code.get_or_insert(code);
+            // Early media: 183 Session Progress carrying an SDP body.
+            if code == 183 && msg.has_sdp {
+                call.early_media = true;
+            }
             call.state = CallState::Ringing;
         } else if code >= 100 && call.trying_ts.is_none() {
             call.trying_ts = Some(msg.ts_us);
@@ -290,6 +297,32 @@ mod tests {
     }
 
     #[test]
+    fn pdd_measured_at_first_provisional() {
+        // 100 Trying arrives first → PDD is INV→100, not INV→180.
+        let mut call = Call::new("c1".into());
+        apply_sip(
+            &mut call,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        apply_sip(&mut call, &mk(1_050_000, false, None, Some(100), None));
+        assert_eq!(call.trying_ts, Some(1_050_000));
+        assert_eq!(call.pdd_ms, Some(50));
+        apply_sip(&mut call, &mk(1_200_000, false, None, Some(180), None));
+        assert_eq!(call.pdd_ms, Some(50), "PDD must not move to the 180 time");
+        assert_eq!(call.ringing_ts, Some(1_200_000));
+        assert_eq!(call.ring_code, Some(180));
+
+        // 180 without a prior 100 → PDD is INV→180.
+        let mut call2 = Call::new("c2".into());
+        apply_sip(
+            &mut call2,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        apply_sip(&mut call2, &mk(1_150_000, false, None, Some(180), None));
+        assert_eq!(call2.pdd_ms, Some(150));
+    }
+
+    #[test]
     fn ring_code_183_and_ring_ms() {
         let mut call = Call::new("c1".into());
         apply_sip(
@@ -301,6 +334,37 @@ mod tests {
         assert_eq!(call.ring_code, Some(183));
         apply_sip(&mut call, &mk(1_600_000, false, None, Some(200), None));
         assert_eq!(call.ring_ms, Some(500));
+    }
+
+    #[test]
+    fn early_media_only_when_183_carries_sdp() {
+        // 183 Session Progress with an SDP body = early media.
+        let mut call = Call::new("c1".into());
+        apply_sip(
+            &mut call,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        let mut m183 = mk(1_100_000, false, None, Some(183), None);
+        m183.has_sdp = true;
+        apply_sip(&mut call, &m183);
+        assert!(call.early_media, "183+SDP must set early media");
+        assert_eq!(call.ring_code, Some(183));
+
+        // Plain 183 without media, and 180, must not.
+        let mut call2 = Call::new("c2".into());
+        apply_sip(
+            &mut call2,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        apply_sip(&mut call2, &mk(1_100_000, false, None, Some(183), None));
+        assert!(!call2.early_media, "183 without SDP is not early media");
+        let mut call3 = Call::new("c3".into());
+        apply_sip(
+            &mut call3,
+            &mk(1_000_000, true, Some(Method::Invite), None, None),
+        );
+        apply_sip(&mut call3, &mk(1_100_000, false, None, Some(180), None));
+        assert!(!call3.early_media, "180 is not early media");
     }
 
     #[test]

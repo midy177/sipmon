@@ -14,10 +14,16 @@ a live `sipbot` caller/callee pair plus a synthetic load pcap). Source recording
 
 ![sipmon demo](demo/sipmon-demo.svg)
 
+Screenshots — call list (Overview) and Call Detail:
+
+![sipmon call list](list.jpg)
+
+![sipmon call detail](detail.jpg)
+
 ## Features
 
 - **Multiple input sources**: live interface (libpcap + BPF), offline pcap/pcapng, stdin `tcpdump -w -` stream, event-log replay
-- **Three modes**: `live` interactive monitoring / `record` headless recording (daemonizable with `-d`) / `replay`
+- **Three modes**: `live` interactive monitoring / `record` recording with live TUI on a tty (`--headless` = no UI, `-d` daemonizable) / `replay`
 - **SIP correlation**: Call-ID call state machine, transactions (branch+method), Call-ID / number / IP / SSRC indexes, SIP-over-TCP reassembly
 - **Media quality**: RFC3550 jitter/loss (64-packet reorder window), RTCP RR LSR/DLSR RTT, one-way delay estimate, E-model MOS
 - **TURN detection**: auto-learns TURN servers and labels `turn-client` / `turn-peer` relay legs
@@ -55,6 +61,9 @@ sipmon live -i any
 # SIP on port 5060 only
 sipmon live -i eth0 -f "udp port 5060"
 
+# Record live with a watch TUI on a tty (--headless for no UI; -d daemonizes, always no UI)
+sipmon record -i any -w cap.evlog --headless
+
 # Continuous background recording to an event log (daemon), replayable/queryable/exportable later
 sipmon record -i any -w cap.evlog -d --pidfile /run/sipmon.pid --logfile /var/log/sipmon.log
 
@@ -82,7 +91,7 @@ tcpdump -i eth0 -w - | sipmon -
 |---|---|
 | `(none)` | Default mode: a positional `FILE` is dispatched by extension — `.pcap/.pcapng` → `file -r`, `.evlog` → `replay -l`, `.jsonl` → load a snapshot export; with no FILE, starts a live capture. `--no-tui` for headless output |
 | `live` | Live capture + TUI. `-i any` captures all interfaces, `-f` sets a BPF filter, `--no-media` disables RTP/RTCP analysis, `-w` optionally writes an event log too |
-| `record` | Headless recording: live capture → event log (`-w` required). `-d` daemonizes, `--pidfile` writes the PID, `--logfile` redirects stderr. Flushes gracefully on SIGTERM/SIGINT |
+| `record` | Recording: live capture → event log (`-w` required). Live TUI on a tty; `--headless` disables the UI (non-tty/`-d` contexts are headless automatically). `-d` daemonizes, `--pidfile` writes the PID, `--logfile` redirects stderr. Flushes gracefully on SIGTERM/SIGINT |
 | `-` | Read a pcap byte stream from stdin (a `tcpdump -w -` pipe) |
 | `file` | Offline pcap/pcapng. `--rate 1x` replays at a real-time speed multiplier, `--no-tui` for headless output, `--print-events` prints structured events |
 | `replay` | Replay an event log (TUI / `--no-tui`) |
@@ -141,7 +150,7 @@ highlighted.
 
 ```
 Time From To State PDD Setup Ring Dur MOS RTP Diag End Call-ID
-PDD    INVITE → ring-back (180/183)            Ring   ring duration · 180/183 code
+PDD    INVITE → first provisional (100 Trying / 180·183)   Ring   ring duration · 180/183 code
 Setup  INVITE → 200 OK (answer)                End    who hung up: BYE→ (caller),
                                                    ←BYE (callee), CANCEL, REJ·486
 ```

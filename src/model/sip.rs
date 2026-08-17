@@ -177,6 +177,8 @@ pub struct Call {
     pub ring_ms: Option<u32>,
     /// Provisional code that started ringing: 180 or 183 (early media).
     pub ring_code: Option<u16>,
+    /// True if early media was negotiated: a 183 Session Progress carrying SDP.
+    pub early_media: bool,
     /// Initiator of the hangup (BYE sender / cancel / reject).
     pub hangup_by: Option<HangupBy>,
     pub pkts_sip: u64,
@@ -225,6 +227,7 @@ impl Call {
             setup_ms: None,
             ring_ms: None,
             ring_code: None,
+            early_media: false,
             hangup_by: None,
             pkts_sip: 0,
             pkts_rtp: 0,

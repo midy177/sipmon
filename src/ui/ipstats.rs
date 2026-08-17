@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::store::ipstats::{Dir, IpStats, WINDOWS};
 use crate::store::registry::{CallSummary, Snapshot};
 use crate::ui::app::{App, IpSort};
-use crate::ui::{fmt_bytes, fmt_time, theme};
+use crate::ui::{fmt_bytes, fmt_time, mask_ip, mask_user, theme};
 
 /// How often the IP row order is re-derived from the live sort key. Between
 /// refreshes the previous order is kept so the list doesn't reshuffle on every
@@ -51,7 +51,10 @@ pub fn sorted_rows(snap: &Snapshot, sort: IpSort) -> Vec<&IpStats> {
 /// and the heatmap so the two stay aligned and don't jump around.
 pub fn ordered_rows<'a>(snap: &'a Snapshot, app: &mut App) -> Vec<&'a IpStats> {
     if app.ip_sort_order.is_empty() || app.ip_sort_last.elapsed() >= SORT_REFRESH {
-        app.ip_sort_order = sorted_rows(snap, app.ip_sort).iter().map(|s| s.ip).collect();
+        app.ip_sort_order = sorted_rows(snap, app.ip_sort)
+            .iter()
+            .map(|s| s.ip)
+            .collect();
         app.ip_sort_last = Instant::now();
     }
     let by_ip: std::collections::HashMap<IpAddr, &IpStats> =
@@ -99,7 +102,9 @@ fn loss_cell(pct: Option<f64>) -> Cell<'static> {
         None => Cell::from("-").style(Style::default().fg(theme::MUTED)),
         Some(p) => {
             let style = if p >= 2.0 {
-                Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::ERROR)
+                    .add_modifier(Modifier::BOLD)
             } else if p >= 0.5 {
                 Style::default().fg(theme::WARNING)
             } else {
@@ -112,6 +117,11 @@ fn loss_cell(pct: Option<f64>) -> Cell<'static> {
 
 fn render_table(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let rows = ordered_rows(snap, app);
+    let privacy = app.privacy;
+    let ip_cell = |ip: IpAddr| {
+        let s = if privacy { mask_ip(ip) } else { ip.to_string() };
+        Cell::from(s)
+    };
 
     let (data_rows, header_cells, widths, title) = if app.ip_loss_only {
         let label = WINDOWS
@@ -123,8 +133,9 @@ fn render_table(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             .iter()
             .map(|s| {
                 Row::new(vec![
-                    Cell::from(s.ip.to_string()),
-                    Cell::from(s.active_calls.to_string()).style(Style::default().fg(theme::ACCENT)),
+                    ip_cell(s.ip),
+                    Cell::from(s.active_calls.to_string())
+                        .style(Style::default().fg(theme::ACCENT)),
                     loss_cell(s.loss_pct(app.ip_summary_window, Dir::Tx)),
                     loss_cell(s.loss_pct(app.ip_summary_window, Dir::Rx)),
                 ])
@@ -153,8 +164,9 @@ fn render_table(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             .iter()
             .map(|s| {
                 Row::new(vec![
-                    Cell::from(s.ip.to_string()),
-                    Cell::from(s.active_calls.to_string()).style(Style::default().fg(theme::ACCENT)),
+                    ip_cell(s.ip),
+                    Cell::from(s.active_calls.to_string())
+                        .style(Style::default().fg(theme::ACCENT)),
                     Cell::from(s.pkts_tx.to_string()),
                     Cell::from(s.pkts_rx.to_string()),
                     Cell::from(fmt_bytes(s.bytes_tx)),
@@ -194,8 +206,11 @@ fn render_table(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 
     let table = Table::new(data_rows, widths)
         .header(
-            Row::new(header_cells)
-                .style(Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD)),
+            Row::new(header_cells).style(
+                Style::default()
+                    .fg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(Style::default().bg(theme::MUTED));
@@ -204,7 +219,22 @@ fn render_table(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 
 fn render_drill(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let calls = calls_for_ip(snap, app.ip_drill);
-    let ip = app.ip_drill.map(|i| i.to_string()).unwrap_or_default();
+    let ip = app
+        .ip_drill
+        .map(|i| {
+            if app.privacy {
+                mask_ip(i)
+            } else {
+                i.to_string()
+            }
+        })
+        .unwrap_or_default();
+    let privacy = app.privacy;
+    let user = |v: &Option<String>| match v.as_deref() {
+        Some(v) if privacy => mask_user(v),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    };
     let rows = calls.iter().map(|c| {
         let hangup = match (c.hangup_by, c.hangup_code) {
             (Some(b), Some(code)) => format!("{}·{code}", b.label()),
@@ -214,8 +244,8 @@ fn render_drill(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         };
         Row::new(vec![
             Cell::from(c.invite_ts.map(fmt_time).unwrap_or_else(|| "-".into())),
-            Cell::from(c.from_user.clone().unwrap_or_default()),
-            Cell::from(c.to_user.clone().unwrap_or_default()),
+            Cell::from(user(&c.from_user)),
+            Cell::from(user(&c.to_user)),
             Cell::from(c.state.label()),
             Cell::from(c.pkts_rtp.to_string()),
             Cell::from(crate::ui::fmt_ms(c.best_mos)),
@@ -237,15 +267,16 @@ fn render_drill(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         ],
     )
     .header(Row::new(
-        ["Time", "From", "To", "State", "RTP pkts", "MOS", "End", "Call-ID"]
-            .iter()
-            .map(|h| Cell::from(*h)),
+        [
+            "Time", "From", "To", "State", "RTP pkts", "MOS", "End", "Call-ID",
+        ]
+        .iter()
+        .map(|h| Cell::from(*h)),
     ))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Calls for {ip} ({} — Enter=detail, Esc=back)", calls.len())),
-    )
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Calls for {ip} ({} — Enter=detail, Esc=back)",
+        calls.len()
+    )))
     .row_highlight_style(Style::default().bg(theme::MUTED));
     f.render_stateful_widget(table, area, &mut app.ip_drill_state);
 }
@@ -270,6 +301,7 @@ pub fn render_loss_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut
     let axis_start = now.saturating_sub(col_us * cols as u64);
 
     let rows = ordered_rows(snap, app);
+    let privacy = app.privacy;
     let height = (area.height as usize).saturating_sub(2);
     let visible: Vec<&IpStats> = rows.into_iter().take(height).collect();
 
@@ -283,8 +315,13 @@ pub fn render_loss_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut
     let head = Row::new(head_cells);
 
     let body = visible.iter().map(|s| {
+        let ip_label = if privacy {
+            mask_ip(s.ip)
+        } else {
+            s.ip.to_string()
+        };
         let mut cells = vec![
-            Cell::from(s.ip.to_string()),
+            Cell::from(ip_label),
             Cell::from(format!("{:.1}", s.loss_pct_total(0).unwrap_or(0.0))),
         ];
         let cols_series = s.heatmap_columns(window, 60);
@@ -309,13 +346,14 @@ pub fn render_loss_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut
         .chain((0..cols).map(|_| Constraint::Length(1)))
         .collect::<Vec<_>>();
 
-    let table = Table::new(body, widths).header(head).block(
-        Block::default().borders(Borders::ALL).title(format!(
-            "Loss% heatmap (last {}s, w=switch) — s=sort:{}",
-            app.ip_window_secs,
-            app.ip_sort.label()
-        )),
-    );
+    let table =
+        Table::new(body, widths)
+            .header(head)
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                "Loss% heatmap (last {}s, w=switch) — s=sort:{}",
+                app.ip_window_secs,
+                app.ip_sort.label()
+            )));
     f.render_widget(table, area);
 }
 
@@ -343,19 +381,29 @@ fn heat_cell(pct: Option<f64>) -> Cell<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
-    use crate::ui::app::{App, Page};
+    use crate::ui::app::{App, Page, RecordState};
 
     fn sample_snapshot() -> Snapshot {
         let mut st = crate::store::ipstats::IpStatsStore::new();
         let ts = 1_800_000_000_000_000u64;
         for i in 0..30u64 {
-            st.observe_packet("10.10.0.8".parse().unwrap(), ts + i * 1_000_000, 160, Dir::Tx);
-            st.observe_packet("10.20.0.8".parse().unwrap(), ts + i * 1_000_000, 160, Dir::Rx);
+            st.observe_packet(
+                "10.10.0.8".parse().unwrap(),
+                ts + i * 1_000_000,
+                160,
+                Dir::Tx,
+            );
+            st.observe_packet(
+                "10.20.0.8".parse().unwrap(),
+                ts + i * 1_000_000,
+                160,
+                Dir::Rx,
+            );
             if i % 10 == 0 {
                 st.observe_lost("10.20.0.8".parse().unwrap(), ts + i * 1_000_000, 1, Dir::Rx);
             }
@@ -370,6 +418,7 @@ mod tests {
             call_id: "c1".into(),
             from_user: Some("alice".into()),
             to_user: Some("bob".into()),
+            caller_ip: Some("10.10.0.8".parse().unwrap()),
             state: crate::model::sip::CallState::Active,
             outcome: crate::model::sip::Outcome::Answered,
             invite_ts: Some(ts),
@@ -378,6 +427,7 @@ mod tests {
             setup_ms: Some(200),
             ring_ms: Some(100),
             ring_code: Some(180),
+            early_media: false,
             hangup_by: None,
             hangup_code: None,
             pkts_sip: 4,
@@ -400,6 +450,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             Arc::new(AtomicBool::new(false)),
+            RecordState::default(),
         );
         app.page = Page::IpStats;
         let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
@@ -430,6 +481,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             Arc::new(AtomicBool::new(false)),
+            RecordState::default(),
         );
         app.page = Page::IpStats;
         app.ip_loss_only = true;
@@ -461,6 +513,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             Arc::new(AtomicBool::new(false)),
+            RecordState::default(),
         );
         app.page = Page::IpStats;
         app.ip_drill = Some("10.20.0.8".parse().unwrap());

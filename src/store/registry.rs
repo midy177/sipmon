@@ -31,7 +31,15 @@ pub struct Focus {
     pub pdd_ms: Option<u32>,
     pub setup_ms: Option<u32>,
     pub ring_ms: Option<u32>,
-    pub ring_code: Option<u16>,
+    /// True if early media (183 with SDP) was negotiated.
+    pub early_media: bool,
+    /// Milestone timestamps for the setup timeline (chrome-devtools-style).
+    pub invite_ts: Option<u64>,
+    pub trying_ts: Option<u64>,
+    pub ringing_ts: Option<u64>,
+    pub answer_ts: Option<u64>,
+    pub bye_ts: Option<u64>,
+    pub end_ts: Option<u64>,
     pub hangup_by: Option<HangupBy>,
     pub hangup_code: Option<u32>,
     pub hangup_reason: Option<String>,
@@ -50,6 +58,8 @@ pub struct CallSummary {
     pub call_id: String,
     pub from_user: Option<String>,
     pub to_user: Option<String>,
+    /// Source IP of the initial INVITE (the caller side).
+    pub caller_ip: Option<std::net::IpAddr>,
     pub state: CallState,
     pub outcome: Outcome,
     pub invite_ts: Option<u64>,
@@ -60,6 +70,8 @@ pub struct CallSummary {
     pub ring_ms: Option<u32>,
     /// Provisional code that started ringing: 180 or 183.
     pub ring_code: Option<u16>,
+    /// True if early media (183 with SDP) was negotiated.
+    pub early_media: bool,
     /// Who initiated the hangup.
     pub hangup_by: Option<HangupBy>,
     pub hangup_code: Option<u32>,
@@ -152,6 +164,9 @@ pub struct Registry {
     pub ssrc_index: HashMap<u32, Vec<StreamKey>>,
     /// Per-IP packet/loss statistics (updated on the RTP hot path + 5s flush).
     pub ipstats: IpStatsStore,
+    /// Stream summaries reconstructed from a replay/import (no RTP packets are
+    /// re-fed then, so they come straight from the evlog's StreamSnap records).
+    pub imported_streams: Vec<StreamSummary>,
     pub max_calls: usize,
     pub max_streams: usize,
     pub max_diagnostics: usize,
@@ -182,6 +197,7 @@ impl Default for Registry {
             stream_index: HashMap::new(),
             ssrc_index: HashMap::new(),
             ipstats: IpStatsStore::new(),
+            imported_streams: Vec::new(),
             removed: VecDeque::new(),
             heatmap_retain_us: 24 * 3600 * 1_000_000,
             max_calls: 100_000,
@@ -231,6 +247,7 @@ impl Registry {
         self.diagnostics.clear();
         self.heatmap = crate::store::heatmap::Heatmap::new(self.heatmap.bucket_secs());
         self.ipstats.clear();
+        self.imported_streams.clear();
         self.pkts_total = 0;
         self.pkts_last_window = 0;
         self.window_start_us = None;
@@ -401,6 +418,15 @@ impl Registry {
         }
     }
 
+    /// Register a stream summary reconstructed from an evlog record (replay
+    /// path). These appear in snapshots and call-detail alongside live streams.
+    pub fn add_imported_stream(&mut self, s: StreamSummary) {
+        if self.imported_streams.len() >= self.max_streams {
+            self.imported_streams.remove(0);
+        }
+        self.imported_streams.push(s);
+    }
+
     /// Build a UI snapshot: recent calls capped to `limit`, streams capped to
     /// 1000 (display only; exports use `snapshot_full`).
     pub fn snapshot(&self, limit: usize) -> Snapshot {
@@ -503,12 +529,17 @@ impl Registry {
             avg_mos: avg(mos, mos_n),
             asr,
             calls: summaries,
-            streams: self
-                .streams
-                .values()
-                .take(stream_limit)
-                .map(|s| s.summary())
-                .collect(),
+            streams: {
+                let mut s: Vec<_> = self
+                    .streams
+                    .values()
+                    .take(stream_limit)
+                    .map(|s| s.summary())
+                    .collect();
+                let remaining = stream_limit.saturating_sub(s.len());
+                s.extend(self.imported_streams.iter().take(remaining).cloned());
+                s
+            },
             events: self.events.clone(),
             diagnostics: self.diagnostics.iter().cloned().collect(),
             ip_stats: self.ipstats.snapshot(),
@@ -545,12 +576,18 @@ impl Registry {
         let caller_ip = invite
             .map(|m| m.flow.src.ip())
             .or_else(|| call.invite_key.as_deref().and_then(|k| k.parse().ok()));
-        let streams = self
+        let mut streams: Vec<_> = self
             .call_stream_keys(call_id)
             .iter()
             .filter_map(|k| self.streams.get(k))
             .map(|s| s.summary())
             .collect();
+        streams.extend(
+            self.imported_streams
+                .iter()
+                .filter(|s| s.call_id.as_deref() == Some(call_id))
+                .cloned(),
+        );
         let diagnostics = self
             .diagnostics
             .iter()
@@ -574,7 +611,13 @@ impl Registry {
             pdd_ms: call.pdd_ms,
             setup_ms: call.setup_ms,
             ring_ms: call.ring_ms,
-            ring_code: call.ring_code,
+            early_media: call.early_media,
+            invite_ts: call.invite_ts,
+            trying_ts: call.trying_ts,
+            ringing_ts: call.ringing_ts,
+            answer_ts: call.answer_ts,
+            bye_ts: call.bye_ts,
+            end_ts: call.end_ts,
             hangup_by: call.hangup_by,
             hangup_code: call.hangup.code,
             hangup_reason: call.hangup.reason.clone(),
@@ -583,18 +626,26 @@ impl Registry {
 
     fn summarize(&self, c: &Call) -> CallSummary {
         let keys = self.call_stream_keys(&c.call_id);
+        let imported: Vec<&StreamSummary> = self
+            .imported_streams
+            .iter()
+            .filter(|s| s.call_id.as_deref() == Some(&c.call_id))
+            .collect();
         let best_mos = keys
             .iter()
             .filter_map(|k| self.streams.get(k))
             .filter_map(|s| s.summary().mos)
+            .chain(imported.iter().filter_map(|s| s.mos))
             .fold(None, |acc: Option<f64>, m| {
                 Some(acc.map_or(m, |a| a.min(m)))
             });
-        let stream_count = keys.len();
+        let stream_count = keys.len() + imported.len();
+        let imported_pkts_rtp: u64 = imported.iter().map(|s| s.packets).sum();
         CallSummary {
             call_id: c.call_id.clone(),
             from_user: c.from_user.clone(),
             to_user: c.to_user.clone(),
+            caller_ip: c.invite_key.as_deref().and_then(|k| k.parse().ok()),
             state: c.state,
             outcome: c.outcome,
             invite_ts: c.invite_ts,
@@ -603,10 +654,11 @@ impl Registry {
             setup_ms: c.setup_ms,
             ring_ms: c.ring_ms,
             ring_code: c.ring_code,
+            early_media: c.early_media,
             hangup_by: c.hangup_by,
             hangup_code: c.hangup.code,
             pkts_sip: c.pkts_sip,
-            pkts_rtp: c.pkts_rtp,
+            pkts_rtp: c.pkts_rtp + imported_pkts_rtp,
             best_mos,
             warn_count: c.warn_count,
             critical_count: c.critical_count,
@@ -632,4 +684,46 @@ fn sip_header(raw: &[u8], name: &str) -> Option<String> {
             .eq_ignore_ascii_case(name)
             .then(|| v.trim().to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::media::StreamSummary;
+
+    #[test]
+    fn imported_streams_surface_in_snapshot_focus_and_summary() {
+        let mut reg = Registry::with_source("replay".into());
+        reg.get_or_create_call("c1");
+        let mut st = StreamSummary {
+            ssrc: 0x1000,
+            packets: 500,
+            lost: 4,
+            loss_pct: 0.8,
+            bytes: 4000,
+            mos: Some(4.3),
+            ..StreamSummary::default()
+        };
+        st.call_id = Some("c1".into());
+        reg.add_imported_stream(st);
+
+        // Snapshot streams include the imported stream.
+        let snap = reg.snapshot_full();
+        assert_eq!(snap.streams.len(), 1);
+        assert_eq!(snap.streams[0].ssrc, 0x1000);
+
+        // Focus detail (Call Detail media table) includes it with flow/pkts.
+        reg.focus_hint = Some("c1".into());
+        let snap = reg.snapshot_full();
+        let focus = snap.focus.expect("focus detail present");
+        assert_eq!(focus.streams.len(), 1, "media table must show the stream");
+        assert_eq!(focus.streams[0].packets, 500);
+        assert_eq!(focus.streams[0].bytes, 4000);
+
+        // Call summary aggregates RTP packets + MOS from imported streams.
+        let call = &snap.calls[0];
+        assert_eq!(call.pkts_rtp, 500);
+        assert_eq!(call.best_mos, Some(4.3));
+        assert_eq!(call.stream_count, 1);
+    }
 }

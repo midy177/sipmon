@@ -163,9 +163,9 @@ Keys: `Tab`/`Shift-Tab` cycles pages 1-7 continuously (bottom tab bar highlights
 
 ```
 sipmon live   -i any [-f bpf] [--no-media] [-w log]        # live capture + TUI (-i any captures all interfaces; optionally writes an evlog too)
-sipmon record -i any [-f bpf] [--no-media] -w log [-d] [--pidfile p] [--logfile l]
-                                                           # headless recording: live capture → binary event log (-w)
-                                                           # -d daemonizes; SIGTERM/SIGINT flush and exit gracefully
+sipmon record -i any [-f bpf] [--no-media] -w log [--headless] [-d] [--pidfile p] [--logfile l]
+                                                           # recording: live capture → binary event log (-w), live TUI on a tty
+                                                           # --headless = no UI; -d daemonizes; SIGTERM/SIGINT flush and exit gracefully
 sipmon -                                          # read a pcap stream from stdin (tcpdump -w -)
 sipmon file   -r cap.pcap [--pcapng] [--rate 1x]       # offline pcap analysis + TUI (speed adjustable)
 sipmon replay -l sipmon.evlog                         # replay an event log + TUI
@@ -181,7 +181,7 @@ Mode matrix:
 |---|---|---|---|
 | `(default FILE)` | pcap/pcapng or evlog | same as file/replay | no subcommand → dispatch by extension: `*.pcap/pcapng` → `file -r`, `*.evlog` → `replay -l`, `*.jsonl` → load snapshot export |
 | `live` | interface/stdin/pcap | TUI + (optional) evlog | interactive monitoring |
-| `record` | interface | evlog (required) | headless recording, `-d` daemonizable, suited for 7×24 continuous capture |
+| `record` | interface | evlog (required) | recording + live TUI on a tty; `--headless`/`-d`/non-tty = no UI, `-d` daemonizable, suited for 7×24 continuous capture |
 | `replay` | evlog | TUI / headless JSON | replay and re-analyze a past recording |
 
 ## 7. Dependency list

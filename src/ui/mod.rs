@@ -15,12 +15,56 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::store::registry::Snapshot;
-use app::{App, Page};
+use app::{App, Page, RecordState};
+
+/// Mask a user/number for privacy: keep the first 3 and last 4 characters,
+/// mask the middle (very short values keep only their first character).
+pub fn mask_user(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    if n <= 4 {
+        return chars
+            .iter()
+            .enumerate()
+            .map(|(i, c)| if i == 0 { *c } else { '*' })
+            .collect();
+    }
+    let back_start = n.saturating_sub(4).max(3);
+    let mid = if back_start > 3 { "…" } else { "*" };
+    let front: String = chars[..3].iter().collect();
+    let back: String = chars[back_start..].iter().collect();
+    format!("{front}{mid}{back}")
+}
+
+/// Mask an IP address: keep the first and last octets (IPv4) or hextets (IPv6).
+pub fn mask_ip(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.{}", o[0], '*', '*', o[3])
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:…:{:x}", s[0], s[7])
+        }
+    }
+}
+
+/// Mask a socket string `ip:port` (or bare IP), preserving the port.
+pub fn mask_socket(s: &str) -> String {
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return mask_ip(ip);
+    }
+    if let Ok(a) = s.parse::<std::net::SocketAddr>() {
+        return format!("{}:{}", mask_ip(a.ip()), a.port());
+    }
+    s.to_string()
+}
 
 /// Shared top bar (3 lines): source/stats/status, global keys, page keys.
 pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
     let paused = app.pause.load(std::sync::atomic::Ordering::Relaxed);
-    let line1 = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" sipmon [{}] ", snap.source),
             Style::default()
@@ -41,23 +85,33 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
             format!("diag {} ", snap.diagnostics.len()),
             Style::default().fg(theme::ACCENT),
         ),
-        if paused {
-            Span::styled(
-                "⏸ PAUSED ",
-                Style::default()
-                    .fg(theme::ERROR)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw("")
-        },
-        Span::styled(
-            format!(" {} ", app.status),
-            Style::default().fg(theme::PRIMARY),
-        ),
-    ]);
+    ];
+    if paused {
+        spans.push(Span::styled(
+            "⏸ PAUSED ",
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(rec) = record_indicator(&app.record) {
+        spans.push(rec);
+    }
+    if app.privacy {
+        spans.push(Span::styled(
+            "🔒 PRIVACY ",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" {} ", app.status),
+        Style::default().fg(theme::PRIMARY),
+    ));
+    let line1 = Line::from(spans);
     let line2 = Line::from(Span::styled(
-        " Global: [Tab/Shift-Tab] pages [1-7] jump [/] search [Space] pause [e] export [x] clear [Ctrl-C/q] quit",
+        " Global: [Tab] pages [1-7] jump [/] search [Space] pause [e] export [p] privacy [x] clear [Ctrl-C/q] quit",
         Style::default().fg(theme::MUTED),
     ));
     let line3 = if app.search_editing {
@@ -73,6 +127,55 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
     };
     let p = Paragraph::new(vec![line1, line2, line3]).style(Style::default().fg(theme::INK));
     f.render_widget(p, area);
+
+    // Brand watermark on the top-right corner of the top bar.
+    let brand = Paragraph::new(Line::from(Span::styled(
+        "by miuda.ai",
+        Style::default().fg(theme::MUTED),
+    )))
+    .alignment(ratatui::layout::Alignment::Right);
+    let brand_area = Rect {
+        x: area.right().saturating_sub(13),
+        y: area.y,
+        width: 13.min(area.width),
+        height: 1,
+    };
+    f.render_widget(brand, brand_area);
+}
+
+/// Live-recording indicator: a blinking ● REC <file> (<size>) shown in the top
+/// bar while the pipeline writes an event log. Blinks by alternating the dot
+/// glyph every 500 ms — terminal blink modifiers are too unreliable across
+/// emulators. Hidden entirely when not recording.
+fn record_indicator(record: &RecordState) -> Option<Span<'static>> {
+    use std::sync::atomic::Ordering;
+    if !record.active.load(Ordering::Relaxed) {
+        return None;
+    }
+    let name = record
+        .path
+        .lock()
+        .ok()
+        .and_then(|p| p.clone())
+        .map(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("evlog")
+                .to_string()
+        })
+        .unwrap_or_else(|| "evlog".to_string());
+    let bytes = record.bytes.load(Ordering::Relaxed);
+    let blink_on = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_millis() / 500) % 2 == 0)
+        .unwrap_or(true);
+    let dot = if blink_on { "●" } else { "○" };
+    Some(Span::styled(
+        format!(" {dot} REC {name} ({}) ", fmt_bytes(bytes)),
+        Style::default()
+            .fg(theme::ERROR)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 /// Page-specific key hints shown on the top bar's third line.
@@ -80,9 +183,7 @@ fn page_keys(page: Page) -> &'static str {
     match page {
         Page::Overview => "[↑↓] select [Enter] open call detail",
         Page::Search => "[↑↓] select [Enter] open call detail [/] new query",
-        Page::CallDetail => {
-            "[↑↓] select msg [PgUp/PgDn] scroll raw [←/Esc] back to list"
-        }
+        Page::CallDetail => "[↑↓] select msg [PgUp/PgDn] scroll raw [←/Esc] back to list",
         Page::Heatmap => "[s] sort [w] loss window",
         Page::Streams => "[↑↓] select stream",
         Page::EventLog => "[↑↓] scroll",
@@ -136,7 +237,11 @@ fn render_page_tabs(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .flat_map(|(i, (n, name))| {
-            let sep = if i == 0 { Vec::new() } else { vec![Span::raw("  ")] };
+            let sep = if i == 0 {
+                Vec::new()
+            } else {
+                vec![Span::raw("  ")]
+            };
             let selected = i == active;
             let style = if selected {
                 Style::default()
@@ -170,8 +275,12 @@ pub fn fmt_ms(v: Option<f64>) -> String {
     }
 }
 
-pub fn fmt_u32(v: Option<u32>) -> String {
-    v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
+/// Format ms as seconds with two decimals, e.g. 230 → "0.23s".
+pub fn fmt_secs(ms: Option<u64>) -> String {
+    match ms {
+        None => "-".into(),
+        Some(ms) => format!("{}.{:02}s", ms / 1000, (ms % 1000) / 10),
+    }
 }
 
 pub fn fmt_dur(ms: Option<u64>) -> String {

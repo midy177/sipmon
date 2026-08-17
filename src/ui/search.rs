@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::store::registry::Snapshot;
 use crate::ui::app::{App, search_results};
-use crate::ui::{fmt_dur, fmt_ms, fmt_time, theme};
+use crate::ui::{fmt_dur, fmt_ms, fmt_time, mask_user, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
@@ -29,11 +29,17 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     };
 
     let results = search_results(snap, &app.search_query);
+    let privacy = app.privacy;
+    let user = |v: &Option<String>| match v.as_deref() {
+        Some(v) if privacy => mask_user(v),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    };
     let rows = results.iter().map(|c| {
         Row::new(vec![
             Cell::from(c.invite_ts.map(fmt_time).unwrap_or_else(|| "-".into())),
-            Cell::from(c.from_user.clone().unwrap_or_default()),
-            Cell::from(c.to_user.clone().unwrap_or_default()),
+            Cell::from(user(&c.from_user)),
+            Cell::from(user(&c.to_user)),
             Cell::from(c.state.label()),
             Cell::from(fmt_dur(c.duration_ms)),
             Cell::from(fmt_ms(c.best_mos)),

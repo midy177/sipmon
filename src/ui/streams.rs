@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
-use crate::ui::{fmt_ms, theme};
+use crate::ui::{fmt_ms, mask_socket, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
@@ -13,7 +13,42 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 
     let mut streams = snap.streams.clone();
     streams.sort_by_key(|s| s.ssrc);
+    let privacy = app.privacy;
+    let flow_w = streams
+        .iter()
+        .filter_map(|s| s.flow)
+        .map(|f| {
+            let src = if privacy {
+                mask_socket(&f.src.to_string())
+            } else {
+                f.src.to_string()
+            };
+            let dst = if privacy {
+                mask_socket(&f.dst.to_string())
+            } else {
+                f.dst.to_string()
+            };
+            src.len().max(dst.len())
+        })
+        .max()
+        .unwrap_or(0);
     let rows = streams.iter().map(|s| {
+        let flow = match s.flow {
+            Some(f) => {
+                let src = if privacy {
+                    mask_socket(&f.src.to_string())
+                } else {
+                    f.src.to_string()
+                };
+                let dst = if privacy {
+                    mask_socket(&f.dst.to_string())
+                } else {
+                    f.dst.to_string()
+                };
+                format!("{src:<flow_w$}->{dst:>flow_w$}")
+            }
+            None => "-".into(),
+        };
         Row::new(vec![
             Cell::from(format!("{:#x}", s.ssrc)),
             Cell::from(s.codec.clone().unwrap_or_else(|| "-".into())),
@@ -22,11 +57,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "-".into()),
             ),
-            Cell::from(format!(
-                "{}->{}",
-                s.flow.map(|f| f.src.to_string()).unwrap_or_default(),
-                s.flow.map(|f| f.dst.to_string()).unwrap_or_default()
-            )),
+            Cell::from(flow),
             Cell::from(s.packets.to_string()),
             Cell::from(s.lost.to_string()),
             Cell::from(format!("{:.1}", s.loss_pct)),
@@ -41,7 +72,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(4),
-            Constraint::Length(42),
+            Constraint::Length((flow_w * 2 + 2) as u16),
             Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Length(7),

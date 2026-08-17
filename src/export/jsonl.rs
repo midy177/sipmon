@@ -23,6 +23,7 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
             "call_id": c.call_id,
             "from": c.from_user,
             "to": c.to_user,
+            "caller_ip": c.caller_ip,
             "state": c.state.label(),
             "outcome": format!("{:?}", c.outcome),
             "invite_ts_us": c.invite_ts,
@@ -31,6 +32,7 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
             "setup_ms": c.setup_ms,
             "ring_ms": c.ring_ms,
             "ring_code": c.ring_code,
+            "early_media": c.early_media,
             "hangup_by": c.hangup_by.map(|b| format!("{:?}", b)),
             "hangup_code": c.hangup_code,
             "pkts_sip": c.pkts_sip,
@@ -229,6 +231,7 @@ fn import_call(v: &Value) -> CallSummary {
         call_id: v["call_id"].as_str().unwrap_or_default().to_string(),
         from_user: opt_str(v, "from"),
         to_user: opt_str(v, "to"),
+        caller_ip: opt_str(v, "caller_ip").and_then(|s| s.parse().ok()),
         state: parse_state(v.get("state").and_then(|x| x.as_str())),
         outcome: parse_outcome(v.get("outcome").and_then(|x| x.as_str())),
         invite_ts: v.get("invite_ts_us").and_then(|x| x.as_u64()),
@@ -240,6 +243,10 @@ fn import_call(v: &Value) -> CallSummary {
             .get("ring_code")
             .and_then(|x| x.as_u64())
             .map(|x| x as u16),
+        early_media: v
+            .get("early_media")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
         hangup_by: parse_hangup_by(v.get("hangup_by").and_then(|x| x.as_str())),
         hangup_code: opt_u32(v, "hangup_code"),
         pkts_sip: v.get("pkts_sip").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -253,7 +260,8 @@ fn import_call(v: &Value) -> CallSummary {
             .map(|x| x as usize)
             .unwrap_or(0),
         via_turn: v.get("via_turn").and_then(|x| x.as_bool()).unwrap_or(false),
-        ips: v.get("ips")
+        ips: v
+            .get("ips")
             .and_then(|x| x.as_array())
             .map(|a| {
                 a.iter()
@@ -373,6 +381,7 @@ mod tests {
             call_id: "abc@x".into(),
             from_user: Some("1001".into()),
             to_user: Some("1002".into()),
+            caller_ip: Some("10.0.0.1".parse().unwrap()),
             state: CallState::Completed,
             outcome: Outcome::Answered,
             invite_ts: Some(1_000_000),
@@ -381,6 +390,7 @@ mod tests {
             setup_ms: Some(200),
             ring_ms: Some(50),
             ring_code: Some(180),
+            early_media: true,
             hangup_by: Some(crate::model::sip::HangupBy::Caller),
             hangup_code: Some(200),
             pkts_sip: 8,
@@ -446,6 +456,10 @@ mod tests {
         assert_eq!(loaded.calls[0].state, CallState::Completed);
         assert_eq!(loaded.calls[0].pdd_ms, Some(150));
         assert_eq!(loaded.calls[0].ring_ms, Some(50));
+        assert_eq!(
+            loaded.calls[0].caller_ip,
+            Some("10.0.0.1".parse().unwrap())
+        );
         assert_eq!(
             loaded.calls[0].hangup_by,
             Some(crate::model::sip::HangupBy::Caller)

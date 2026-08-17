@@ -108,7 +108,8 @@ impl Correlator {
             // From each IP's viewpoint: lost egress packets at the source,
             // lost ingress packets at the destination.
             let lost_now = sum.lost;
-            let lost_delta = lost_now.saturating_sub(self.last_lost.get(&key).copied().unwrap_or(0));
+            let lost_delta =
+                lost_now.saturating_sub(self.last_lost.get(&key).copied().unwrap_or(0));
             self.last_lost.insert(key, lost_now);
             if lost_delta > 0 {
                 self.reg.ipstats.observe_lost(
@@ -140,6 +141,15 @@ impl Correlator {
                         jitter_ms: sum.jitter_ms,
                         mos: sum.mos,
                         direction: s.direction.clone(),
+                        bytes: s.bytes,
+                        first_ts_us: s.first_ts_us,
+                        last_ts_us: s.last_ts_us,
+                        rtt_min_ms: sum.rtt_min_ms,
+                        rtt_avg_ms: sum.rtt_avg_ms,
+                        rtt_max_ms: sum.rtt_max_ms,
+                        oneway_ms: sum.oneway_ms,
+                        leg: sum.leg.clone(),
+                        via_turn: sum.via_turn,
                     },
                 ));
         }

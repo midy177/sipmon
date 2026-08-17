@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -123,6 +124,16 @@ impl IpSort {
     }
 }
 
+/// Live event-log recording state surfaced by the top bar (`record`/`-w`
+/// mode): whether the pipeline is writing an evlog, its path, and the bytes
+/// written so far.
+#[derive(Clone, Default)]
+pub struct RecordState {
+    pub active: Arc<AtomicBool>,
+    pub path: Arc<Mutex<Option<PathBuf>>>,
+    pub bytes: Arc<AtomicU64>,
+}
+
 pub struct App {
     pub snap: Arc<Mutex<Snapshot>>,
     pub pause: Arc<AtomicBool>,
@@ -162,6 +173,10 @@ pub struct App {
     pub ip_window_secs: u64, // heatmap window: 60s / 10m / 1h
     pub ip_drill: Option<std::net::IpAddr>,
     pub ip_drill_state: TableState,
+    /// Live evlog recording state (blinking top-bar indicator).
+    pub record: RecordState,
+    /// Privacy mode: masks IPs and caller/callee identifiers (screenshot-safe).
+    pub privacy: bool,
 }
 
 impl App {
@@ -170,6 +185,7 @@ impl App {
         pause: Arc<AtomicBool>,
         focus: Arc<Mutex<Option<String>>>,
         clear: Arc<AtomicBool>,
+        record: RecordState,
     ) -> Self {
         Self {
             snap,
@@ -200,6 +216,8 @@ impl App {
             ip_window_secs: 60,
             ip_drill: None,
             ip_drill_state: TableState::default(),
+            record,
+            privacy: false,
         }
     }
 
@@ -296,6 +314,14 @@ impl App {
                 self.search_editing = true;
             }
             KeyCode::Char('e') => self.do_export(),
+            KeyCode::Char('p') => {
+                self.privacy = !self.privacy;
+                self.set_status(if self.privacy {
+                    "privacy on — IPs and numbers masked"
+                } else {
+                    "privacy off"
+                });
+            }
             KeyCode::Char('f') => {
                 self.filter = self.filter.next();
                 self.set_status(format!("filter = {}", self.filter.label()));
@@ -325,7 +351,10 @@ impl App {
     /// Cycle the loss-only summary window through the supported windows.
     fn cycle_ip_summary_window(&mut self) {
         let vals = crate::store::ipstats::WINDOWS.map(|(s, _)| s);
-        let i = vals.iter().position(|&x| x == self.ip_summary_window).unwrap_or(0);
+        let i = vals
+            .iter()
+            .position(|&x| x == self.ip_summary_window)
+            .unwrap_or(0);
         self.ip_summary_window = vals[(i + 1) % vals.len()];
         let label = crate::store::ipstats::WINDOWS
             .iter()
@@ -565,8 +594,8 @@ pub fn search_results<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn app() -> App {
         App::new(
@@ -574,6 +603,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             Arc::new(AtomicBool::new(false)),
+            RecordState::default(),
         )
     }
 
@@ -603,7 +633,9 @@ mod tests {
         terminal.draw(|f| crate::ui::render(f, &mut a)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let last_y = buf.area.height - 1;
-        let row: String = (0..buf.area.width).map(|x| buf[(x, last_y)].symbol()).collect();
+        let row: String = (0..buf.area.width)
+            .map(|x| buf[(x, last_y)].symbol())
+            .collect();
         for label in [
             "1 Overview",
             "2 Search",
@@ -621,6 +653,46 @@ mod tests {
             buf[(start as u16, last_y)].bg,
             crate::ui::theme::ACCENT,
             "selected tab must be highlighted"
+        );
+    }
+
+    #[test]
+    fn topbar_shows_blinking_recording_indicator() {
+        let mut a = app();
+        a.record = RecordState {
+            active: Arc::new(AtomicBool::new(true)),
+            path: Arc::new(Mutex::new(Some(PathBuf::from("/tmp/capture.evlog")))),
+            bytes: Arc::new(AtomicU64::new(2048)),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut a)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let top: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        // The indicator must carry the file name and the formatted size.
+        assert!(
+            top.contains("REC capture.evlog"),
+            "top bar missing recording indicator: {top:?}"
+        );
+        assert!(
+            top.contains("2.0 KB"),
+            "top bar missing recording size: {top:?}"
+        );
+        // The dot glyph is the blinking part; either phase must be rendered.
+        assert!(
+            top.contains("● REC") || top.contains("○ REC"),
+            "top bar must render the recording dot: {top:?}"
+        );
+        // No recording → no indicator.
+        a.record
+            .active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut a)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let top: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            !top.contains("REC"),
+            "indicator must be hidden when idle: {top:?}"
         );
     }
 }

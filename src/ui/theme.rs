@@ -1,21 +1,21 @@
-//! TUI color palette, matching the opencode dark theme
-//! (https://opencode.ai, `packages/ui/src/theme/themes/opencode.json`).
+//! TUI color palette: a bright, high-contrast variant inspired by the
+//! opencode theme, lightened so text and accents pop on dark terminals.
 
 use ratatui::style::Color;
 
 /// Default text color.
-pub const INK: Color = Color::Rgb(0xee, 0xee, 0xee);
+pub const INK: Color = Color::Rgb(0xf4, 0xf4, 0xf4);
 /// Muted / de-emphasized text.
-pub const MUTED: Color = Color::Rgb(0x80, 0x80, 0x80);
+pub const MUTED: Color = Color::Rgb(0x9a, 0x9a, 0x9a);
 /// Primary accent (peach).
-pub const PRIMARY: Color = Color::Rgb(0xfa, 0xb2, 0x83);
+pub const PRIMARY: Color = Color::Rgb(0xff, 0xc0, 0x92);
 /// Secondary accent (violet) — headings / highlights.
-pub const ACCENT: Color = Color::Rgb(0x9d, 0x7c, 0xd8);
+pub const ACCENT: Color = Color::Rgb(0xc0, 0xa3, 0xf5);
 /// Success / healthy (green).
-pub const SUCCESS: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
+pub const SUCCESS: Color = Color::Rgb(0x94, 0xea, 0xa2);
 /// Warning (orange).
-pub const WARNING: Color = Color::Rgb(0xf5, 0xa7, 0x42);
+pub const WARNING: Color = Color::Rgb(0xfe, 0xbd, 0x5c);
 /// Error / failed (red).
-pub const ERROR: Color = Color::Rgb(0xe0, 0x6c, 0x75);
+pub const ERROR: Color = Color::Rgb(0xff, 0x87, 0x8e);
 /// Informational (teal).
-pub const INFO: Color = Color::Rgb(0x56, 0xb6, 0xc2);
+pub const INFO: Color = Color::Rgb(0x6f, 0xd0, 0xda);

@@ -95,6 +95,17 @@ pub struct StreamSnapEvt {
     pub jitter_ms: Option<f64>,
     pub mos: Option<f64>,
     pub direction: Option<String>,
+    /// Cumulative RTP bytes observed (added in v1.1; absent in older logs).
+    pub bytes: u64,
+    pub first_ts_us: Option<u64>,
+    pub last_ts_us: Option<u64>,
+    pub rtt_min_ms: Option<f64>,
+    pub rtt_avg_ms: Option<f64>,
+    pub rtt_max_ms: Option<f64>,
+    pub oneway_ms: Option<f64>,
+    /// TURN relay leg label ("client"/"peer") if the stream traverses a relay.
+    pub leg: Option<String>,
+    pub via_turn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +366,16 @@ fn encode_event_payload(ev: &Event) -> (EvType, Vec<u8>) {
             write_opt_f64(&mut buf, e.jitter_ms);
             write_opt_f64(&mut buf, e.mos);
             write_opt_string(&mut buf, &e.direction);
+            // v1.1+ fields (readers tolerate their absence in older logs).
+            write_varint(&mut buf, e.bytes);
+            write_opt_u64(&mut buf, e.first_ts_us);
+            write_opt_u64(&mut buf, e.last_ts_us);
+            write_opt_f64(&mut buf, e.rtt_min_ms);
+            write_opt_f64(&mut buf, e.rtt_avg_ms);
+            write_opt_f64(&mut buf, e.rtt_max_ms);
+            write_opt_f64(&mut buf, e.oneway_ms);
+            write_opt_string(&mut buf, &e.leg);
+            buf.push(e.via_turn as u8);
             (EvType::StreamSnap, buf)
         }
         Event::RtcpRtt(e) => {
@@ -406,6 +427,7 @@ fn write_metric_set(buf: &mut Vec<u8>, m: &MetricSet) {
 pub struct EvlogWriter<W: Write + Send> {
     w: BufWriter<W>,
     last_ts: u64,
+    bytes_written: u64,
 }
 
 impl EvlogWriter<File> {
@@ -429,7 +451,11 @@ impl<W: Write + Send> EvlogWriter<W> {
         bw.write_all(&0u16.to_be_bytes())?; // flags
         bw.write_all(&0i32.to_be_bytes())?; // tz_offset
         bw.flush()?;
-        Ok(Self { w: bw, last_ts: 0 })
+        Ok(Self {
+            w: bw,
+            last_ts: 0,
+            bytes_written: 0,
+        })
     }
 
     pub fn write(&mut self, ev: &Event) -> Result<()> {
@@ -443,12 +469,20 @@ impl<W: Write + Send> EvlogWriter<W> {
         rec.extend_from_slice(&payload);
         self.w.write_all(&rec)?;
         self.last_ts = ts;
+        self.bytes_written += rec.len() as u64;
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
         self.w.flush()?;
         Ok(())
+    }
+
+    /// Total payload bytes handed to the underlying writer (headers + records).
+    /// The on-disk size trails this by at most the internal buffer between
+    /// flushes; used by the TUI to show live recording growth.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
     }
 }
 
@@ -534,6 +568,12 @@ fn read_f64<R: Read>(r: &mut R) -> Result<f64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b)?;
     Ok(f64::from_be_bytes(b))
+}
+
+fn read_u8<R: Read>(r: &mut R) -> Result<u8> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0])
 }
 
 fn read_flow<R: Read>(r: &mut R) -> Result<Flow5Tuple> {
@@ -686,6 +726,32 @@ fn decode_payload(ty: u8, ts_us: u64, mut rd: &[u8]) -> Result<Event> {
             let jitter_ms = read_opt_f64(&mut rd)?;
             let mos = read_opt_f64(&mut rd)?;
             let direction = read_opt_string(&mut rd)?;
+            // v1.1+ fields appended after `direction`; older logs stop there.
+            let (
+                bytes,
+                first_ts_us,
+                last_ts_us,
+                rtt_min_ms,
+                rtt_avg_ms,
+                rtt_max_ms,
+                oneway_ms,
+                leg,
+                via_turn,
+            ) = if rd.is_empty() {
+                (0, None, None, None, None, None, None, None, false)
+            } else {
+                (
+                    read_varint(&mut rd)?,
+                    read_opt_u64(&mut rd)?,
+                    read_opt_u64(&mut rd)?,
+                    read_opt_f64(&mut rd)?,
+                    read_opt_f64(&mut rd)?,
+                    read_opt_f64(&mut rd)?,
+                    read_opt_f64(&mut rd)?,
+                    read_opt_string(&mut rd)?,
+                    read_u8(&mut rd)? != 0,
+                )
+            };
             Event::StreamSnap(StreamSnapEvt {
                 ts_us,
                 call_id,
@@ -700,6 +766,15 @@ fn decode_payload(ty: u8, ts_us: u64, mut rd: &[u8]) -> Result<Event> {
                 jitter_ms,
                 mos,
                 direction,
+                bytes,
+                first_ts_us,
+                last_ts_us,
+                rtt_min_ms,
+                rtt_avg_ms,
+                rtt_max_ms,
+                oneway_ms,
+                leg,
+                via_turn,
             })
         }
         5 => {

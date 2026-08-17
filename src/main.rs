@@ -26,6 +26,7 @@ use correlate::Correlator;
 use diagnostics::Severity;
 use store::evlog::{Event, EvlogReader, EvlogWriter};
 use store::registry::Snapshot;
+use ui::app::RecordState;
 
 #[derive(Parser)]
 #[command(
@@ -106,7 +107,8 @@ enum Cmd {
         #[arg(long)]
         no_tui: bool,
     },
-    /// Record a live capture into a binary event log (headless, daemonizable)
+    /// Record a live capture into a binary event log (live TUI by default,
+    /// daemonizable with `-d`)
     Record {
         /// Interface to capture on (default: any)
         #[arg(short = 'i', long, default_value = "any")]
@@ -117,6 +119,9 @@ enum Cmd {
         /// Disable RTP/RTCP analysis
         #[arg(long)]
         no_media: bool,
+        /// No live UI: headless recording only
+        #[arg(long)]
+        headless: bool,
         /// Event-log output path (required)
         #[arg(short = 'w', long)]
         evlog: PathBuf,
@@ -165,6 +170,8 @@ struct Shared {
     focus: Arc<Mutex<Option<String>>>,
     quit: Arc<AtomicBool>,
     clear: Arc<AtomicBool>,
+    /// Live event-log recording state for the TUI top-bar indicator.
+    record: RecordState,
 }
 
 impl Shared {
@@ -175,6 +182,7 @@ impl Shared {
             focus: Arc::new(Mutex::new(None)),
             quit: Arc::new(AtomicBool::new(false)),
             clear: Arc::new(AtomicBool::new(false)),
+            record: RecordState::default(),
         }
     }
 }
@@ -242,6 +250,7 @@ fn main() -> Result<()> {
             daemon,
             pidfile,
             logfile,
+            headless,
         }) => {
             let mut c = cfg.clone();
             c.bpf = filter;
@@ -253,6 +262,7 @@ fn main() -> Result<()> {
                 daemon,
                 pidfile.as_deref(),
                 logfile.as_deref(),
+                headless || global_no_tui,
             )
         }
         Some(Cmd::Replay { evlog, no_tui }) => {
@@ -355,9 +365,11 @@ fn run_stdin(cli: Cli, with_tui: bool) -> Result<()> {
     )
 }
 
-/// Record mode: live capture → binary event log, headless and optionally
-/// daemonized (`-d`). Same pipeline as `live`/`file`, but it always writes the
-/// evlog and never prints per-call JSON.
+/// Record mode: live capture → binary event log, with an optional live TUI.
+/// On a tty the live monitor runs while recording; `--headless` (or a
+/// non-tty / `-d` daemon context) makes it headless. Same pipeline as
+/// `live`/`file`, but it always writes the evlog and never prints per-call
+/// JSON.
 fn run_record(
     mut cfg: Config,
     interface: &str,
@@ -365,6 +377,7 @@ fn run_record(
     daemon: bool,
     pidfile: Option<&std::path::Path>,
     logfile: Option<&std::path::Path>,
+    explicit_headless: bool,
 ) -> Result<()> {
     if daemon {
         daemonize(logfile)?;
@@ -382,7 +395,7 @@ fn run_record(
         Box::new(source),
         cfg,
         format!("record:{interface}"),
-        false,
+        want_tui(explicit_headless),
         false,
         true,
     )
@@ -482,6 +495,13 @@ fn run_capture_loop(
 ) -> Result<()> {
     let shared = Arc::new(Shared::new());
     let evlog_path: Option<PathBuf> = if cfg.dry_run { None } else { cfg.evlog.clone() };
+    if let Some(p) = &evlog_path {
+        // Advertise the recording so the TUI top bar can show it.
+        if let Ok(mut path) = shared.record.path.lock() {
+            *path = Some(p.clone());
+        }
+        shared.record.active.store(true, Ordering::Relaxed);
+    }
 
     let corr = Correlator::new(&cfg, name.clone());
     let writer = match &evlog_path {
@@ -530,9 +550,7 @@ fn run_capture_loop(
                             let _ = w.write(&ev);
                         }
                     }
-                    if let Some(w) = writer.as_mut() {
-                        let _ = w.flush();
-                    }
+                    flush_recorder(&mut writer, &shared2.record);
                     publish(&shared2, &mut corr, true);
                 }
                 if with_tui {
@@ -571,9 +589,7 @@ fn run_capture_loop(
                     last_pub_pkts = cur_pkts;
                     last_pub_focus = cur_focus;
                 }
-                if let Some(w) = writer.as_mut() {
-                    let _ = w.flush();
-                }
+                flush_recorder(&mut writer, &shared2.record);
                 last_publish = std::time::Instant::now();
             }
         }
@@ -583,9 +599,7 @@ fn run_capture_loop(
                 let _ = w.write(&ev);
             }
         }
-        if let Some(w) = writer.as_mut() {
-            let _ = w.flush();
-        }
+        flush_recorder(&mut writer, &shared2.record);
         // Final publish: full fidelity (all calls + all streams) for
         // headless output and exports.
         publish(&shared2, &mut corr, true);
@@ -615,6 +629,43 @@ fn run_capture_loop(
 
     final_exports(&cfg, &shared)?;
     Ok(())
+}
+
+/// Flush the evlog writer and publish its byte count to the TUI top bar.
+fn flush_recorder(writer: &mut Option<EvlogWriter<std::fs::File>>, record: &RecordState) {
+    if let Some(w) = writer.as_mut() {
+        let _ = w.flush();
+        record.bytes.store(w.bytes_written(), Ordering::Relaxed);
+    }
+}
+
+/// Rebuild a stream summary from an evlog StreamSnap record. Used on replay
+/// (no RTP packets are re-fed then) and when exporting an evlog to JSONL.
+fn snap_evt_to_summary(e: &store::evlog::StreamSnapEvt) -> model::media::StreamSummary {
+    model::media::StreamSummary {
+        call_id: Some(e.call_id.clone()),
+        ssrc: e.ssrc,
+        flow: Some(e.flow),
+        codec: e.codec.clone(),
+        payload_type: e.payload_type,
+        packets: e.packets,
+        lost: e.lost,
+        expected: e.expected,
+        loss_pct: e.loss_pct,
+        jitter_ms: e.jitter_ms,
+        first_ts_us: e.first_ts_us,
+        last_ts_us: e.last_ts_us,
+        rtt_min_ms: e.rtt_min_ms,
+        rtt_avg_ms: e.rtt_avg_ms,
+        rtt_max_ms: e.rtt_max_ms,
+        oneway_ms: e.oneway_ms,
+        mos: e.mos,
+        direction: e.direction.clone(),
+        leg: e.leg.clone(),
+        via_turn: e.via_turn,
+        bytes: e.bytes,
+        history: Vec::new(),
+    }
 }
 
 fn publish(shared: &Shared, corr: &mut Correlator, full: bool) {
@@ -707,9 +758,34 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
                             "stream {} ssrc={:#x} pkts={} loss={:.1}%",
                             e.call_id, e.ssrc, e.packets, e.loss_pct
                         ));
+                        corr.reg.add_imported_stream(snap_evt_to_summary(e));
                     } else if let Event::Diag(e) = &ev {
                         corr.reg
                             .push_event(format!("[{}] {} {}", e.severity, e.code, e.message));
+                        // Restore the diagnostic so the Call Detail pane and the
+                        // per-call Diag column show it after a replay.
+                        let severity = match e.severity {
+                            0 => Severity::Info,
+                            1 => Severity::Warn,
+                            _ => Severity::Critical,
+                        };
+                        if let Some(c) = corr.reg.calls.get_mut(&e.call_id) {
+                            match severity {
+                                Severity::Critical => c.critical_count += 1,
+                                Severity::Warn => c.warn_count += 1,
+                                Severity::Info => {}
+                            }
+                        }
+                        corr.reg.diagnostics.push_back(diagnostics::Diagnostic {
+                            ts_us: e.ts_us,
+                            call_id: e.call_id.clone(),
+                            severity,
+                            code: diagnostics::code_from_str(&e.code),
+                            message: e.message.clone(),
+                        });
+                        while corr.reg.diagnostics.len() > corr.reg.max_diagnostics {
+                            corr.reg.diagnostics.pop_front();
+                        }
                     }
                     corr.take_events(); // replay does not re-write evlog
                 }
@@ -857,7 +933,13 @@ fn build_jsonl_focus(
         pdd_ms: call.pdd_ms,
         setup_ms: call.setup_ms,
         ring_ms: call.ring_ms,
-        ring_code: call.ring_code,
+        early_media: call.early_media,
+        invite_ts: call.invite_ts,
+        trying_ts: None,
+        ringing_ts: None,
+        answer_ts: None,
+        bye_ts: None,
+        end_ts: None,
         hangup_by: call.hangup_by,
         hangup_code: call.hangup_code,
         hangup_reason: None,
@@ -954,30 +1036,7 @@ fn run_export(
             }
             Event::StreamSnap(e) => {
                 if in_range(e.ts_us) {
-                    streams_extra.push(model::media::StreamSummary {
-                        call_id: Some(e.call_id.clone()),
-                        ssrc: e.ssrc,
-                        flow: Some(e.flow),
-                        codec: e.codec.clone(),
-                        payload_type: e.payload_type,
-                        packets: e.packets,
-                        lost: e.lost,
-                        expected: e.expected,
-                        loss_pct: e.loss_pct,
-                        jitter_ms: e.jitter_ms,
-                        first_ts_us: None,
-                        last_ts_us: None,
-                        rtt_min_ms: None,
-                        rtt_avg_ms: None,
-                        rtt_max_ms: None,
-                        oneway_ms: None,
-                        mos: e.mos,
-                        direction: e.direction.clone(),
-                        leg: None,
-                        via_turn: false,
-                        bytes: 0,
-                        history: Vec::new(),
-                    });
+                    streams_extra.push(snap_evt_to_summary(e));
                 }
             }
             Event::Diag(e) => {
@@ -1030,6 +1089,7 @@ fn run_tui(shared: Arc<Shared>) -> Result<()> {
         shared.pause.clone(),
         shared.focus.clone(),
         shared.clear.clone(),
+        shared.record.clone(),
     );
     let r = (|| -> Result<()> {
         loop {

@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use crate::model::sip::HangupBy;
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
-use crate::ui::{fmt_dur, fmt_ms, fmt_time, fmt_u32, theme};
+use crate::ui::{fmt_dur, fmt_ms, fmt_secs, fmt_time, mask_ip, mask_user, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([
@@ -56,12 +56,13 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 
     // Call table.
     let header = [
-        "Time", "From", "To", "State", "PDD", "Setup", "Ring", "Dur", "MOS", "RTP", "Diag",
-        "End", "Call-ID",
+        "Time", "SrcIP", "From", "To", "State", "PDD", "Setup", "Ring", "Dur", "EM", "MOS", "RTP",
+        "Diag", "End", "Call-ID",
     ];
     // Keep the highlight anchored to the same call as new calls arrive, then
     // apply the state filter (`f` cycles all/pending/success/failed/canceled).
     app.anchor_overview_selection(snap);
+    let privacy = app.privacy;
     let visible: Vec<&crate::store::registry::CallSummary> = snap
         .calls
         .iter()
@@ -80,19 +81,41 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             Cell::from("·").style(Style::default().fg(theme::MUTED))
         };
         let turn_mark = if c.via_turn { " [T]" } else { "" };
+        let from = match c.from_user.as_deref() {
+            Some(v) if privacy => mask_user(v),
+            Some(v) => v.to_string(),
+            None => String::new(),
+        };
+        let to = match c.to_user.as_deref() {
+            Some(v) if privacy => mask_user(v),
+            Some(v) => v.to_string(),
+            None => String::new(),
+        };
+        let em_cell = if c.early_media {
+            Cell::from("EM").style(
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Cell::from("·").style(Style::default().fg(theme::MUTED))
+        };
+        let src_ip = match c.caller_ip {
+            Some(ip) if privacy => mask_ip(ip),
+            Some(ip) => ip.to_string(),
+            None => "-".into(),
+        };
         Row::new(vec![
             Cell::from(c.invite_ts.map(fmt_time).unwrap_or_else(|| "-".into())),
-            Cell::from(format!(
-                "{}{}",
-                c.from_user.clone().unwrap_or_default(),
-                turn_mark
-            )),
-            Cell::from(c.to_user.clone().unwrap_or_default()),
+            Cell::from(src_ip).style(Style::default().fg(theme::MUTED)),
+            Cell::from(format!("{from}{turn_mark}")),
+            Cell::from(to),
             Cell::from(c.state.label()).style(state_color(c.state)),
-            Cell::from(fmt_u32(c.pdd_ms)),
-            Cell::from(fmt_u32(c.setup_ms)),
-            Cell::from(fmt_ring(c.ring_ms, c.ring_code)).style(ring_style(c.ring_code)),
+            Cell::from(fmt_secs(c.pdd_ms.map(|m| m as u64))),
+            Cell::from(fmt_secs(c.setup_ms.map(|m| m as u64))),
+            Cell::from(fmt_secs(c.ring_ms.map(|m| m as u64))).style(ring_style(c.ring_code)),
             Cell::from(fmt_dur(c.duration_ms)),
+            em_cell,
             Cell::from(fmt_ms(c.best_mos)),
             Cell::from(c.pkts_rtp.to_string()),
             diag_cell,
@@ -105,16 +128,18 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         rows,
         [
             Constraint::Length(8),
+            Constraint::Length(15),
+            Constraint::Length(16),
             Constraint::Length(14),
-            Constraint::Length(12),
             Constraint::Length(10),
-            Constraint::Length(6),
             Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(10),
             Constraint::Length(9),
-            Constraint::Length(8),
+            Constraint::Length(3),
             Constraint::Length(5),
             Constraint::Length(7),
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Min(10),
         ],
@@ -123,7 +148,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         Row::new(header.iter().map(|h| Cell::from(*h))).style(Style::default().fg(theme::WARNING)),
     )
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Calls ({}/{}) — Enter=detail, f=filter:{}  [PDD=INV→ring, Setup=INV→200, Ring=dur·code]",
+        "Calls ({}/{}) — Enter=detail, f=filter:{}  [PDD=INV→try/ring, Setup=INV→200, Ring=dur, EM=183+media]",
         visible.len(),
         snap.calls.len(),
         app.filter.label()
@@ -143,24 +168,14 @@ pub fn state_color(state: crate::model::sip::CallState) -> Style {
     }
 }
 
-/// Ring column: ringing duration + the provisional code that started it
-/// (180 Ringing / 183 early media), e.g. "3.4s·183".
-fn fmt_ring(ms: Option<u32>, code: Option<u16>) -> String {
-    let t = match ms {
-        None => "-".into(),
-        Some(ms) if ms < 60_000 => format!("{}.{}s", ms / 1000, (ms % 1000) / 100),
-        Some(ms) => format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1000),
-    };
-    match code {
-        Some(c) => format!("{t}·{c}"),
-        None => t,
-    }
-}
-
+/// Ring column: ringing duration (provisional code is folded into the EM
+/// column / color, not shown as text).
 fn ring_style(code: Option<u16>) -> Style {
     // 183 = early media, worth highlighting.
     match code {
-        Some(183) => Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        Some(183) => Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
         _ => Style::default(),
     }
 }
@@ -180,5 +195,82 @@ fn end_style(by: Option<HangupBy>) -> Style {
         Some(HangupBy::Reject) | Some(HangupBy::Cancel) => Style::default().fg(theme::ERROR),
         Some(HangupBy::Caller) | Some(HangupBy::Callee) => Style::default().fg(theme::MUTED),
         None => Style::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use crate::store::registry::CallSummary;
+    use crate::ui::app::{App, Page, RecordState};
+
+    fn render_overview(privacy: bool) -> String {
+        let snap = Arc::new(Mutex::new(Snapshot {
+            calls: vec![CallSummary {
+                call_id: "c1".into(),
+                from_user: Some("13812345678".into()),
+                to_user: Some("bob".into()),
+                caller_ip: Some("10.10.0.8".parse().unwrap()),
+                state: crate::model::sip::CallState::Active,
+                outcome: crate::model::sip::Outcome::Answered,
+                invite_ts: Some(1_000_000),
+                duration_ms: Some(5_000),
+                pdd_ms: Some(100),
+                setup_ms: Some(200),
+                ring_ms: Some(50),
+                ring_code: Some(180),
+                early_media: true,
+                hangup_by: None,
+                hangup_code: None,
+                pkts_sip: 4,
+                pkts_rtp: 100,
+                best_mos: Some(4.2),
+                warn_count: 0,
+                critical_count: 0,
+                stream_count: 1,
+                via_turn: false,
+                ips: vec!["10.10.0.8".parse().unwrap()],
+            }],
+            ..Snapshot::default()
+        }));
+        let mut app = App::new(
+            snap,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(AtomicBool::new(false)),
+            RecordState::default(),
+        );
+        app.privacy = privacy;
+        app.page = Page::Overview;
+        let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn overview_renders_src_ip_column() {
+        let text = render_overview(false);
+        assert!(text.contains("SrcIP"), "SrcIP header missing");
+        assert!(text.contains("10.10.0.8"), "caller IP missing");
+    }
+
+    #[test]
+    fn overview_masks_src_ip_in_privacy_mode() {
+        let text = render_overview(true);
+        assert!(!text.contains("10.10.0.8"), "caller IP leaked in privacy");
+        assert!(text.contains("10.*.*.8"), "masked caller IP missing");
     }
 }
