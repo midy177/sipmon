@@ -735,7 +735,10 @@ fn final_exports(cfg: &Config, shared: &Shared) -> Result<()> {
 fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
     let mut reader = EvlogReader::open(evlog)?;
     let shared = Arc::new(Shared::new());
-    let corr = Correlator::new(cfg, format!("replay:{evlog}"));
+    let mut corr = Correlator::new(cfg, format!("replay:{evlog}"));
+    // Restore the recording machine's UTC offset so the UI can render the
+    // original local wall-clock ("当时的时间") instead of guessing at replay time.
+    corr.reg.tz_offset_secs = reader.tz_offset_secs();
 
     let shared2 = shared.clone();
     let handle = std::thread::spawn(move || {
@@ -756,6 +759,9 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
             }
             match reader.next_event() {
                 Ok(Some(ev)) => {
+                    // Anchor the session start on the first record so the flow's
+                    // already-recorded-duration delta matches the recording.
+                    corr.reg.ensure_start(ev.ts_us());
                     if let Event::SipMsg(e) = &ev {
                         let msg = capture::replay::evt_to_sipmsg(e);
                         corr.ingest_sip(msg);
@@ -928,6 +934,8 @@ fn build_jsonl_focus(
         caller_ip: None,
         callee_addr: None,
         messages: Vec::new(),
+        legs: Vec::new(),
+        b2bua: None,
         streams: Vec::new(),
         diagnostics: base
             .diagnostics

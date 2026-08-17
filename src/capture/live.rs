@@ -14,9 +14,12 @@ pub struct LiveSource {
 
 impl LiveSource {
     pub fn open(device: &str, bpf: Option<&str>) -> anyhow::Result<Self> {
+        // The Linux "any" pseudo-device captures on all interfaces but does
+        // not support promiscuous mode (libpcap rejects it at activation).
+        let promisc = device != "any";
         let mut cap = pcap::Capture::from_device(device)
             .map_err(|e| anyhow::anyhow!("open device {device}: {e}"))?
-            .promisc(true)
+            .promisc(promisc)
             .snaplen(65535)
             .buffer_size(64 * 1024 * 1024)
             .timeout(100)

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::store::ipstats::{Dir, IpStats, WINDOWS};
 use crate::store::registry::{CallSummary, Snapshot};
 use crate::ui::app::{App, IpSort};
-use crate::ui::{fmt_bytes, fmt_time, mask_ip, mask_user, theme};
+use crate::ui::{fmt_bytes, fmt_time, fmt_time_delta, mask_ip, mask_user, theme};
 
 /// How often the IP row order is re-derived from the live sort key. Between
 /// refreshes the previous order is kept so the list doesn't reshuffle on every
@@ -243,7 +243,11 @@ fn render_drill(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             (None, None) => "-".into(),
         };
         Row::new(vec![
-            Cell::from(c.invite_ts.map(fmt_time).unwrap_or_else(|| "-".into())),
+            Cell::from(
+                c.invite_ts
+                    .map(|t| fmt_time_delta(t, snap.start_us.unwrap_or(t), snap.tz_offset_secs))
+                    .unwrap_or_else(|| "-".into()),
+            ),
             Cell::from(user(&c.from_user)),
             Cell::from(user(&c.to_user)),
             Cell::from(c.state.label()),
@@ -256,7 +260,7 @@ fn render_drill(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),
+            Constraint::Length(17),
             Constraint::Length(14),
             Constraint::Length(12),
             Constraint::Length(10),

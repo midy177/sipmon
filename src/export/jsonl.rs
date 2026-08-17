@@ -456,10 +456,7 @@ mod tests {
         assert_eq!(loaded.calls[0].state, CallState::Completed);
         assert_eq!(loaded.calls[0].pdd_ms, Some(150));
         assert_eq!(loaded.calls[0].ring_ms, Some(50));
-        assert_eq!(
-            loaded.calls[0].caller_ip,
-            Some("10.0.0.1".parse().unwrap())
-        );
+        assert_eq!(loaded.calls[0].caller_ip, Some("10.0.0.1".parse().unwrap()));
         assert_eq!(
             loaded.calls[0].hangup_by,
             Some(crate::model::sip::HangupBy::Caller)

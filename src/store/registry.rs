@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::diagnostics::Diagnostic;
 use crate::model::media::StreamSummary;
-use crate::model::sip::{Call, CallState, HangupBy, Method, Outcome, SipMsg};
+use crate::model::sip::{B2buaInfo, Call, CallState, HangupBy, Method, Outcome, SipMsg};
 use crate::store::ipstats::{IpStats, IpStatsStore};
 
 /// Focused-call detail payload for the Call Detail page.
@@ -24,6 +24,13 @@ pub struct Focus {
     /// Callee signaling address (src of the first response).
     pub callee_addr: Option<std::net::SocketAddr>,
     pub messages: Vec<SipMsg>,
+    /// Dialog (leg) index per message, parallel to `messages`. Messages of the
+    /// same dialog share a leg index; a call with ≥2 legs is a same-Call-ID
+    /// B2BUA split. Legs are derived from `from_tag` (fallback `branch`).
+    pub legs: Vec<u8>,
+    /// B2BUA evidence: dual-dialog split within this Call-ID, or a pairing
+    /// with a sibling call-id whose INVITE the B2BUA rewrote.
+    pub b2bua: Option<B2buaInfo>,
     pub streams: Vec<StreamSummary>,
     pub diagnostics: Vec<Diagnostic>,
     pub negotiated_endpoints: Vec<std::net::SocketAddr>,
@@ -92,6 +99,13 @@ pub struct CallSummary {
 pub struct Snapshot {
     pub source: String,
     pub elapsed_us: Option<u64>,
+    /// Absolute (epoch us) timestamp of the first observed frame: the
+    /// recording/session start used to compute each event's already-recorded
+    /// duration in the Call Detail flow / call lists.
+    pub start_us: Option<u64>,
+    /// UTC offset (seconds) of the machine that recorded the event log, when
+    /// known (replay). Used to render the original local wall-clock.
+    pub tz_offset_secs: Option<i32>,
     pub pps: f64,
     pub pkts_total: u64,
     #[allow(dead_code)]
@@ -138,6 +152,9 @@ pub struct Registry {
     pub start_us: Option<u64>,
     pub last_us: Option<u64>,
     pub pkts_total: u64,
+    /// UTC offset (seconds) of the machine that recorded the event log
+    /// (populated on replay); used to render the original local wall-clock.
+    pub tz_offset_secs: Option<i32>,
     #[allow(dead_code)]
     pub pkts_dropped: u64,
     pub pkts_last_window: u64,
@@ -185,6 +202,7 @@ impl Default for Registry {
             start_us: None,
             last_us: None,
             pkts_total: 0,
+            tz_offset_secs: None,
             pkts_dropped: 0,
             pkts_last_window: 0,
             window_start_us: None,
@@ -402,6 +420,15 @@ impl Registry {
         self.pkts_last_window += 1;
     }
 
+    /// Record the session/replay start if not already set (used by replay so
+    /// the first evlog event, not just the first SIP message, anchors the
+    /// already-recorded-duration delta).
+    pub fn ensure_start(&mut self, ts_us: u64) {
+        if self.start_us.is_none() {
+            self.start_us = Some(ts_us);
+        }
+    }
+
     pub fn get_or_create_call(&mut self, call_id: &str) -> &mut Call {
         if !self.calls.contains_key(call_id) {
             self.calls
@@ -514,6 +541,8 @@ impl Registry {
                 (Some(a), Some(b)) => Some(b.saturating_sub(a)),
                 _ => None,
             },
+            start_us: self.start_us,
+            tz_offset_secs: self.tz_offset_secs,
             pps: self.pps,
             pkts_total: self.pkts_total,
             pkts_dropped: self.pkts_dropped,
@@ -594,6 +623,14 @@ impl Registry {
             .filter(|d| d.call_id == call_id)
             .cloned()
             .collect();
+        // Dialog (leg) derivation: every message of a dialog shares the same
+        // From tag (fallback: branch). ≥2 distinct legs inside one Call-ID is a
+        // same-Call-ID B2BUA split.
+        let (legs, leg_count) = dialog_legs(&msgs);
+        let b2bua = (leg_count >= 2).then(|| B2buaInfo {
+            addr: common_flow_ip(&msgs, &legs),
+            legs: leg_count,
+        });
         Some(Focus {
             call_id: call_id.to_string(),
             state: Some(call.state),
@@ -605,6 +642,8 @@ impl Registry {
             caller_ip,
             callee_addr,
             messages: msgs,
+            legs,
+            b2bua,
             streams,
             diagnostics,
             negotiated_endpoints: call.negotiated.endpoints.clone(),
@@ -686,10 +725,158 @@ fn sip_header(raw: &[u8], name: &str) -> Option<String> {
     })
 }
 
+/// Per-message dialog (leg) index, keyed by From tag (fallback: branch).
+/// Returns (per-message legs, number of distinct legs). Messages without any
+/// tag key collapse into leg 0.
+fn dialog_legs(msgs: &[SipMsg]) -> (Vec<u8>, u8) {
+    let mut leg_of: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    let legs: Vec<u8> = msgs
+        .iter()
+        .map(|m| {
+            let key = m
+                .from_tag
+                .clone()
+                .or_else(|| m.branch.clone())
+                .unwrap_or_default();
+            if key.is_empty() {
+                0
+            } else {
+                let n = leg_of.len().min(u8::MAX as usize) as u8;
+                *leg_of.entry(key).or_insert(n)
+            }
+        })
+        .collect();
+    let count = leg_of.len().max(1).min(u8::MAX as usize) as u8;
+    (legs, count)
+}
+
+/// The one IP shared by the flows of both the first two legs — i.e. the
+/// B2BUA/SBC in a same-Call-ID dual-dialog split. None when ambiguous.
+fn common_flow_ip(msgs: &[SipMsg], legs: &[u8]) -> Option<std::net::IpAddr> {
+    let mut by_leg: std::collections::HashMap<u8, Vec<std::net::IpAddr>> =
+        std::collections::HashMap::new();
+    for (m, l) in msgs.iter().zip(legs) {
+        by_leg
+            .entry(*l)
+            .or_default()
+            .extend([m.flow.src.ip(), m.flow.dst.ip()]);
+    }
+    let l0 = by_leg.get(&0)?;
+    let l1 = by_leg.get(&1)?;
+    let shared: Vec<std::net::IpAddr> = l0.iter().copied().filter(|ip| l1.contains(ip)).collect();
+    (shared.len() == 1).then(|| shared[0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::media::StreamSummary;
+    use crate::model::packet::{Flow5Tuple, Proto};
+    use crate::model::sip::Method;
+
+    fn mk_sip(from_tag: Option<&str>, from: &str, to: &str) -> SipMsg {
+        SipMsg {
+            ts_us: 0,
+            flow: Flow5Tuple {
+                proto: Proto::Udp,
+                src: from.parse().unwrap(),
+                dst: to.parse().unwrap(),
+            },
+            is_request: true,
+            method: Some(Method::Invite),
+            status: None,
+            call_id: "c1".into(),
+            cseq: Some(1),
+            cseq_method: Some("INVITE".into()),
+            branch: Some("b".into()),
+            from_tag: from_tag.map(str::to_owned),
+            to_tag: None,
+            from_uri: None,
+            to_uri: None,
+            raw: bytes::Bytes::new(),
+            contact_addr: None,
+            route_count: 0,
+            record_route_count: 0,
+            has_sdp: false,
+        }
+    }
+
+    #[test]
+    fn dialog_legs_groups_by_from_tag() {
+        let msgs = vec![
+            mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060"),
+            mk_sip(Some("t2"), "2.2.2.2:5060", "3.3.3.3:5060"),
+            mk_sip(Some("t1"), "2.2.2.2:5060", "1.1.1.1:5060"),
+        ];
+        let (legs, n) = dialog_legs(&msgs);
+        assert_eq!(legs, vec![0, 1, 0]);
+        assert_eq!(n, 2);
+        // A re-INVITE (same From tag) stays in the same dialog → not a B2BUA.
+        let msgs2 = vec![
+            mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060"),
+            mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060"),
+        ];
+        let (_, n2) = dialog_legs(&msgs2);
+        assert_eq!(n2, 1);
+    }
+
+    #[test]
+    fn common_flow_ip_finds_same_call_id_b2bua() {
+        let msgs = vec![
+            mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060"),
+            mk_sip(Some("t2"), "2.2.2.2:5060", "3.3.3.3:5060"),
+        ];
+        let (legs, _) = dialog_legs(&msgs);
+        assert_eq!(
+            common_flow_ip(&msgs, &legs),
+            Some("2.2.2.2".parse().unwrap()),
+            "shared flow IP (the B2BUA) must be found"
+        );
+        // No shared IP → None (ambiguous).
+        let msgs2 = vec![
+            mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060"),
+            mk_sip(Some("t2"), "3.3.3.3:5060", "4.4.4.4:5060"),
+        ];
+        let (legs2, _) = dialog_legs(&msgs2);
+        assert_eq!(common_flow_ip(&msgs2, &legs2), None);
+    }
+
+    #[test]
+    fn focus_detail_exposes_legs_and_b2bua() {
+        let mut reg = Registry::with_source("t".into());
+        let call = reg.get_or_create_call("c1");
+        call.from_user = Some("alice".into());
+        call.to_user = Some("bob".into());
+        call.invite_ts = Some(1_000_000);
+        let msgs = vec![
+            mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060"),
+            mk_sip(Some("t2"), "2.2.2.2:5060", "3.3.3.3:5060"),
+        ];
+        call.messages = msgs;
+        reg.focus_hint = Some("c1".into());
+        let focus = reg.snapshot_full().focus.expect("focus detail present");
+        assert_eq!(focus.legs, vec![0, 1]);
+        let b2bua = focus.b2bua.expect("same Call-ID split must be detected");
+        assert_eq!(b2bua.legs, 2);
+        assert_eq!(b2bua.addr, Some("2.2.2.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn focus_detail_no_b2bua_for_single_dialog() {
+        let mut reg = Registry::with_source("t".into());
+        let call = reg.get_or_create_call("c1");
+        call.from_user = Some("alice".into());
+        call.to_user = Some("bob".into());
+        call.invite_ts = Some(1_000_000);
+        call.messages = vec![
+            mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060"),
+            mk_sip(Some("t1"), "2.2.2.2:5060", "1.1.1.1:5060"),
+        ];
+        reg.focus_hint = Some("c1".into());
+        let focus = reg.snapshot_full().focus.expect("focus detail present");
+        assert_eq!(focus.legs, vec![0, 0]);
+        assert!(focus.b2bua.is_none(), "single dialog must not be a B2BUA");
+    }
 
     #[test]
     fn imported_streams_surface_in_snapshot_focus_and_summary() {

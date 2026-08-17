@@ -99,7 +99,9 @@ pub fn detect_local_ips() -> Vec<std::net::IpAddr> {
         let mut cur = head;
         while !cur.is_null() {
             let ifa = &*cur;
-            if let Some(a) = (!ifa.ifa_addr.is_null()).then(|| sockaddr_to_ip(ifa.ifa_addr)).flatten()
+            if let Some(a) = (!ifa.ifa_addr.is_null())
+                .then(|| sockaddr_to_ip(ifa.ifa_addr))
+                .flatten()
                 && !a.is_loopback()
                 && !a.is_unspecified()
                 && !a.is_multicast()
@@ -125,13 +127,15 @@ unsafe fn sockaddr_to_ip(sa: *const libc::sockaddr) -> Option<std::net::IpAddr> 
         match (*sa).sa_family as libc::c_int {
             libc::AF_INET => {
                 let s = &*(sa as *const libc::sockaddr_in);
-                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
-                    s.sin_addr.s_addr,
-                ))))
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                    u32::from_be(s.sin_addr.s_addr),
+                )))
             }
             libc::AF_INET6 => {
                 let s = &*(sa as *const libc::sockaddr_in6);
-                Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(s.sin6_addr.s6_addr)))
+                Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                    s.sin6_addr.s6_addr,
+                )))
             }
             _ => None,
         }

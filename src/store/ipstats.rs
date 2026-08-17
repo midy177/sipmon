@@ -96,7 +96,12 @@ impl IpStats {
     /// Ensure a bucket exists for `ts_us` in the given ring, pushing empty
     /// buckets to fill gaps and pruning entries older than `retain`. The common
     /// in-order case is O(1); only reordered timestamps fall back to a scan.
-    fn bucket_mut(ring: &mut VecDeque<(u64, Bucket)>, ts_us: u64, width_us: u64, retain: u64) -> &mut Bucket {
+    fn bucket_mut(
+        ring: &mut VecDeque<(u64, Bucket)>,
+        ts_us: u64,
+        width_us: u64,
+        retain: u64,
+    ) -> &mut Bucket {
         let key = ts_us / width_us;
         if ring.is_empty() {
             ring.push_back((key, Bucket::default()));
@@ -104,9 +109,7 @@ impl IpStats {
             return &mut tail.1;
         }
         // Align the tail forward to `key`, filling gaps and pruning the front.
-        while ring.back().map(|(k, _)| *k).unwrap_or(0) < key
-            && (ring.len() as u64) < retain
-        {
+        while ring.back().map(|(k, _)| *k).unwrap_or(0) < key && (ring.len() as u64) < retain {
             let next = ring.back().unwrap().0 + 1;
             ring.push_back((next, Bucket::default()));
         }
@@ -329,7 +332,11 @@ impl IpStats {
         }
         map.into_iter()
             .map(|(g, (p, l))| {
-                let pct = if p == 0 { 0.0 } else { l as f64 / p as f64 * 100.0 };
+                let pct = if p == 0 {
+                    0.0
+                } else {
+                    l as f64 / p as f64 * 100.0
+                };
                 (g * group * bucket_us, pct)
             })
             .collect()

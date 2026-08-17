@@ -16,6 +16,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::store::registry::Snapshot;
 use app::{App, Page, RecordState};
+use chrono::Offset;
 
 /// Mask a user/number for privacy: keep the first 3 and last 4 characters,
 /// mask the middle (very short values keep only their first character).
@@ -260,11 +261,51 @@ fn render_page_tabs(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
-/// Format a capture timestamp (us) as HH:MM:SS.
+/// Format a capture timestamp (us) as HH:MM:SS in the current machine's local
+/// timezone. Callers that know the recording machine's UTC offset should use
+/// `fmt_time_tz` instead so a replay shows the wall-clock as it was recorded.
 pub fn fmt_time(ts_us: u64) -> String {
-    chrono::DateTime::from_timestamp((ts_us / 1_000_000) as i64, 0)
-        .map(|d| d.format("%H:%M:%S").to_string())
-        .unwrap_or_else(|| "??:??:??".into())
+    fmt_time_tz(ts_us, None)
+}
+
+/// Format a capture timestamp (us) as HH:MM:SS. `tz_secs` is the recording
+/// machine's UTC offset in seconds (positive east of UTC); `None` falls back to
+/// the current machine's local timezone.
+pub fn fmt_time_tz(ts_us: u64, tz_secs: Option<i32>) -> String {
+    let Some(utc) = chrono::DateTime::from_timestamp((ts_us / 1_000_000) as i64, 0) else {
+        return "??:??:??".into();
+    };
+    let offset = match tz_secs {
+        Some(s) => s,
+        None => chrono::Local::now().offset().fix().local_minus_utc(),
+    };
+    let local = utc + chrono::Duration::seconds(offset as i64);
+    local.format("%H:%M:%S").to_string()
+}
+
+/// Merged flow-time cell: local wall-clock plus the already-recorded duration,
+/// e.g. `12:34:56(+1m05s)`. `base_us` is the recording/session start, so the
+/// delta is how far into the recording this message/call happened.
+pub fn fmt_time_delta(ts_us: u64, base_us: u64, tz_secs: Option<i32>) -> String {
+    format!(
+        "{}(+{})",
+        fmt_time_tz(ts_us, tz_secs),
+        fmt_elapsed(ts_us.saturating_sub(base_us))
+    )
+}
+
+/// Compact elapsed duration, e.g. `0.12s` / `45.6s` / `1m05s` / `1h05m`.
+pub fn fmt_elapsed(us: u64) -> String {
+    let ms = us / 1000;
+    if ms < 1000 {
+        format!("{:.2}s", ms as f64 / 1000.0)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else if ms < 3_600_000 {
+        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1000)
+    } else {
+        format!("{}h{:02}m", ms / 3_600_000, (ms % 3_600_000) / 60_000)
+    }
 }
 
 /// Format ms with one decimal, or "-".

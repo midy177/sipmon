@@ -400,8 +400,18 @@ mod tests {
     /// A SIP message with a real SDP body (so the correlator learns the media
     /// endpoints and can attribute subsequent RTP to the call).
     #[allow(clippy::too_many_arguments)]
-    fn sdp_msg(ts: u64, call_id: &str, is_req: bool, method: Method, status: Option<u16>,
-               src: &str, dst: &str, sdp_ip: &str, port: u16, to_tag: bool) -> SipMsg {
+    fn sdp_msg(
+        ts: u64,
+        call_id: &str,
+        is_req: bool,
+        method: Method,
+        status: Option<u16>,
+        src: &str,
+        dst: &str,
+        sdp_ip: &str,
+        port: u16,
+        to_tag: bool,
+    ) -> SipMsg {
         let body = format!(
             "v=0\r\no=- 1 1 IN IP4 {sdp_ip}\r\ns=-\r\nc=IN IP4 {sdp_ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
         );
@@ -449,10 +459,30 @@ mod tests {
         let mut corr = Correlator::new(&Config::default(), "ipstats".into());
         let id = "ip-attr";
         // INVITE (offer) + 200 OK (answer) with SDP, then ACK.
-        corr.ingest_sip(sdp_msg(1_000_000, id, true, Method::Invite, None,
-            "10.10.0.1:5060", "10.20.0.1:5060", "10.10.0.1", 20000, false));
-        corr.ingest_sip(sdp_msg(1_010_000, id, false, Method::Invite, Some(200),
-            "10.20.0.1:5060", "10.10.0.1:5060", "10.20.0.1", 30000, true));
+        corr.ingest_sip(sdp_msg(
+            1_000_000,
+            id,
+            true,
+            Method::Invite,
+            None,
+            "10.10.0.1:5060",
+            "10.20.0.1:5060",
+            "10.10.0.1",
+            20000,
+            false,
+        ));
+        corr.ingest_sip(sdp_msg(
+            1_010_000,
+            id,
+            false,
+            Method::Invite,
+            Some(200),
+            "10.20.0.1:5060",
+            "10.10.0.1:5060",
+            "10.20.0.1",
+            30000,
+            true,
+        ));
         // RTP toward the negotiated endpoints.
         let flow = Flow5Tuple {
             proto: Proto::Udp,
@@ -463,7 +493,13 @@ mod tests {
             corr.ingest_rtp(
                 1_100_000 + i as u64 * 20_000,
                 flow,
-                RtpHeader { version: 2, payload_type: 0, sequence_number: 1000 + i, timestamp: 16_000 + i as u32 * 160, ssrc: 0x1000 },
+                RtpHeader {
+                    version: 2,
+                    payload_type: 0,
+                    sequence_number: 1000 + i,
+                    timestamp: 16_000 + i as u32 * 160,
+                    ssrc: 0x1000,
+                },
                 160,
                 Encap::Direct,
             );
@@ -471,17 +507,32 @@ mod tests {
         // Both endpoint IPs tracked with the right packet/byte counts.
         let stats = corr.reg.ipstats.snapshot();
         assert_eq!(stats.len(), 2, "both endpoints tracked");
-        let a = stats.iter().find(|s| s.ip == "10.10.0.1".parse::<std::net::IpAddr>().unwrap()).unwrap();
+        let a = stats
+            .iter()
+            .find(|s| s.ip == "10.10.0.1".parse::<std::net::IpAddr>().unwrap())
+            .unwrap();
         assert_eq!(a.pkts_tx + a.pkts_rx, 10);
         assert_eq!(a.bytes_tx + a.bytes_rx, 1600);
-        let b = stats.iter().find(|s| s.ip == "10.20.0.1".parse::<std::net::IpAddr>().unwrap()).unwrap();
+        let b = stats
+            .iter()
+            .find(|s| s.ip == "10.20.0.1".parse::<std::net::IpAddr>().unwrap())
+            .unwrap();
         assert_eq!(b.pkts_tx + b.pkts_rx, 10);
         // Call remembers the media IPs for the drill-down.
         let call = corr.reg.calls.get(id).unwrap();
-        assert!(call.ips.contains(&"10.10.0.1".parse::<std::net::IpAddr>().unwrap()));
-        assert!(call.ips.contains(&"10.20.0.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(
+            call.ips
+                .contains(&"10.10.0.1".parse::<std::net::IpAddr>().unwrap())
+        );
+        assert!(
+            call.ips
+                .contains(&"10.20.0.1".parse::<std::net::IpAddr>().unwrap())
+        );
         // Active-call counters for both signaling endpoints.
-        let a = stats.iter().find(|s| s.ip == "10.10.0.1".parse::<std::net::IpAddr>().unwrap()).unwrap();
+        let a = stats
+            .iter()
+            .find(|s| s.ip == "10.10.0.1".parse::<std::net::IpAddr>().unwrap())
+            .unwrap();
         assert_eq!(a.active_calls, 1);
     }
 
@@ -491,9 +542,12 @@ mod tests {
         let mut corr = Correlator::new(&Config::default(), "clear".into());
         corr.ingest_sip(sip(1_000_000, "x", Method::Invite, false));
         corr.ingest_sip(sip(1_100_000, "x", Method::Bye, true));
-        corr.reg
-            .ipstats
-            .observe_packet("10.0.0.1".parse().unwrap(), 1_000_000, 100, crate::store::ipstats::Dir::Tx);
+        corr.reg.ipstats.observe_packet(
+            "10.0.0.1".parse().unwrap(),
+            1_000_000,
+            100,
+            crate::store::ipstats::Dir::Tx,
+        );
         assert!(!corr.reg.calls.is_empty());
         assert!(!corr.reg.ipstats.snapshot().is_empty());
         corr.clear();

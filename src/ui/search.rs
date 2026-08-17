@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::store::registry::Snapshot;
 use crate::ui::app::{App, search_results};
-use crate::ui::{fmt_dur, fmt_ms, fmt_time, mask_user, theme};
+use crate::ui::{fmt_dur, fmt_ms, fmt_time_delta, mask_user, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
@@ -37,7 +37,11 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     };
     let rows = results.iter().map(|c| {
         Row::new(vec![
-            Cell::from(c.invite_ts.map(fmt_time).unwrap_or_else(|| "-".into())),
+            Cell::from(
+                c.invite_ts
+                    .map(|t| fmt_time_delta(t, snap.start_us.unwrap_or(t), snap.tz_offset_secs))
+                    .unwrap_or_else(|| "-".into()),
+            ),
             Cell::from(user(&c.from_user)),
             Cell::from(user(&c.to_user)),
             Cell::from(c.state.label()),
@@ -50,7 +54,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),
+            Constraint::Length(17),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(10),

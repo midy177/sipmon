@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use crate::model::sip::HangupBy;
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
-use crate::ui::{fmt_dur, fmt_ms, fmt_secs, fmt_time, mask_ip, mask_user, theme};
+use crate::ui::{fmt_dur, fmt_ms, fmt_secs, fmt_time_delta, mask_user, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([
@@ -54,10 +54,23 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     .block(Block::default().borders(Borders::ALL).title("Summary"));
     f.render_widget(cards, chunks[1]);
 
-    // Call table.
+    // Call table. The SrcIP column was dropped to give the (wider) local-time +
+    // recorded-duration Time column room.
     let header = [
-        "Time", "SrcIP", "From", "To", "State", "PDD", "Setup", "Ring", "Dur", "EarlyMedia", "MOS",
-        "RTP", "Diag", "End", "Call-ID",
+        "Time",
+        "From",
+        "To",
+        "State",
+        "PDD",
+        "Setup",
+        "Ring",
+        "Dur",
+        "EarlyMedia",
+        "MOS",
+        "RTP",
+        "Diag",
+        "End",
+        "Call-ID",
     ];
     // Keep the highlight anchored to the same call as new calls arrive, then
     // apply the state filter (`f` cycles all/pending/success/failed/canceled).
@@ -100,14 +113,12 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         } else {
             Cell::from("·").style(Style::default().fg(theme::MUTED))
         };
-        let src_ip = match c.caller_ip {
-            Some(ip) if privacy => mask_ip(ip),
-            Some(ip) => ip.to_string(),
-            None => "-".into(),
-        };
         Row::new(vec![
-            Cell::from(c.invite_ts.map(fmt_time).unwrap_or_else(|| "-".into())),
-            Cell::from(src_ip).style(Style::default().fg(theme::MUTED)),
+            Cell::from(
+                c.invite_ts
+                    .map(|t| fmt_time_delta(t, snap.start_us.unwrap_or(t), snap.tz_offset_secs))
+                    .unwrap_or_else(|| "-".into()),
+            ),
             Cell::from(format!("{from}{turn_mark}")),
             Cell::from(to),
             Cell::from(c.state.label()).style(state_color(c.state)),
@@ -127,8 +138,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),
-            Constraint::Length(15),
+            Constraint::Length(17),
             Constraint::Length(16),
             Constraint::Length(14),
             Constraint::Length(10),
@@ -261,16 +271,26 @@ mod tests {
     }
 
     #[test]
-    fn overview_renders_src_ip_column() {
+    fn overview_merges_local_time_and_recorded_duration() {
         let text = render_overview(false);
-        assert!(text.contains("SrcIP"), "SrcIP header missing");
-        assert!(text.contains("10.10.0.8"), "caller IP missing");
+        assert!(
+            !text.contains("SrcIP"),
+            "SrcIP column must be removed to make room for the time display"
+        );
+        // The Time cell carries the local wall-clock plus the recorded delta.
+        assert!(
+            text.contains("(+"),
+            "time column must include the recorded duration: {text}"
+        );
     }
 
     #[test]
-    fn overview_masks_src_ip_in_privacy_mode() {
+    fn overview_masks_users_in_privacy_mode() {
         let text = render_overview(true);
-        assert!(!text.contains("10.10.0.8"), "caller IP leaked in privacy");
-        assert!(text.contains("10.*.*.8"), "masked caller IP missing");
+        assert!(
+            !text.contains("13812345678"),
+            "caller number leaked in privacy"
+        );
+        assert!(text.contains("138…5678"), "masked caller number missing");
     }
 }

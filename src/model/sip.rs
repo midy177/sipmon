@@ -124,6 +124,16 @@ pub struct Leg {
     pub local: Option<SocketAddr>,
 }
 
+/// B2BUA evidence for a call: two dialogs observed inside the same Call-ID,
+/// distinguished by their From tags (a same-Call-ID B2BUA/SBC split).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct B2buaInfo {
+    /// The B2BUA/SBC signaling endpoint (IP shared by both legs' flows).
+    pub addr: Option<std::net::IpAddr>,
+    /// Number of dialogs (legs) observed in this call.
+    pub legs: u8,
+}
+
 /// A classified/decoded SIP message relevant to analysis.
 #[derive(Debug, Clone)]
 pub struct SipMsg {

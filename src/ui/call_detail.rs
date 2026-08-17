@@ -9,7 +9,8 @@ use crate::model::sip::{Method, SipMsg};
 use crate::store::registry::{Focus, Snapshot};
 use crate::ui::app::App;
 use crate::ui::{
-    fmt_bytes, fmt_ms, fmt_rate, fmt_secs, fmt_time, mask_ip, mask_socket, mask_user, theme,
+    fmt_bytes, fmt_ms, fmt_rate, fmt_secs, fmt_time_delta, fmt_time_tz, mask_ip, mask_socket,
+    mask_user, theme,
 };
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
@@ -36,12 +37,23 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 
     let from = display_user(focus.from_user.as_deref(), privacy, "?");
     let to = display_user(focus.to_user.as_deref(), privacy, "?");
+    let b2bua_suffix = match &focus.b2bua {
+        Some(b) => {
+            let addr = b
+                .addr
+                .map(|ip| if privacy { mask_ip(ip) } else { ip.to_string() })
+                .unwrap_or_else(|| "?".into());
+            format!("  ⇄ B2BUA {addr} ({} legs)", b.legs)
+        }
+        None => String::new(),
+    };
     let title = format!(
-        "Call {} ({} → {}) [{}]{}",
+        "Call {} ({} → {}) [{}]{}{}",
         focus.call_id,
         from,
         to,
         focus.state.map(|s| s.label()).unwrap_or("?"),
+        b2bua_suffix,
         if focus.streams.iter().any(|s| s.via_turn) {
             "  ⚙ via-TURN"
         } else {
@@ -119,9 +131,9 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         Constraint::Ratio(2, 5),
     ])
     .split(cols[0]);
-    render_flow(f, left[0], &focus.messages, app);
+    render_flow(f, left[0], &focus.messages, snap, &focus.legs, app);
     render_timeline(f, left[1], focus);
-    render_diag(f, left[2], focus);
+    render_diag(f, left[2], focus, snap.tz_offset_secs);
 
     let right = Layout::vertical([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)]).split(cols[1]);
     render_raw(f, right[0], &focus.messages, app);
@@ -177,10 +189,28 @@ fn short_reason(code: u16) -> &'static str {
     }
 }
 
-fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
-    let base = messages.first().map(|m| m.ts_us).unwrap_or(0);
+fn render_flow(
+    f: &mut Frame,
+    area: Rect,
+    messages: &[SipMsg],
+    snap: &Snapshot,
+    legs: &[u8],
+    app: &mut App,
+) {
+    let first_ts = messages.first().map(|m| m.ts_us).unwrap_or(0);
+    let start = snap.start_us.unwrap_or(first_ts);
+    let tz = snap.tz_offset_secs;
     let privacy = app.privacy;
     let local = &app.local_ips;
+
+    // Same-Call-ID B2BUA: when the two dialogs can be told apart (the current
+    // machine is the PBX in the middle), show the two-lane layout; otherwise
+    // fall back to the normal single-flow view.
+    if let Some(ln) = classify_lanes(messages, legs, local) {
+        render_lane_flow(f, area, messages, legs, snap, &ln, app);
+        return;
+    }
+
     let flow_w = messages
         .iter()
         .map(|m| {
@@ -193,22 +223,9 @@ fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
         .max(9);
     let rows = messages.iter().map(|m| {
         let label = label_of(m);
-        let style = if m.is_request {
-            match m.method {
-                Some(Method::Invite) => Style::default().fg(theme::SUCCESS),
-                Some(Method::Bye) | Some(Method::Cancel) => Style::default().fg(theme::ERROR),
-                _ => Style::default().fg(theme::INFO),
-            }
-        } else {
-            match m.status {
-                Some(s) if (200..300).contains(&s) => Style::default().fg(theme::SUCCESS),
-                Some(s) if s >= 300 => Style::default().fg(theme::ERROR),
-                _ => Style::default().fg(theme::WARNING),
-            }
-        };
+        let style = msg_style(m);
         Row::new(vec![
-            Cell::from(fmt_time(m.ts_us)),
-            Cell::from(format!("{:>8.3}", (m.ts_us - base) as f64 / 1000.0)),
+            Cell::from(fmt_time_delta(m.ts_us, start, tz)),
             Cell::from(dir_flow(
                 m.flow.src.ip(),
                 m.flow.dst.ip(),
@@ -224,14 +241,13 @@ fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),
-            Constraint::Length(9),
+            Constraint::Length(17),
             Constraint::Length(flow_col as u16),
             Constraint::Min(20),
         ],
     )
     .header(Row::new(
-        ["Time", "Rel ms", "Flow", "Msg"]
+        ["Time (+recorded)", "Flow", "Msg"]
             .iter()
             .map(|h| Cell::from(*h)),
     ))
@@ -241,14 +257,192 @@ fn render_flow(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
             .title(if local.is_empty() {
                 format!("Flow ({} msgs)", messages.len())
             } else {
-                format!(
-                    "Flow ({} msgs · right=local ->in <-out)",
-                    messages.len()
-                )
+                format!("Flow ({} msgs · right=local ->in <-out)", messages.len())
             }),
     )
     .row_highlight_style(Style::default().bg(theme::MUTED));
     f.render_stateful_widget(table, area, &mut app.flow_state);
+}
+
+/// Two-lane B2BUA flow: `Time | A-Leg | PBX | B-Leg`. Every message is placed in
+/// the lane of its dialog (`←` = the PBX receives it, `→` = the PBX sends it),
+/// with the middle-box IP shown in the PBX column.
+fn render_lane_flow(
+    f: &mut Frame,
+    area: Rect,
+    messages: &[SipMsg],
+    legs: &[u8],
+    snap: &Snapshot,
+    ln: &Lanes,
+    app: &mut App,
+) {
+    let first_ts = messages.first().map(|m| m.ts_us).unwrap_or(0);
+    let start = snap.start_us.unwrap_or(first_ts);
+    let tz = snap.tz_offset_secs;
+    let privacy = app.privacy;
+    let local = &app.local_ips;
+    let pbx_s = if privacy {
+        mask_ip(ln.pbx)
+    } else {
+        ln.pbx.to_string()
+    };
+    let a_remote_s = display_socket(ln.a_remote, privacy);
+    let b_remote_s = display_socket(ln.b_remote, privacy);
+    let pbx_w = pbx_s.len().max(9);
+    let lane_w = 12usize;
+
+    let rows = messages.iter().zip(legs).map(|(m, &l)| {
+        let label = label_of(m);
+        let style = msg_style(m);
+        let arrow = lane_arrow(m, local);
+        let cell = |arrow: &str, label: &str| {
+            let text = if arrow.is_empty() {
+                label.to_string()
+            } else {
+                format!("{arrow} {label}")
+            };
+            Cell::from(text).style(style)
+        };
+        if l == ln.a_leg {
+            Row::new(vec![
+                Cell::from(fmt_time_delta(m.ts_us, start, tz)),
+                cell(arrow, &label),
+                Cell::from(pbx_s.clone()),
+                Cell::from(""),
+            ])
+        } else {
+            debug_assert_eq!(l, ln.b_leg, "message must belong to one of the two lanes");
+            Row::new(vec![
+                Cell::from(fmt_time_delta(m.ts_us, start, tz)),
+                Cell::from(""),
+                Cell::from(pbx_s.clone()),
+                cell(arrow, &label),
+            ])
+        }
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(17),
+            Constraint::Min(lane_w as u16),
+            Constraint::Length(pbx_w as u16),
+            Constraint::Min(lane_w as u16),
+        ],
+    )
+    .column_spacing(1)
+    .header(Row::new(
+        ["Time (+recorded)", "A-Leg", "PBX", "B-Leg"]
+            .iter()
+            .map(|h| Cell::from(*h)),
+    ))
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Flow · A {a_remote_s} ⇄ PBX {pbx_s} ⇄ B {b_remote_s} ({} msgs)",
+        messages.len()
+    )))
+    .row_highlight_style(Style::default().bg(theme::MUTED));
+    f.render_stateful_widget(table, area, &mut app.flow_state);
+}
+
+/// Method/status color for a message label.
+fn msg_style(m: &SipMsg) -> Style {
+    if m.is_request {
+        match m.method {
+            Some(Method::Invite) => Style::default().fg(theme::SUCCESS),
+            Some(Method::Bye) | Some(Method::Cancel) => Style::default().fg(theme::ERROR),
+            _ => Style::default().fg(theme::INFO),
+        }
+    } else {
+        match m.status {
+            Some(s) if (200..300).contains(&s) => Style::default().fg(theme::SUCCESS),
+            Some(s) if s >= 300 => Style::default().fg(theme::ERROR),
+            _ => Style::default().fg(theme::WARNING),
+        }
+    }
+}
+
+/// Direction of a message relative to the PBX (local IPs): `←` = the PBX
+/// receives it, `→` = the PBX sends it. Empty when no local anchor is known.
+fn lane_arrow(m: &SipMsg, local: &[std::net::IpAddr]) -> &'static str {
+    if local.contains(&m.flow.dst.ip()) {
+        "←"
+    } else if local.contains(&m.flow.src.ip()) {
+        "→"
+    } else {
+        ""
+    }
+}
+
+/// A same-Call-ID dual-dialog split classified into an ingress a-leg and an
+/// egress b-leg, with the shared PBX endpoint and both remote parties.
+struct Lanes {
+    a_leg: u8,
+    b_leg: u8,
+    a_remote: std::net::SocketAddr,
+    b_remote: std::net::SocketAddr,
+    pbx: std::net::IpAddr,
+}
+
+/// Classify a same-Call-ID dual-dialog call into an ingress a-leg and an
+/// egress b-leg using the local (PBX) IPs. The a-leg is the dialog whose INVITE
+/// arrives *at* the PBX, the b-leg the dialog whose INVITE the PBX originates.
+/// Returns None when the call isn't a two-dialog split or the legs can't be
+/// told apart (no local anchor, or both INVITEs go the same way) — the caller
+/// then falls back to the normal flow view.
+fn classify_lanes(messages: &[SipMsg], legs: &[u8], local: &[std::net::IpAddr]) -> Option<Lanes> {
+    let leg_count = legs.iter().max()? + 1;
+    if leg_count != 2 {
+        return None;
+    }
+    // First dialog-initiating INVITE per leg.
+    let mut first: [Option<&SipMsg>; 2] = [None, None];
+    for (m, &l) in messages.iter().zip(legs) {
+        if l > 1 {
+            continue;
+        }
+        if first[l as usize].is_none()
+            && m.is_request
+            && matches!(m.method, Some(Method::Invite))
+            && m.to_tag.is_none()
+        {
+            first[l as usize] = Some(m);
+        }
+    }
+    let inv0 = first[0]?;
+    let inv1 = first[1]?;
+    // a-leg = inbound INVITE (dst is the PBX), b-leg = outbound (src is the PBX).
+    let inbound0 = local.contains(&inv0.flow.dst.ip());
+    let inbound1 = local.contains(&inv1.flow.dst.ip());
+    let (a_leg, b_leg, a_inv, b_inv) = if inbound0 && !inbound1 {
+        (0u8, 1u8, inv0, inv1)
+    } else if inbound1 && !inbound0 {
+        (1u8, 0u8, inv1, inv0)
+    } else {
+        return None;
+    };
+    let other = |inv: &SipMsg| {
+        if local.contains(&inv.flow.dst.ip()) {
+            inv.flow.src
+        } else {
+            inv.flow.dst
+        }
+    };
+    let a_remote = other(a_inv);
+    let b_remote = other(b_inv);
+    // The PBX = a local IP common to both legs' INVITEs.
+    let a_ips = [a_inv.flow.src.ip(), a_inv.flow.dst.ip()];
+    let b_ips = [b_inv.flow.src.ip(), b_inv.flow.dst.ip()];
+    let pbx = local
+        .iter()
+        .copied()
+        .find(|ip| a_ips.contains(ip) && b_ips.contains(ip))?;
+    Some(Lanes {
+        a_leg,
+        b_leg,
+        a_remote,
+        b_remote,
+        pbx,
+    })
 }
 
 /// IP-only form of a socket endpoint (port stripped), masked under privacy.
@@ -321,10 +515,9 @@ fn render_raw(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
         .map(|m| String::from_utf8_lossy(&m.raw).to_string())
         .unwrap_or_default();
     let text = if app.privacy { mask_raw(&text) } else { text };
-    let lines: Vec<Line> = text
-        .lines()
+    let lines: Vec<Line> = highlight_raw(&text)
+        .into_iter()
         .skip(app.raw_scroll)
-        .map(|l| Line::from(l.to_string()))
         .collect();
     let p = Paragraph::new(lines).block(
         Block::default()
@@ -332,6 +525,231 @@ fn render_raw(f: &mut Frame, area: Rect, messages: &[SipMsg], app: &mut App) {
             .title(format!("Raw [{idx}]")),
     );
     f.render_widget(p, area);
+}
+
+/// Full-token syntax highlighting for a raw SIP/SDP message: request/status
+/// lines, header names and values (sip:/sips: URIs, `branch=`, `;tag=` params),
+/// and the SDP body after the first blank line. Operates on the (already
+/// privacy-masked) text so the layout is preserved.
+fn highlight_raw(text: &str) -> Vec<Line<'static>> {
+    let mut in_body = false;
+    text.lines()
+        .map(|l| {
+            if !in_body {
+                if l.trim().is_empty() {
+                    // Header/body separator; everything after is the body.
+                    in_body = true;
+                    return Line::raw(l.to_string());
+                }
+                if let Some(line) = style_start_line(l) {
+                    return line;
+                }
+                return Line::from(Span::styled(l.to_string(), Style::default().fg(theme::INK)));
+            }
+            style_sdp(l)
+        })
+        .collect()
+}
+
+/// Style a non-body line: request line, status line, or header.
+fn style_start_line(l: &str) -> Option<Line<'static>> {
+    // Request line: `METHOD request-uri SIP/2.0`.
+    let mut it = l.split_whitespace();
+    if let (Some(m), Some(uri), Some(version)) = (it.next(), it.next(), it.next())
+        && it.next().is_none()
+        && is_sip_method(m)
+        && version.starts_with("SIP/")
+    {
+        return Some(Line::from(vec![
+            Span::styled(
+                m.to_string(),
+                Style::default()
+                    .fg(theme::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(uri.to_string(), Style::default().fg(theme::INFO)),
+            Span::raw(" "),
+            Span::styled(version.to_string(), Style::default().fg(theme::MUTED)),
+        ]));
+    }
+
+    // Status line: `SIP/2.0 200 OK`.
+    let mut it = l.split_whitespace();
+    if let Some(version) = it.next()
+        && version.starts_with("SIP/")
+        && let Some(code) = it.next().and_then(|c| c.parse::<u16>().ok())
+    {
+        let reason = it.collect::<Vec<_>>().join(" ");
+        let mut spans = vec![
+            Span::styled(version.to_string(), Style::default().fg(theme::MUTED)),
+            Span::raw(" "),
+            Span::styled(
+                code.to_string(),
+                Style::default().fg(status_code_color(code)),
+            ),
+        ];
+        if !reason.is_empty() {
+            spans.push(Span::styled(
+                format!(" {reason}"),
+                Style::default().fg(theme::INK),
+            ));
+        }
+        return Some(Line::from(spans));
+    }
+
+    // Header: `Name: value` (first colon is the delimiter).
+    let (name, _) = l.split_once(':')?;
+    let mut spans = vec![Span::styled(
+        format!("{name}:"),
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(style_value(&l[name.len() + 1..]));
+    Some(Line::from(spans))
+}
+
+/// Tokenize a header value: `sip:`/`sips:` URIs, `branch=` and `;tag=`
+/// parameters are tinted, everything else stays plain ink.
+fn style_value(value: &str) -> Vec<Span<'static>> {
+    let plain = Style::default().fg(theme::INK);
+    let mut spans = Vec::new();
+    let mut rest = value;
+    while let Some((start, end, kind)) = next_token(rest) {
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), plain));
+        }
+        spans.push(Span::styled(
+            rest[start..end].to_string(),
+            Style::default().fg(kind.color()),
+        ));
+        rest = &rest[end..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), plain));
+    }
+    spans
+}
+
+#[derive(Clone, Copy)]
+enum TokenKind {
+    Uri,
+    Branch,
+    Tag,
+}
+
+impl TokenKind {
+    fn color(self) -> Color {
+        match self {
+            TokenKind::Uri => theme::INFO,
+            TokenKind::Branch => theme::WARNING,
+            TokenKind::Tag => theme::ACCENT,
+        }
+    }
+}
+
+/// Find the next highlightable token in `rest`, returning (start, end, kind).
+fn next_token(rest: &str) -> Option<(usize, usize, TokenKind)> {
+    let mut best: Option<(usize, usize, TokenKind)> = None;
+    let mut consider = |start: usize, end: usize, kind: TokenKind| {
+        let better = match best {
+            None => true,
+            Some((s, e, _)) => start < s || (start == s && end > e),
+        };
+        if better {
+            best = Some((start, end, kind));
+        }
+    };
+
+    if let Some(p) = rest.find("sips:") {
+        consider(p, uri_end(rest, p + 5), TokenKind::Uri);
+    }
+    if let Some(p) = rest.find("sip:")
+        && !rest[p..].starts_with("sips:")
+    {
+        consider(p, uri_end(rest, p + 4), TokenKind::Uri);
+    }
+    if let Some(p) = rest.find(";branch=") {
+        consider(p, param_end(rest, p + 8), TokenKind::Branch);
+    }
+    if let Some(p) = rest.find(";tag=") {
+        consider(p, param_end(rest, p + 5), TokenKind::Tag);
+    }
+    best
+}
+
+/// End index of a `sip:`/`sips:` URI starting at `from` (relative to `s`).
+fn uri_end(s: &str, from: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = from;
+    while i < bytes.len() && !matches!(bytes[i], b';' | b' ' | b'\t' | b'>' | b'<' | b',') {
+        i += 1;
+    }
+    i
+}
+
+/// End index of a `;name=value` parameter starting at `p` (relative to `s`).
+fn param_end(s: &str, p: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = p;
+    while i < bytes.len() && !matches!(bytes[i], b';' | b' ' | b'\t') {
+        i += 1;
+    }
+    i
+}
+
+/// Style an SDP (or other) body line: tint the `key=` prefix, keep the rest.
+fn style_sdp(l: &str) -> Line<'static> {
+    let key_color = match l.split_once('=').map(|(k, _)| k.trim()) {
+        Some("m") => theme::WARNING,
+        Some("a") => theme::INFO,
+        Some("v" | "o" | "s" | "c" | "t" | "b") => theme::MUTED,
+        _ => theme::MUTED,
+    };
+    if let Some((key, val)) = l.split_once('=') {
+        Line::from(vec![
+            Span::styled(
+                format!("{key}="),
+                Style::default().fg(key_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(val.to_string(), Style::default().fg(theme::INK)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(theme::MUTED),
+        ))
+    }
+}
+
+fn is_sip_method(s: &str) -> bool {
+    matches!(
+        s,
+        "INVITE"
+            | "ACK"
+            | "BYE"
+            | "CANCEL"
+            | "REGISTER"
+            | "OPTIONS"
+            | "PRACK"
+            | "UPDATE"
+            | "SUBSCRIBE"
+            | "NOTIFY"
+            | "PUBLISH"
+            | "INFO"
+            | "REFER"
+            | "MESSAGE"
+    )
+}
+
+fn status_code_color(code: u16) -> Color {
+    match code {
+        100..=199 => theme::INFO,
+        200..=299 => theme::SUCCESS,
+        300..=399 => theme::WARNING,
+        _ => theme::ERROR,
+    }
 }
 
 /// Privacy masking for a raw SIP/SDP message: every `sip:`/`sips:` URI (From,
@@ -350,7 +768,11 @@ fn mask_raw(text: &str) -> String {
                 Some("FROM") | Some("TO") | Some("P-ASSERTED-IDENTITY") | Some("REMOTE-PARTY-ID")
             );
             let line = mask_sip_uris(l);
-            let line = if identity { mask_display_names(&line) } else { line };
+            let line = if identity {
+                mask_display_names(&line)
+            } else {
+                line
+            };
             mask_ips(&line)
         })
         .collect::<Vec<_>>()
@@ -391,7 +813,11 @@ fn mask_sip_uris(s: &str) -> String {
             (None, None) => break,
         };
         out.push_str(&rest[..start]);
-        let scheme_len = if rest[start..].starts_with("sips:") { 5 } else { 4 };
+        let scheme_len = if rest[start..].starts_with("sips:") {
+            5
+        } else {
+            4
+        };
         let mut end = start + scheme_len;
         let b = rest.as_bytes();
         while end < rest.len() && !matches!(b[end], b'>' | b' ' | b'\t' | b',' | b'\r' | b'\n') {
@@ -823,7 +1249,7 @@ fn stream_bytes_per_sec(s: &StreamSummary) -> f64 {
     }
 }
 
-fn render_diag(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus) {
+fn render_diag(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus, tz: Option<i32>) {
     let lines: Vec<Line> = focus
         .diagnostics
         .iter()
@@ -836,7 +1262,7 @@ fn render_diag(f: &mut Frame, area: Rect, focus: &crate::store::registry::Focus)
             Line::from(Span::styled(
                 format!(
                     "{} [{}] {} {}",
-                    fmt_time(d.ts_us),
+                    fmt_time_tz(d.ts_us, tz),
                     d.severity.label(),
                     d.code,
                     d.message
@@ -1108,7 +1534,8 @@ mod tests {
     }
 
     #[test]
-    fn privacy_masks_ips_and_users_in_detail() {        let focus = Focus {
+    fn privacy_masks_ips_and_users_in_detail() {
+        let focus = Focus {
             call_id: "c1".into(),
             state: Some(crate::model::sip::CallState::Active),
             from_user: Some("13812345678".into()),
@@ -1191,17 +1618,39 @@ mod tests {
         assert!(!masked.contains("Alice"), "display name leaked");
         assert!(!masked.contains("alice"), "display name leaked");
         // Masked forms are in place.
-        assert!(masked.contains("sip:138…5678@10.*.*.8:5060"), "request URI not masked");
-        assert!(masked.contains("10.*.*.8:5060;branch=z9hG4bK-1"), "Via IP/port not masked");
-        assert!(masked.contains("\"Ali*ce\" <sip:138…5678@10.*.*.8>"), "From header not masked");
+        assert!(
+            masked.contains("sip:138…5678@10.*.*.8:5060"),
+            "request URI not masked"
+        );
+        assert!(
+            masked.contains("10.*.*.8:5060;branch=z9hG4bK-1"),
+            "Via IP/port not masked"
+        );
+        assert!(
+            masked.contains("\"Ali*ce\" <sip:138…5678@10.*.*.8>"),
+            "From header not masked"
+        );
         assert!(masked.contains("sip:b**@10.*.*.8"), "To URI not masked");
-        assert!(masked.contains("c=IN IP4 10.*.*.8"), "SDP connection not masked");
+        assert!(
+            masked.contains("c=IN IP4 10.*.*.8"),
+            "SDP connection not masked"
+        );
         assert!(masked.contains("IN IP4 10.*.*.8"), "SDP origin not masked");
         // Non-IP tokens are preserved.
-        assert!(masked.contains("CSeq: 1 INVITE"), "non-sensitive data changed");
-        assert!(masked.contains("m=audio 20014 RTP/AVP 0"), "SDP media line changed");
+        assert!(
+            masked.contains("CSeq: 1 INVITE"),
+            "non-sensitive data changed"
+        );
+        assert!(
+            masked.contains("m=audio 20014 RTP/AVP 0"),
+            "SDP media line changed"
+        );
         // Layout (line count) is unchanged.
-        assert_eq!(masked.lines().count(), raw.lines().count(), "layout changed");
+        assert_eq!(
+            masked.lines().count(),
+            raw.lines().count(),
+            "layout changed"
+        );
     }
 
     #[test]
@@ -1213,5 +1662,254 @@ mod tests {
         let masked = mask_raw(raw);
         assert!(masked.contains("sip:ali*ce@10.*.*.3"));
         assert!(!masked.contains("10.1.2.3"));
+    }
+
+    #[test]
+    fn highlight_colors_request_status_header_and_sdp() {
+        let raw = "INVITE sip:bob@10.0.0.2 SIP/2.0\r\n\
+                   Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1\r\n\
+                   From: <sip:alice@10.0.0.1>;tag=abc\r\n\
+                   \r\n\
+                   v=0\r\n\
+                   m=audio 20014 RTP/AVP 0\r\n";
+        let lines = highlight_raw(raw);
+        // Request line: method bold success, URI info, version muted.
+        assert_eq!(lines[0].spans[0].content.as_ref(), "INVITE");
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme::SUCCESS));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(lines[0].spans[2].content.as_ref(), "sip:bob@10.0.0.2");
+        assert_eq!(lines[0].spans[2].style.fg, Some(theme::INFO));
+        // Header: name accent, branch= value warning.
+        assert_eq!(lines[1].spans[0].content.as_ref(), "Via:");
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme::ACCENT));
+        let branch = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("branch="))
+            .expect("branch token present");
+        assert_eq!(branch.style.fg, Some(theme::WARNING));
+        // From header: ;tag= accent.
+        let tag = lines[2]
+            .spans
+            .iter()
+            .find(|s| s.content.contains(";tag="))
+            .expect("tag token present");
+        assert_eq!(tag.style.fg, Some(theme::ACCENT));
+        // Blank line is the header/body separator, uncolored.
+        assert!(lines[3].spans.is_empty());
+        // SDP: v= muted, m= warning.
+        assert_eq!(lines[4].spans[0].content.as_ref(), "v=");
+        assert_eq!(lines[4].spans[0].style.fg, Some(theme::MUTED));
+        assert_eq!(lines[5].spans[0].content.as_ref(), "m=");
+        assert_eq!(lines[5].spans[0].style.fg, Some(theme::WARNING));
+    }
+
+    #[test]
+    fn highlight_status_line_colors_code_by_class() {
+        let lines = highlight_raw("SIP/2.0 404 Not Found\r\n");
+        assert_eq!(lines[0].spans[0].content.as_ref(), "SIP/2.0");
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme::MUTED));
+        assert_eq!(lines[0].spans[2].content.as_ref(), "404");
+        assert_eq!(lines[0].spans[2].style.fg, Some(theme::ERROR));
+        assert_eq!(lines[0].spans[3].content.as_ref(), " Not Found");
+
+        let ok = highlight_raw("SIP/2.0 200 OK\r\n");
+        assert_eq!(ok[0].spans[2].style.fg, Some(theme::SUCCESS));
+        let trying = highlight_raw("SIP/2.0 100 Trying\r\n");
+        assert_eq!(trying[0].spans[2].style.fg, Some(theme::INFO));
+    }
+
+    #[test]
+    fn highlight_applies_after_privacy_masking() {
+        let raw = "INVITE sip:13812345678@10.20.0.8:5060 SIP/2.0\r\n\
+                   From: <sip:13812345678@10.10.0.8>;tag=a1\r\n";
+        let masked = mask_raw(raw);
+        assert!(!masked.contains("10.20.0.8"));
+        let lines = highlight_raw(&masked);
+        // Request-URI span is the masked form.
+        assert_eq!(
+            lines[0].spans[2].content.as_ref(),
+            "sip:138…5678@10.*.*.8:5060"
+        );
+    }
+
+    fn mk_msg(ts: u64, src: &str, dst: &str, from_tag: &str) -> crate::model::sip::SipMsg {
+        crate::model::sip::SipMsg {
+            ts_us: ts,
+            flow: Flow5Tuple {
+                proto: Proto::Udp,
+                src: src.parse().unwrap(),
+                dst: dst.parse().unwrap(),
+            },
+            is_request: true,
+            method: Some(crate::model::sip::Method::Invite),
+            status: None,
+            call_id: "c1".into(),
+            cseq: Some(1),
+            cseq_method: Some("INVITE".into()),
+            branch: Some(format!("b-{from_tag}")),
+            from_tag: Some(from_tag.into()),
+            to_tag: None,
+            from_uri: None,
+            to_uri: None,
+            raw: bytes::Bytes::new(),
+            contact_addr: None,
+            route_count: 0,
+            record_route_count: 0,
+            has_sdp: false,
+        }
+    }
+
+    #[test]
+    fn classify_lanes_assigns_ingress_and_egress() {
+        let msgs = vec![
+            mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"),
+            mk_msg(1_100_000, "2.2.2.2:5060", "3.3.3.3:5060", "t2"),
+        ];
+        let local = ["2.2.2.2".parse().unwrap()];
+        let lanes = classify_lanes(&msgs, &[0, 1], &local).expect("lanes classified");
+        assert_eq!(lanes.a_leg, 0);
+        assert_eq!(lanes.b_leg, 1);
+        assert_eq!(lanes.a_remote, "1.1.1.1:5060".parse().unwrap());
+        assert_eq!(lanes.b_remote, "3.3.3.3:5060".parse().unwrap());
+        assert_eq!(lanes.pbx, "2.2.2.2".parse::<std::net::IpAddr>().unwrap());
+        // Reversed arrival order must still classify by direction.
+        let msgs2 = vec![
+            mk_msg(1_000_000, "2.2.2.2:5060", "3.3.3.3:5060", "t2"),
+            mk_msg(1_100_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"),
+        ];
+        let lanes2 = classify_lanes(&msgs2, &[0, 1], &local).expect("lanes classified");
+        assert_eq!(lanes2.a_leg, 1, "inbound leg must be a-leg");
+        assert_eq!(lanes2.b_leg, 0);
+    }
+
+    #[test]
+    fn classify_lanes_falls_back_when_pbx_unknown() {
+        let msgs = vec![
+            mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"),
+            mk_msg(1_100_000, "2.2.2.2:5060", "3.3.3.3:5060", "t2"),
+        ];
+        // No local anchor → can't tell which leg is the egress b-leg.
+        assert!(classify_lanes(&msgs, &[0, 1], &[]).is_none());
+        // Single dialog → never a lane layout.
+        assert!(classify_lanes(&msgs, &[0, 0], &["2.2.2.2".parse().unwrap()]).is_none());
+    }
+
+    #[test]
+    fn lane_flow_renders_a_leg_pbx_b_leg_columns() {
+        let focus = Focus {
+            call_id: "c1".into(),
+            state: Some(crate::model::sip::CallState::Active),
+            messages: vec![
+                mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"),
+                mk_msg(1_100_000, "2.2.2.2:5060", "3.3.3.3:5060", "t2"),
+            ],
+            legs: vec![0, 1],
+            b2bua: Some(crate::model::sip::B2buaInfo {
+                addr: Some("2.2.2.2".parse().unwrap()),
+                legs: 2,
+            }),
+            ..Focus::default()
+        };
+        let snap = Arc::new(Mutex::new(Snapshot {
+            focus: Some(focus),
+            ..Snapshot::default()
+        }));
+        let mut app = App::new(
+            snap,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(AtomicBool::new(false)),
+            RecordState::default(),
+        );
+        app.local_ips = vec!["2.2.2.2".parse().unwrap()];
+        app.page = Page::CallDetail;
+
+        let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("B2BUA"), "title must show B2BUA marker");
+        let header_row = text
+            .lines()
+            .find(|l| l.contains("A-Leg") && l.contains("B-Leg"))
+            .expect("lane header row present: {text}");
+        assert!(header_row.contains("PBX"), "header must include PBX");
+        assert!(
+            !header_row.contains("Msg"),
+            "lane layout drops the redundant Msg column"
+        );
+        // Direction arrows relative to the PBX: a-leg receives, b-leg sends.
+        assert!(
+            text.contains("← INVITE"),
+            "a-leg inbound INVITE must show ←: {text}"
+        );
+        assert!(
+            text.contains("→ INVITE"),
+            "b-leg outbound INVITE must show →: {text}"
+        );
+    }
+
+    #[test]
+    fn lane_flow_falls_back_to_normal_when_b_leg_unidentifiable() {
+        let focus = Focus {
+            call_id: "c1".into(),
+            state: Some(crate::model::sip::CallState::Active),
+            messages: vec![
+                mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"),
+                mk_msg(1_100_000, "2.2.2.2:5060", "3.3.3.3:5060", "t2"),
+            ],
+            legs: vec![0, 1],
+            b2bua: Some(crate::model::sip::B2buaInfo {
+                addr: Some("2.2.2.2".parse().unwrap()),
+                legs: 2,
+            }),
+            ..Focus::default()
+        };
+        let snap = Arc::new(Mutex::new(Snapshot {
+            focus: Some(focus),
+            ..Snapshot::default()
+        }));
+        let mut app = App::new(
+            snap,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(AtomicBool::new(false)),
+            RecordState::default(),
+        );
+        // No local IPs → the PBX is unknown, lanes can't be told apart.
+        app.page = Page::CallDetail;
+
+        let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let header_row = text
+            .lines()
+            .find(|l| l.contains("Time") && l.contains("Msg"))
+            .expect("normal flow header must still render");
+        assert!(
+            !header_row.contains("A-Leg"),
+            "must fall back to the normal flow without a PBX anchor"
+        );
     }
 }

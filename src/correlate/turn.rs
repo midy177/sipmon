@@ -87,7 +87,8 @@ impl TurnTracker {
     }
 
     /// Bounded-memory maintenance: cap sizes by evicting oldest allocations.
-    pub fn prune(&mut self) {        while self.allocs.len() > MAX_ALLOCS {
+    pub fn prune(&mut self) {
+        while self.allocs.len() > MAX_ALLOCS {
             let oldest = self
                 .allocs
                 .iter()

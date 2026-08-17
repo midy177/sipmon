@@ -113,8 +113,7 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
     {
         // PDD = INVITE → first provisional (100 Trying or 180 Ringing/183).
         if call.trying_ts.is_none() && call.ringing_ts.is_none() {
-            call.pdd_ms =
-                Some(((msg.ts_us - call.invite_ts.unwrap_or(msg.ts_us)) / 1000) as u32);
+            call.pdd_ms = Some(((msg.ts_us - call.invite_ts.unwrap_or(msg.ts_us)) / 1000) as u32);
         }
         if (180..190).contains(&code) || code == 183 {
             if call.ringing_ts.is_none() {

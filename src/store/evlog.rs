@@ -4,12 +4,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::Offset;
 
 use crate::model::packet::{Flow5Tuple, Proto};
 use crate::model::stats::{HealthBucket, MetricSet};
 
 pub const MAGIC: &[u8; 4] = b"SMON";
-pub const VERSION: u16 = 1;
+/// v2: the header's tz_offset field now carries the recording machine's UTC
+/// offset (v1 always wrote 0, which read as "unset").
+pub const VERSION: u16 = 2;
 
 /// Sanity cap for a single evlog record payload (32 MiB). A length field
 /// beyond this means the file is corrupt/hostile; fail cleanly instead of
@@ -444,12 +447,15 @@ impl EvlogWriter<File> {
 impl<W: Write + Send> EvlogWriter<W> {
     pub fn new(w: W) -> Result<Self> {
         let mut bw = BufWriter::new(w);
-        // Header (only meaningful at start of file; for append we still write a
-        // header marker — readers tolerate multiple headers by resyncing).
+        // Header. `tz_offset` records the writing machine's UTC offset so a
+        // replay can render the original local wall-clock ("当时的时间") even on
+        // a host in a different timezone. Readers of v1 files (tz always 0)
+        // treat it as unset and fall back to the current machine's timezone.
         bw.write_all(MAGIC)?;
         bw.write_all(&VERSION.to_be_bytes())?;
         bw.write_all(&0u16.to_be_bytes())?; // flags
-        bw.write_all(&0i32.to_be_bytes())?; // tz_offset
+        let tz = chrono::Local::now().offset().fix().local_minus_utc();
+        bw.write_all(&tz.to_be_bytes())?; // tz_offset
         bw.flush()?;
         Ok(Self {
             w: bw,
@@ -852,6 +858,9 @@ fn decode_payload(ty: u8, ts_us: u64, mut rd: &[u8]) -> Result<Event> {
 pub struct EvlogReader {
     r: BufReader<Box<dyn Read + Send>>,
     last_ts: u64,
+    /// UTC offset (seconds) of the machine that recorded the log. `None` for
+    /// v1 files (offset was never stored) or unreadable headers.
+    tz_offset_secs: Option<i32>,
 }
 
 impl EvlogReader {
@@ -868,10 +877,18 @@ impl EvlogReader {
         // Peek 4 bytes to detect/strip the file header.
         let mut head = [0u8; 4];
         let n = r.read(&mut head)?;
+        let mut tz_offset_secs = None;
         let inner: Box<dyn Read + Send> = if n == 4 && &head == MAGIC {
-            // Consume the remaining 8 header bytes (version/flags/tz).
+            // Consume the remaining header bytes (version/flags/tz).
             let mut rest = [0u8; 8];
-            let _ = r.read_exact(&mut rest);
+            let ok = r.read_exact(&mut rest).is_ok();
+            if ok {
+                let version = u16::from_be_bytes([rest[0], rest[1]]);
+                if version >= 2 {
+                    let tz = i32::from_be_bytes([rest[4], rest[5], rest[6], rest[7]]);
+                    tz_offset_secs = Some(tz);
+                }
+            }
             Box::new(r)
         } else {
             Box::new(std::io::Cursor::new(head[..n].to_vec()).chain(r))
@@ -879,7 +896,13 @@ impl EvlogReader {
         Ok(Self {
             r: BufReader::new(inner),
             last_ts: 0,
+            tz_offset_secs,
         })
+    }
+
+    /// UTC offset (seconds) of the recording machine, if the log carried one.
+    pub fn tz_offset_secs(&self) -> Option<i32> {
+        self.tz_offset_secs
     }
 
     pub fn next_event(&mut self) -> Result<Option<Event>> {
