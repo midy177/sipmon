@@ -33,7 +33,7 @@ jobs:
       - name: Install musl toolchain + build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools make flex bison autoconf automake libtool
+          sudo apt-get install -y musl-tools make flex bison autoconf automake libtool linux-libc-dev
 
       - name: Build static libpcap for musl
         run: |
@@ -45,8 +45,11 @@ jobs:
             https://github.com/the-tcpdump-group/libpcap libpcap-gh
           cd libpcap-gh
           autoreconf -i
+          # Cross-compiling can't run probe binaries, so force the Linux
+          # PF_PACKET capture type explicitly instead of auto-detecting.
           CC=musl-gcc AR=ar RANLIB=ranlib ./configure \
             --host=x86_64-linux-musl \
+            --with-pcap=linux \
             --disable-shared --enable-static \
             --without-libnl --disable-dbus --disable-bluetooth \
             --disable-usb --disable-manual --without-dag \
