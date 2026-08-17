@@ -56,8 +56,8 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 
     // Call table.
     let header = [
-        "Time", "SrcIP", "From", "To", "State", "PDD", "Setup", "Ring", "Dur", "EM", "MOS", "RTP",
-        "Diag", "End", "Call-ID",
+        "Time", "SrcIP", "From", "To", "State", "PDD", "Setup", "Ring", "Dur", "EarlyMedia", "MOS",
+        "RTP", "Diag", "End", "Call-ID",
     ];
     // Keep the highlight anchored to the same call as new calls arrive, then
     // apply the state filter (`f` cycles all/pending/success/failed/canceled).
@@ -92,7 +92,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             None => String::new(),
         };
         let em_cell = if c.early_media {
-            Cell::from("EM").style(
+            Cell::from("✓").style(
                 Style::default()
                     .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
@@ -136,7 +136,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             Constraint::Length(7),
             Constraint::Length(10),
             Constraint::Length(9),
-            Constraint::Length(3),
+            Constraint::Length(10),
             Constraint::Length(5),
             Constraint::Length(7),
             Constraint::Length(8),
@@ -148,7 +148,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         Row::new(header.iter().map(|h| Cell::from(*h))).style(Style::default().fg(theme::WARNING)),
     )
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Calls ({}/{}) — Enter=detail, f=filter:{}  [PDD=INV→try/ring, Setup=INV→200, Ring=dur, EM=183+media]",
+        "Calls ({}/{}) — Enter=detail, f=filter:{}  [PDD=INV→try/ring, Setup=INV→200, Ring=dur, EarlyMedia=183+media]",
         visible.len(),
         snap.calls.len(),
         app.filter.label()
