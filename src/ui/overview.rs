@@ -163,7 +163,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         snap.calls.len(),
         app.filter.label()
     )))
-    .row_highlight_style(Style::default().bg(theme::MUTED));
+    .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, chunks[2], &mut app.table_state);
 }
 

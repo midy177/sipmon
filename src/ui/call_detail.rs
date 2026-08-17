@@ -260,7 +260,7 @@ fn render_flow(
                 format!("Flow ({} msgs · right=local ->in <-out)", messages.len())
             }),
     )
-    .row_highlight_style(Style::default().bg(theme::MUTED));
+    .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, area, &mut app.flow_state);
 }
 
@@ -340,7 +340,7 @@ fn render_lane_flow(
         "Flow · A {a_remote_s} ⇄ PBX {pbx_s} ⇄ B {b_remote_s} ({} msgs)",
         messages.len()
     )))
-    .row_highlight_style(Style::default().bg(theme::MUTED));
+    .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, area, &mut app.flow_state);
 }
 

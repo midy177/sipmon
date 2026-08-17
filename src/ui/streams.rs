@@ -1,6 +1,5 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
 use crate::store::registry::Snapshot;
@@ -94,6 +93,6 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             .borders(Borders::ALL)
             .title(format!("RTP streams ({})", streams.len())),
     )
-    .row_highlight_style(Style::default().bg(theme::MUTED));
+    .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, chunks[1], &mut app.streams_state);
 }

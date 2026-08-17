@@ -76,6 +76,6 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             .borders(Borders::ALL)
             .title(format!("Results ({}) — Enter=detail", results.len())),
     )
-    .row_highlight_style(Style::default().bg(theme::MUTED));
+    .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, inner, &mut app.search_state);
 }

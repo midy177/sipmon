@@ -213,7 +213,7 @@ fn render_table(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             ),
         )
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(theme::MUTED));
+        .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, area, &mut app.ip_table_state);
 }
 
@@ -281,7 +281,7 @@ fn render_drill(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         "Calls for {ip} ({} — Enter=detail, Esc=back)",
         calls.len()
     )))
-    .row_highlight_style(Style::default().bg(theme::MUTED));
+    .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, area, &mut app.ip_drill_state);
 }
 
