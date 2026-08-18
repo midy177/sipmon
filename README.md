@@ -30,7 +30,7 @@ sipmon live -i eth0 -f "udp port 5060"   # with a BPF filter
 sipmon record -i any -w cap.evlog --headless   # record to an event log
 sipmon record -i any -w cap.evlog -d --pidfile /run/sipmon.pid --logfile /var/log/sipmon.log
 sipmon replay cap.evlog            # replay a recording (TUI)
-sipmon stats cap.evlog             # ASR, traffic, 5-minute quality windows
+sipmon stats cap.evlog             # ASR, traffic, 5-minute call-availability + network tables
 sipmon file -r capture.pcap        # offline pcap analysis
 sipmon capture.pcap                # default mode: dispatch by extension
 sipmon cap.evlog                   #   *.pcap/.pcapng → file, *.evlog → replay, *.jsonl → snapshot view
@@ -49,7 +49,7 @@ tcpdump -i eth0 -w - | sipmon -    # read a live tcpdump stream
 | `file` | Offline pcap/pcapng. `--rate 1x` replay speed multiplier, `--no-tui`, `--print-events` |
 | `replay` | Replay an event log (`sipmon replay FILE`; `-l/--evlog` still works). TUI / `--no-tui` |
 | `query` | No TUI; exports flow + stream stats + RTT + diagnostics for a Call-ID (script friendly) |
-| `stats` | No TUI; ASR / CCR / PDD / ACD, RTP+SIP traffic, MOS/jitter/RTT, top-IP loss, and 5-minute load/quality windows (`sipmon stats FILE`, `--json`, `--top N`) |
+| `stats` | No TUI; ASR / CCR / NER / PDD / ACD, fail split (NF/REJ/BUSY/TMO/FAIL), RTP+SIP traffic, MOS/jitter/RTT, top-50 IP loss table, and 5-minute call-availability + network windows (`sipmon stats FILE`, `--json`, `--top N`) |
 | `export` | Rebuild a snapshot from an event log → JSONL, with `--from/--to` time filtering |
 
 ### Common options

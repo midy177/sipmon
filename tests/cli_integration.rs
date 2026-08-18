@@ -164,8 +164,20 @@ fn evlog_roundtrip_and_query() {
         "stats must report traffic: {sout}"
     );
     assert!(
-        sout.contains("5-minute windows"),
-        "stats must list 5-minute windows: {sout}"
+        sout.contains("5-minute call availability") && sout.contains("5-minute network"),
+        "stats must list 5-minute call-availability and network tables: {sout}"
+    );
+    assert!(
+        sout.contains("CANCEL%") && sout.contains("NF%"),
+        "stats windows must include cancel and fail-class rates: {sout}"
+    );
+    assert!(
+        sout.contains("answered / seizures"),
+        "stats must explain ASR: {sout}"
+    );
+    assert!(
+        sout.contains("Definitions"),
+        "stats must include metric definitions: {sout}"
     );
     let s_flag = bin().args(["stats", "-l"]).arg(&evlog).output().unwrap();
     assert!(

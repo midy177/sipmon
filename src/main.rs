@@ -24,7 +24,7 @@ use capture::CaptureSource;
 use config::{Bucket, Config};
 use correlate::Correlator;
 use diagnostics::Severity;
-use store::evlog::{Event, EvlogReader, EvlogWriter};
+use store::evlog::{Event, EvlogReader, EvlogWriter, decode_payload, parse_stream_summary};
 use store::registry::Snapshot;
 use ui::app::RecordState;
 
@@ -162,7 +162,7 @@ enum Cmd {
         #[arg(short = 'c', long)]
         call_id: String,
     },
-    /// Summarize an event log: ASR/traffic/reliability + 5-minute windows
+    /// Summarize an event log: ASR/traffic/reliability + 5-minute call-availability and network tables
     Stats {
         /// Event log to summarize
         #[arg(value_name = "FILE")]
@@ -173,8 +173,8 @@ enum Cmd {
         /// Emit JSON instead of the text table
         #[arg(long)]
         json: bool,
-        /// How many IPs to rank by loss% (default 10)
-        #[arg(long, default_value_t = 10)]
+        /// How many IPs to rank by loss% (default 50)
+        #[arg(long, default_value_t = crate::store::evstats::DEFAULT_TOP_IPS)]
         top: usize,
     },
     /// Export an event log to JSONL
@@ -706,7 +706,11 @@ fn run_capture_loop(
         }
     }
     if print_stats && let Some(acc) = session_stats {
-        print!("{}", acc.finish(name, 0, None, 10).render_text());
+        print!(
+            "{}",
+            acc.finish(name, 0, None, store::evstats::DEFAULT_TOP_IPS)
+                .render_text()
+        );
     }
 
     final_exports(&cfg, &shared)?;
@@ -718,35 +722,6 @@ fn flush_recorder(writer: &mut Option<EvlogWriter<std::fs::File>>, record: &Reco
     if let Some(w) = writer.as_mut() {
         let _ = w.flush();
         record.bytes.store(w.bytes_written(), Ordering::Relaxed);
-    }
-}
-
-/// Rebuild a stream summary from an evlog StreamSnap record. Used on replay
-/// (no RTP packets are re-fed then) and when exporting an evlog to JSONL.
-fn snap_evt_to_summary(e: &store::evlog::StreamSnapEvt) -> model::media::StreamSummary {
-    model::media::StreamSummary {
-        call_id: Some(e.call_id.clone()),
-        ssrc: e.ssrc,
-        flow: Some(e.flow),
-        codec: e.codec.clone(),
-        payload_type: e.payload_type,
-        packets: e.packets,
-        lost: e.lost,
-        expected: e.expected,
-        loss_pct: e.loss_pct,
-        jitter_ms: e.jitter_ms,
-        first_ts_us: e.first_ts_us,
-        last_ts_us: e.last_ts_us,
-        rtt_min_ms: e.rtt_min_ms,
-        rtt_avg_ms: e.rtt_avg_ms,
-        rtt_max_ms: e.rtt_max_ms,
-        oneway_ms: e.oneway_ms,
-        mos: e.mos,
-        direction: e.direction.clone(),
-        leg: e.leg.clone(),
-        via_turn: e.via_turn,
-        bytes: e.bytes,
-        history: Vec::new(),
     }
 }
 
@@ -808,6 +783,63 @@ fn final_exports(cfg: &Config, shared: &Shared) -> Result<()> {
 
 // ----------------------------- replay -----------------------------
 
+/// Apply one evlog record to the correlator. Undecodable bodies are skipped.
+fn replay_apply(corr: &mut Correlator, ty: u8, ts: u64, payload: &[u8]) {
+    match ty {
+        1 => {
+            if let Ok(Event::SipMsg(e)) = decode_payload(ty, ts, payload) {
+                corr.ingest_sip(capture::replay::evt_to_sipmsg(&e));
+            }
+        }
+        4 => {
+            if let Ok(s) = parse_stream_summary(payload) {
+                // Event Log is a 1000-line ring: only keep snaps that actually
+                // lost packets (the rest is noise and format!-alloc on every
+                // 5s flush of every stream).
+                if s.lost > 0 {
+                    let cid = s.call_id.as_deref().unwrap_or("");
+                    corr.reg.push_event(format!(
+                        "stream {cid} ssrc={:#x} pkts={} loss={:.1}%",
+                        s.ssrc, s.packets, s.loss_pct
+                    ));
+                }
+                corr.reg.import_stream_snap(ts, s);
+            }
+        }
+        8 => {
+            if let Ok(Event::Diag(e)) = decode_payload(ty, ts, payload) {
+                corr.reg
+                    .push_event(format!("[{}] {} {}", e.severity, e.code, e.message));
+                // Restore the diagnostic so the Call Detail pane and the
+                // per-call Diag column show it after a replay.
+                let severity = match e.severity {
+                    0 => Severity::Info,
+                    1 => Severity::Warn,
+                    _ => Severity::Critical,
+                };
+                if let Some(c) = corr.reg.calls.get_mut(&e.call_id) {
+                    match severity {
+                        Severity::Critical => c.critical_count += 1,
+                        Severity::Warn => c.warn_count += 1,
+                        Severity::Info => {}
+                    }
+                }
+                corr.reg.diagnostics.push_back(diagnostics::Diagnostic {
+                    ts_us: e.ts_us,
+                    call_id: e.call_id.clone(),
+                    severity,
+                    code: diagnostics::code_from_str(&e.code),
+                    message: e.message.clone(),
+                });
+                while corr.reg.diagnostics.len() > corr.reg.max_diagnostics {
+                    corr.reg.diagnostics.pop_front();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
     let mut reader = EvlogReader::open(evlog)?;
     let shared = Arc::new(Shared::new());
@@ -837,65 +869,21 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
                 corr.clear();
                 publish(&shared2, &mut corr, false);
             }
-            match reader.next_event() {
-                Ok(Some(ev)) => {
+            match reader.next_raw() {
+                Ok(Some((ty, ts, payload))) => {
                     // Anchor the session start on the first record so the flow's
                     // already-recorded-duration delta matches the recording.
-                    corr.reg.ensure_start(ev.ts_us());
-                    match &ev {
-                        Event::SipMsg(e) => {
-                            let msg = capture::replay::evt_to_sipmsg(e);
-                            corr.ingest_sip(msg);
-                        }
-                        Event::StreamSnap(e) => {
-                            // Event Log is a 1000-line ring: only keep snaps
-                            // that actually lost packets (the rest is noise and
-                            // format!-alloc on every 5s flush of every stream).
-                            if e.lost > 0 {
-                                corr.reg.push_event(format!(
-                                    "stream {} ssrc={:#x} pkts={} loss={:.1}%",
-                                    e.call_id, e.ssrc, e.packets, e.loss_pct
-                                ));
-                            }
-                            corr.reg.import_stream_snap(e.ts_us, snap_evt_to_summary(e));
-                        }
-                        Event::Diag(e) => {
-                            corr.reg
-                                .push_event(format!("[{}] {} {}", e.severity, e.code, e.message));
-                            // Restore the diagnostic so the Call Detail pane and the
-                            // per-call Diag column show it after a replay.
-                            let severity = match e.severity {
-                                0 => Severity::Info,
-                                1 => Severity::Warn,
-                                _ => Severity::Critical,
-                            };
-                            if let Some(c) = corr.reg.calls.get_mut(&e.call_id) {
-                                match severity {
-                                    Severity::Critical => c.critical_count += 1,
-                                    Severity::Warn => c.warn_count += 1,
-                                    Severity::Info => {}
-                                }
-                            }
-                            corr.reg.diagnostics.push_back(diagnostics::Diagnostic {
-                                ts_us: e.ts_us,
-                                call_id: e.call_id.clone(),
-                                severity,
-                                code: diagnostics::code_from_str(&e.code),
-                                message: e.message.clone(),
-                            });
-                            while corr.reg.diagnostics.len() > corr.reg.max_diagnostics {
-                                corr.reg.diagnostics.pop_front();
-                            }
-                        }
-                        _ => {}
-                    }
+                    corr.reg.ensure_start(ts);
+                    replay_apply(&mut corr, ty, ts, payload);
                     // Keep the TUI live while ingesting a large evlog.
                     if with_tui && last_publish.elapsed() >= Duration::from_millis(200) {
                         publish(&shared2, &mut corr, false);
                         last_publish = Instant::now();
                     }
                 }
-                Ok(None) => {
+                Ok(None) | Err(_) => {
+                    // Clean EOF, truncated tail (kill mid-write), or a framing
+                    // error we cannot resync: keep what was ingested.
                     if !done {
                         done = true;
                         publish(&shared2, &mut corr, true);
@@ -914,7 +902,6 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
                     }
                     break;
                 }
-                Err(_) => break,
             }
         }
         publish(&shared2, &mut corr, true);
@@ -1061,49 +1048,69 @@ fn run_query(evlog: &str, call_id: &str) -> Result<()> {
     let mut found = 0usize;
     let mut streams = 0usize;
     let mut rtts = 0usize;
-    while let Ok(Some(ev)) = reader.next_event() {
-        match &ev {
-            Event::SipMsg(e) if e.call_id == call_id => {
-                found += 1;
-                let label = if e.is_request {
-                    e.method.clone().unwrap_or_default()
-                } else {
-                    e.status.map(|s| s.to_string()).unwrap_or_default()
-                };
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ts_us": e.ts_us, "msg": label,
-                        "src": e.flow.src.to_string(), "dst": e.flow.dst.to_string(),
-                        "cseq": e.cseq, "branch": e.branch,
-                        "from_tag": e.from_tag, "to_tag": e.to_tag,
-                        "raw_len": e.raw.len(),
-                    })
-                );
+    loop {
+        let (ty, ts, payload) = match reader.next_raw() {
+            Ok(Some(rec)) => rec,
+            Ok(None) | Err(_) => break,
+        };
+        match ty {
+            1 => {
+                if let Ok(Event::SipMsg(e)) = decode_payload(ty, ts, payload) {
+                    if e.call_id == call_id {
+                        found += 1;
+                        let label = if e.is_request {
+                            e.method.clone().unwrap_or_default()
+                        } else {
+                            e.status.map(|s| s.to_string()).unwrap_or_default()
+                        };
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ts_us": e.ts_us, "msg": label,
+                                "src": e.flow.src.to_string(), "dst": e.flow.dst.to_string(),
+                                "cseq": e.cseq, "branch": e.branch,
+                                "from_tag": e.from_tag, "to_tag": e.to_tag,
+                                "raw_len": e.raw.len(),
+                            })
+                        );
+                    }
+                }
             }
-            Event::StreamSnap(e) if e.call_id == call_id => {
-                streams += 1;
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ts_us": e.ts_us, "stream": format!("{:#x}", e.ssrc),
-                        "codec": e.codec, "packets": e.packets, "lost": e.lost,
-                        "loss_pct": e.loss_pct, "jitter_ms": e.jitter_ms, "mos": e.mos,
-                    })
-                );
+            4 => {
+                if let Ok(s) = parse_stream_summary(payload) {
+                    if s.call_id.as_deref() == Some(call_id) {
+                        streams += 1;
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ts_us": ts, "stream": format!("{:#x}", s.ssrc),
+                                "codec": s.codec, "packets": s.packets, "lost": s.lost,
+                                "loss_pct": s.loss_pct, "jitter_ms": s.jitter_ms, "mos": s.mos,
+                            })
+                        );
+                    }
+                }
             }
-            Event::RtcpRtt(e) if e.call_id == call_id => {
-                rtts += 1;
-                println!(
-                    "{}",
-                    serde_json::json!({"ts_us": e.ts_us, "ssrc": format!("{:#x}", e.ssrc), "rtt_ms": e.rtt_ms, "oneway_ms": e.oneway_ms})
-                );
+            5 => {
+                if let Ok(Event::RtcpRtt(e)) = decode_payload(ty, ts, payload) {
+                    if e.call_id == call_id {
+                        rtts += 1;
+                        println!(
+                            "{}",
+                            serde_json::json!({"ts_us": e.ts_us, "ssrc": format!("{:#x}", e.ssrc), "rtt_ms": e.rtt_ms, "oneway_ms": e.oneway_ms})
+                        );
+                    }
+                }
             }
-            Event::Diag(e) if e.call_id == call_id => {
-                println!(
-                    "{}",
-                    serde_json::json!({"ts_us": e.ts_us, "diag": e.code, "severity": e.severity, "message": e.message})
-                );
+            8 => {
+                if let Ok(Event::Diag(e)) = decode_payload(ty, ts, payload) {
+                    if e.call_id == call_id {
+                        println!(
+                            "{}",
+                            serde_json::json!({"ts_us": e.ts_us, "diag": e.code, "severity": e.severity, "message": e.message})
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -1147,42 +1154,52 @@ fn run_export(
     let mut diags_extra = Vec::new();
     let mut buckets_extra = Vec::new();
 
-    while let Ok(Some(ev)) = reader.next_event() {
-        let in_range = |ts: u64| {
-            from.map(|f| ts >= f * 1_000_000).unwrap_or(true)
-                && to.map(|t| ts <= t * 1_000_000).unwrap_or(true)
+    loop {
+        let (ty, ts, payload) = match reader.next_raw() {
+            Ok(Some(rec)) => rec,
+            Ok(None) | Err(_) => break,
         };
-        match &ev {
-            Event::SipMsg(e) => {
-                if in_range(e.ts_us) {
-                    corr.ingest_sip(capture::replay::evt_to_sipmsg(e));
-                    // Replay never writes an evlog; drop the re-emitted events
-                    // immediately or `pending_events` grows with every message.
-                    corr.take_events();
+        let in_range = from.map(|f| ts >= f * 1_000_000).unwrap_or(true)
+            && to.map(|t| ts <= t * 1_000_000).unwrap_or(true);
+        match ty {
+            1 => {
+                if in_range {
+                    if let Ok(Event::SipMsg(e)) = decode_payload(ty, ts, payload) {
+                        corr.ingest_sip(capture::replay::evt_to_sipmsg(&e));
+                        // Replay never writes an evlog; drop the re-emitted events
+                        // immediately or `pending_events` grows with every message.
+                        corr.take_events();
+                    }
                 }
             }
-            Event::StreamSnap(e) => {
-                if in_range(e.ts_us) {
-                    streams_extra.push(snap_evt_to_summary(e));
+            4 => {
+                if in_range {
+                    if let Ok(s) = parse_stream_summary(payload) {
+                        streams_extra.push(s);
+                    }
                 }
             }
-            Event::Diag(e) => {
-                if in_range(e.ts_us) {
-                    diags_extra.push(diagnostics::Diagnostic {
-                        ts_us: e.ts_us,
-                        call_id: e.call_id.clone(),
-                        severity: match e.severity {
-                            0 => Severity::Info,
-                            1 => Severity::Warn,
-                            _ => Severity::Critical,
-                        },
-                        code: diagnostics::code_from_str(&e.code),
-                        message: e.message.clone(),
-                    });
+            8 => {
+                if in_range {
+                    if let Ok(Event::Diag(e)) = decode_payload(ty, ts, payload) {
+                        diags_extra.push(diagnostics::Diagnostic {
+                            ts_us: e.ts_us,
+                            call_id: e.call_id.clone(),
+                            severity: match e.severity {
+                                0 => Severity::Info,
+                                1 => Severity::Warn,
+                                _ => Severity::Critical,
+                            },
+                            code: diagnostics::code_from_str(&e.code),
+                            message: e.message.clone(),
+                        });
+                    }
                 }
             }
-            Event::HealthBucket(e) => {
-                buckets_extra.push((e.bucket_us, e.dim_key.clone(), e.metrics.clone()))
+            6 => {
+                if let Ok(Event::HealthBucket(e)) = decode_payload(ty, ts, payload) {
+                    buckets_extra.push((e.bucket_us, e.dim_key.clone(), e.metrics.clone()));
+                }
             }
             _ => {}
         }
