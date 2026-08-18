@@ -77,12 +77,21 @@ impl RtpStream {
             ssrc: header.ssrc,
         };
         self.payload_type.get_or_insert(header.payload_type);
-        self.clock_rate
-            .get_or_insert(crate::decode::rtp::rtp_clock_rate_for_payload_type(
-                header.payload_type,
-            ));
+        if self.clock_rate.is_none() {
+            let rate = crate::decode::rtp::rtp_clock_rate_for_payload_type(header.payload_type);
+            self.apply_clock_rate(rate);
+        }
         self.acc.observe(ts_us, Some(stats_header));
         self.last_pt = Some(header.payload_type);
+    }
+
+    /// Apply SDP (or fallback) clock rate, rescaling an in-flight jitter estimator.
+    pub fn apply_clock_rate(&mut self, rate: u32) {
+        if rate == 0 {
+            return;
+        }
+        self.clock_rate = Some(rate);
+        self.acc.set_clock_rate(rate);
     }
 
     /// Append a 5s throughput/quality sample (at most one per window).

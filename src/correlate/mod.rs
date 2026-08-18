@@ -350,6 +350,15 @@ impl Correlator {
                     .iter()
                     .filter_map(|pt| sess.codec_name_for_pt(*pt))
                     .collect();
+                neg.clock_rates = neg
+                    .pts
+                    .iter()
+                    .map(|pt| {
+                        sess.clock_rate_for_pt(*pt).unwrap_or_else(|| {
+                            crate::decode::rtp::rtp_clock_rate_for_payload_type(*pt)
+                        })
+                    })
+                    .collect();
                 learned = Some(neg);
             }
         }
@@ -375,6 +384,7 @@ impl Correlator {
                 for pt in &n.pts {
                     if !call.negotiated.pts.contains(pt) {
                         call.negotiated.pts.push(*pt);
+                        call.negotiated.clock_rates.push(n.clock_rate_for_pt(*pt));
                     }
                 }
                 for c in &n.codecs {
@@ -390,6 +400,7 @@ impl Correlator {
             for ep in &n.endpoints {
                 self.reg.endpoint_call.insert(*ep, call_id.clone());
             }
+            self.apply_sdp_clocks(&call_id);
         }
 
         // Evlog: record the SIP message (raw optionally truncated upstream).
@@ -428,6 +439,42 @@ impl Correlator {
             .unwrap_or(false);
         if terminal && self.terminal_done.insert(call_id.clone()) {
             self.on_call_terminal(&call_id);
+        }
+    }
+
+    /// Push SDP `a=rtpmap` clocks onto already-seen streams (early media
+    /// before the answer, or a late INVITE SDP).
+    fn apply_sdp_clocks(&mut self, call_id: &str) {
+        let rates: Vec<(u8, u32)> = {
+            let Some(call) = self.reg.calls.get(call_id) else {
+                return;
+            };
+            if call.negotiated.pts.is_empty() {
+                return;
+            }
+            call.negotiated
+                .pts
+                .iter()
+                .copied()
+                .map(|pt| (pt, call.negotiated.clock_rate_for_pt(pt)))
+                .collect()
+        };
+        let keys = self
+            .reg
+            .stream_index
+            .get(call_id)
+            .cloned()
+            .unwrap_or_default();
+        for key in keys {
+            let Some(stream) = self.reg.streams.get_mut(&key) else {
+                continue;
+            };
+            let Some(pt) = stream.last_pt.or(stream.payload_type) else {
+                continue;
+            };
+            if let Some((_, rate)) = rates.iter().find(|(p, _)| *p == pt) {
+                stream.apply_clock_rate(*rate);
+            }
         }
     }
 
@@ -495,6 +542,7 @@ impl Correlator {
                     .iter()
                     .position(|p| *p == header.payload_type)
                     .and_then(|i| neg.codecs.get(i).cloned());
+                stream.apply_clock_rate(neg.clock_rate_for_pt(header.payload_type));
             }
             if let Some(l) = leg {
                 stream.via_turn = true;

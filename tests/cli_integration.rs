@@ -179,6 +179,10 @@ fn evlog_roundtrip_and_query() {
         sout.contains("Definitions"),
         "stats must include metric definitions: {sout}"
     );
+    assert!(
+        sout.contains("jitter p50"),
+        "stats must report jitter percentiles: {sout}"
+    );
     let s_flag = bin().args(["stats", "-l"]).arg(&evlog).output().unwrap();
     assert!(
         s_flag.status.success(),
@@ -201,6 +205,7 @@ fn evlog_roundtrip_and_query() {
             .map(|a| !a.is_empty())
             .unwrap_or(false)
     );
+    assert!(v["traffic"]["p50_jitter_ms"].is_number() || v["traffic"]["p50_jitter_ms"].is_null());
 
     // replay reproduces the same terminal state
     let r = bin()

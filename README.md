@@ -103,7 +103,7 @@ Private binary append-only format. Header holds the `SMON` magic, version, and t
 
 - **RTT**: `RTT = arrival_NTP − LSR − DLSR` from the RTCP RR
 - **One-way delay**: RTCP SR NTP↔RTP mapping (when both directions are visible); otherwise an indirect estimate from RTP arrival intervals (labeled "estimate")
-- **jitter/loss**: RFC3550, 64-packet reorder window
+- **jitter/loss**: RFC3550, 64-packet reorder window; `|D| > 1s` is treated as a timestamp jump (hold/DTX/reset), not jitter. `stats` reports packet-weighted p50/p95 (SDP `a=rtpmap` clock when known)
 - **MOS**: simplified E-model (G.107): `R = 93.2 − Id − Ie`, labeled "estimate"
 
 ## Limitations

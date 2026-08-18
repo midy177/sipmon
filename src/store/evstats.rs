@@ -234,6 +234,9 @@ pub struct Traffic {
     pub avg_cps: Option<f64>,
     pub avg_mos: Option<f64>,
     pub avg_jitter_ms: Option<f64>,
+    /// Packet-weighted p50 / p95 of last per-stream jitter.
+    pub p50_jitter_ms: Option<f64>,
+    pub p95_jitter_ms: Option<f64>,
     pub avg_rtt_ms: Option<f64>,
     pub rtt_samples: u64,
     /// SIP response class histogram: index 0 unused, 1..=6 → 1xx..=6xx.
@@ -616,7 +619,7 @@ impl StatsAcc {
         };
         let span_s = (span_us as f64 / 1_000_000.0).max(1e-9);
 
-        let (mos_sum, mos_w, jit_sum, jit_w, snap_rtt_sum, snap_rtt_w) =
+        let (mos_sum, mos_w, jit_sum, jit_w, snap_rtt_sum, snap_rtt_w, p50_jit, p95_jit) =
             quality_weighted(&self.last_quality);
         let avg_rtt_ms =
             mean_f64(self.rtt_sum, self.rtt_n).or_else(|| mean_f64(snap_rtt_sum, snap_rtt_w));
@@ -632,6 +635,8 @@ impl StatsAcc {
             avg_cps: (seizures > 0).then_some(seizures as f64 / span_s),
             avg_mos: mean_f64(mos_sum, mos_w),
             avg_jitter_ms: mean_f64(jit_sum, jit_w),
+            p50_jitter_ms: p50_jit,
+            p95_jitter_ms: p95_jit,
             avg_rtt_ms,
             rtt_samples: self.rtt_n,
             sip_class: self.sip_class,
@@ -758,13 +763,16 @@ pub fn scan(
     Ok(acc.finish(file, bytes, tz, top_ips))
 }
 
-fn quality_weighted(q: &HashMap<(u32, StreamId), StreamQuality>) -> (f64, u64, f64, u64, f64, u64) {
+fn quality_weighted(
+    q: &HashMap<(u32, StreamId), StreamQuality>,
+) -> (f64, u64, f64, u64, f64, u64, Option<f64>, Option<f64>) {
     let mut mos_sum = 0.0;
     let mut mos_w = 0u64;
     let mut jit_sum = 0.0;
     let mut jit_w = 0u64;
     let mut rtt_sum = 0.0;
     let mut rtt_w = 0u64;
+    let mut jit_samples: Vec<(f64, u64)> = Vec::new();
     for s in q.values() {
         let w = s.packets.max(1);
         if let Some(m) = s.mos {
@@ -774,13 +782,35 @@ fn quality_weighted(q: &HashMap<(u32, StreamId), StreamQuality>) -> (f64, u64, f
         if let Some(j) = s.jitter_ms {
             jit_sum += j * w as f64;
             jit_w += w;
+            jit_samples.push((j, w));
         }
         if let Some(r) = s.rtt_ms {
             rtt_sum += r * w as f64;
             rtt_w += w;
         }
     }
-    (mos_sum, mos_w, jit_sum, jit_w, rtt_sum, rtt_w)
+    let p50 = weighted_percentile(&jit_samples, 0.50);
+    let p95 = weighted_percentile(&jit_samples, 0.95);
+    (mos_sum, mos_w, jit_sum, jit_w, rtt_sum, rtt_w, p50, p95)
+}
+
+/// Packet-weighted percentile of `(value, weight)` pairs.
+fn weighted_percentile(samples: &[(f64, u64)], p: f64) -> Option<f64> {
+    let mut v: Vec<(f64, u64)> = samples.iter().copied().filter(|(_, w)| *w > 0).collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: u64 = v.iter().map(|(_, w)| *w).sum();
+    let target = (total as f64 - 1.0) * p.clamp(0.0, 1.0);
+    let mut acc = 0.0;
+    for (val, w) in v {
+        acc += w as f64;
+        if acc > target {
+            return Some(val);
+        }
+    }
+    None
 }
 
 fn mean_u32(v: &[u32]) -> Option<f64> {
@@ -880,6 +910,8 @@ impl EvlogStats {
                 "avg_cps": round2(t.avg_cps),
                 "avg_mos": round2(t.avg_mos),
                 "avg_jitter_ms": round2(t.avg_jitter_ms),
+                "p50_jitter_ms": round2(t.p50_jitter_ms),
+                "p95_jitter_ms": round2(t.p95_jitter_ms),
                 "avg_rtt_ms": round2(t.avg_rtt_ms),
                 "rtt_samples": t.rtt_samples,
                 "sip_class": {
@@ -1039,6 +1071,8 @@ impl EvlogStats {
         out.push_str("  ACD      talk time: answer → BYE/end (answered calls only)\n");
         out.push_str("  call     INVITE → BYE/end\n");
         out.push_str("  windows  call-availability rates use teardowns in that 5-minute bucket\n");
+        out.push_str("  jitter   RFC 3550 interarrival; |D|>1s skipped as timestamp jump\n");
+        out.push_str("           p50/p95 are packet-weighted across streams (avg also in JSON)\n");
 
         let t = &self.traffic;
         out.push_str("\n== Traffic ==\n");
@@ -1066,9 +1100,10 @@ impl EvlogStats {
             fmt_rate(t.avg_cps)
         ));
         out.push_str(&format!(
-            "  quality   MOS {}  jitter {}  RTT {} ({} samples)\n",
+            "  quality   MOS {}  jitter p50 {} p95 {}  RTT {} ({} samples)\n",
             fmt_float(t.avg_mos, 2),
-            fmt_ms(t.avg_jitter_ms),
+            fmt_ms(t.p50_jitter_ms),
+            fmt_ms(t.p95_jitter_ms),
             fmt_ms(t.avg_rtt_ms),
             t.rtt_samples
         ));
@@ -1308,10 +1343,22 @@ mod tests {
     }
 
     fn snap(ts: u64, call: &str, packets: u64, lost: u64, bytes: u64) -> Event {
+        snap_stream(ts, call, 0xabc, packets, lost, bytes, 2.0)
+    }
+
+    fn snap_stream(
+        ts: u64,
+        call: &str,
+        ssrc: u32,
+        packets: u64,
+        lost: u64,
+        bytes: u64,
+        jitter_ms: f64,
+    ) -> Event {
         Event::StreamSnap(StreamSnapEvt {
             ts_us: ts,
             call_id: call.into(),
-            ssrc: 0xabc,
+            ssrc,
             flow: flow(),
             codec: Some("PCMU".into()),
             payload_type: Some(0),
@@ -1323,7 +1370,7 @@ mod tests {
             } else {
                 lost as f64 / packets as f64 * 100.0
             },
-            jitter_ms: Some(2.0),
+            jitter_ms: Some(jitter_ms),
             mos: Some(4.1),
             direction: None,
             bytes,
@@ -1453,6 +1500,7 @@ mod tests {
         assert!(text.contains("answered / seizures"), "{text}");
         assert!(text.contains("Definitions"), "{text}");
         assert!(text.contains("Traffic"), "{text}");
+        assert!(text.contains("jitter p50"), "{text}");
         assert!(text.contains("5-minute call availability"), "{text}");
         assert!(text.contains("5-minute network"), "{text}");
         assert!(text.contains("CANCEL%"), "{text}");
@@ -1463,9 +1511,43 @@ mod tests {
         assert_eq!(j["reliability"]["seizures"], 2);
         assert_eq!(j["reliability"]["answered"], 1);
         assert_eq!(j["traffic"]["rtp_bytes"], 40_000);
+        assert_eq!(j["traffic"]["p50_jitter_ms"], 2.0);
+        assert_eq!(j["traffic"]["p95_jitter_ms"], 2.0);
         assert_eq!(j["windows"].as_array().unwrap().len(), 2);
         assert_eq!(j["windows"][1]["cancel_pct"], 100.0);
         assert_eq!(s.events.skipped, 0);
+    }
+
+    #[test]
+    fn jitter_percentiles_are_packet_weighted() {
+        assert_eq!(
+            weighted_percentile(&[(2.0, 90), (5000.0, 10)], 0.50),
+            Some(2.0)
+        );
+        assert_eq!(
+            weighted_percentile(&[(2.0, 90), (5000.0, 10)], 0.95),
+            Some(5000.0)
+        );
+
+        let mut buf = Vec::new();
+        let mut w = EvlogWriter::new(&mut buf).unwrap();
+        w.write(&sip(1_000_000, "INVITE", "c1")).unwrap();
+        w.write(&snap_stream(2_000_000, "c1", 1, 90, 0, 14_400, 2.0))
+            .unwrap();
+        w.write(&snap_stream(2_000_000, "c1", 2, 10, 0, 1_600, 5000.0))
+            .unwrap();
+        w.flush().unwrap();
+        drop(w);
+
+        let s = scan_buf(&buf, "t.evlog".into(), 10).unwrap();
+        assert_eq!(s.traffic.p50_jitter_ms, Some(2.0));
+        assert_eq!(s.traffic.p95_jitter_ms, Some(5000.0));
+        // Arithmetic mean is pulled up by the tiny high-jitter stream.
+        let avg = s.traffic.avg_jitter_ms.unwrap();
+        assert!(avg > 400.0 && avg < 600.0, "avg={avg}");
+        let text = s.render_text();
+        assert!(text.contains("jitter p50 2ms"), "{text}");
+        assert!(text.contains("p95 5.0s"), "{text}");
     }
 
     #[test]

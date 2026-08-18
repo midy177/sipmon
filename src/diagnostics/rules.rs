@@ -264,6 +264,7 @@ mod tests {
             endpoints: vec![],
             pts: vec![0, 8],
             codecs: vec!["PCMU".into(), "PCMA".into()],
+            clock_rates: vec![8000, 8000],
         };
         let d = check_rtp_pt(0, "c", 1, 18, &neg);
         assert!(d.is_some());

@@ -1,8 +1,15 @@
 //! Vendored RTP media statistics accumulator (RFC 3550 jitter/loss with a
 //! 64-packet reorder window). Adapted from rustpbx-sipflow's `rtp_stats.rs`,
 //! kept self-contained (no external struct dependency).
+//!
+//! Interarrival jitter follows RFC 3550 A.8 (`J += (|D| − J) / 16`). Packet
+//! pairs whose `|D|` exceeds [`JITTER_DISCONT_MS`] are treated as a timestamp
+//! restart (hold, DTX gap, codec switch) and do not update `J`.
 
 pub const RTP_REORDER_WINDOW: u16 = 64;
+
+/// `|D|` larger than this (milliseconds) is a discontinuity, not jitter.
+pub const JITTER_DISCONT_MS: f64 = 1000.0;
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -43,6 +50,21 @@ pub struct MediaStats {
 impl MediaStatsAccumulator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Prefer SDP `a=rtpmap` clock when known; rescale an in-flight estimator
+    /// so `jitter_ms` stays continuous across a late SDP apply.
+    pub fn set_clock_rate(&mut self, rate: u32) {
+        if rate == 0 {
+            return;
+        }
+        if let Some(old) = self.clock_rate
+            && old != 0
+            && old != rate
+        {
+            self.jitter_rtp_units *= rate as f64 / old as f64;
+        }
+        self.clock_rate = Some(rate);
     }
 
     pub fn observe(&mut self, arrival_micros: u64, header: Option<RtpStatsHeader>) {
@@ -124,9 +146,14 @@ impl MediaStatsAccumulator {
             let arr_delta_units = arr_delta as f64 * clock_rate as f64 / 1_000_000.0;
             let rtp_delta_units = rtp_ts_delta(rtp_ts, prev_rtp) as f64;
             let delta = (arr_delta_units - rtp_delta_units).abs();
-            if delta.is_finite() {
-                self.jitter_rtp_units += (delta - self.jitter_rtp_units) / 16.0;
-                self.jitter_samples += 1;
+            if delta.is_finite() && clock_rate > 0 {
+                let delta_ms = delta * 1000.0 / clock_rate as f64;
+                // Hold / timestamp reset / capture stall: keep the RFC estimator
+                // but do not let a multi-second |D| leak into displayed jitter.
+                if delta_ms <= JITTER_DISCONT_MS {
+                    self.jitter_rtp_units += (delta - self.jitter_rtp_units) / 16.0;
+                    self.jitter_samples += 1;
+                }
             }
         }
         self.prev_arrival_micros = Some(arrival_us);
@@ -198,5 +225,65 @@ mod tests {
         let st = s.snapshot();
         assert_eq!(st.lost_packets, 1);
         assert_eq!(st.expected_packets, 3);
+    }
+
+    fn pcmu(seq: u16, ts: u32) -> RtpStatsHeader {
+        hdr(seq, ts)
+    }
+
+    #[test]
+    fn steady_pcmu_has_near_zero_jitter() {
+        let mut s = MediaStatsAccumulator::new();
+        for i in 0..40u16 {
+            let arr = 1_000_000 + u64::from(i) * 20_000;
+            s.observe(arr, Some(pcmu(i, u32::from(i) * 160)));
+        }
+        let j = s.snapshot().jitter_ms.unwrap();
+        assert!(j < 1.0, "expected ~0 jitter, got {j}");
+    }
+
+    #[test]
+    fn multi_second_hold_does_not_inflate_jitter() {
+        let mut s = MediaStatsAccumulator::new();
+        s.observe(1_000_000, Some(pcmu(1, 160)));
+        s.observe(1_020_000, Some(pcmu(2, 320)));
+        // 5s hold; RTP timestamp barely advances (frozen / CN).
+        s.observe(6_040_000, Some(pcmu(3, 480)));
+        s.observe(6_060_000, Some(pcmu(4, 640)));
+        let j = s.snapshot().jitter_ms.unwrap();
+        assert!(
+            j < 20.0,
+            "5s hold must be treated as a timestamp jump, got {j}ms"
+        );
+    }
+
+    #[test]
+    fn rtp_timestamp_reset_does_not_inflate_jitter() {
+        let mut s = MediaStatsAccumulator::new();
+        s.observe(1_000_000, Some(pcmu(1, 800_000)));
+        s.observe(1_020_000, Some(pcmu(2, 800_160)));
+        s.observe(1_040_000, Some(pcmu(3, 160)));
+        s.observe(1_060_000, Some(pcmu(4, 320)));
+        let j = s.snapshot().jitter_ms.unwrap();
+        assert!(
+            j < 20.0,
+            "timestamp reset must be treated as a jump, got {j}ms"
+        );
+    }
+
+    #[test]
+    fn set_clock_rate_rescales_units_not_milliseconds() {
+        let mut s = MediaStatsAccumulator::new();
+        // 1ms extra delay on one interval at 8 kHz → D = 8 units.
+        s.observe(1_000_000, Some(pcmu(1, 160)));
+        s.observe(1_021_000, Some(pcmu(2, 320)));
+        let before = s.snapshot().jitter_ms.unwrap();
+        s.set_clock_rate(48_000);
+        let after = s.snapshot().jitter_ms.unwrap();
+        assert!(
+            (before - after).abs() < 1e-9,
+            "rescale must keep jitter_ms, {before} vs {after}"
+        );
+        assert_eq!(s.clock_rate, Some(48_000));
     }
 }
