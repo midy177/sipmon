@@ -137,38 +137,49 @@ impl IpStats {
     }
 
     fn add_packet(&mut self, ts_us: u64, len: usize, dir: Dir) {
+        self.add_packets(ts_us, 1, len as u64, dir);
+    }
+
+    /// Bulk packet/byte update used when reconstructing IP stats from a
+    /// 5-second StreamSnap (replay: RTP packets themselves are not in the log).
+    fn add_packets(&mut self, ts_us: u64, count: u64, bytes: u64, dir: Dir) {
+        if count == 0 && bytes == 0 {
+            return;
+        }
         if self.first_seen_us.is_none() {
             self.first_seen_us = Some(ts_us);
         }
         self.last_seen_us = Some(ts_us);
         match dir {
-            Dir::Tx => self.pkts_tx += 1,
-            Dir::Rx => self.pkts_rx += 1,
-        }
-        match dir {
-            Dir::Tx => self.bytes_tx += len as u64,
-            Dir::Rx => self.bytes_rx += len as u64,
+            Dir::Tx => {
+                self.pkts_tx += count;
+                self.bytes_tx += bytes;
+            }
+            Dir::Rx => {
+                self.pkts_rx += count;
+                self.bytes_rx += bytes;
+            }
         }
         let b = Self::bucket_mut(&mut self.sec1, ts_us, 1_000_000, SEC1_RETAIN);
         match dir {
             Dir::Tx => {
-                b.pkts_tx += 1;
-                b.bytes_tx += len as u64;
+                b.pkts_tx += count;
+                b.bytes_tx += bytes;
             }
             Dir::Rx => {
-                b.pkts_rx += 1;
-                b.bytes_rx += len as u64;
+                b.pkts_rx += count;
+                b.bytes_rx += bytes;
             }
         }
         let b = Self::bucket_mut(&mut self.sec60, ts_us, 60_000_000, SEC60_RETAIN);
         match dir {
             Dir::Tx => {
-                b.pkts_tx += 1;
-                b.bytes_tx += len as u64;
+                b.pkts_tx += count;
+                b.bytes_tx += bytes;
             }
             Dir::Rx => {
-                b.pkts_rx += 1;
-                b.bytes_rx += len as u64;
+                b.pkts_rx += count;
+                b.bytes_rx += bytes;
             }
         }
     }
@@ -366,6 +377,11 @@ impl IpStatsStore {
         self.entry(ip).add_packet(ts_us, len, dir);
     }
 
+    /// Attribute `count` packets totaling `bytes` to `ip` in one shot.
+    pub fn observe_packets(&mut self, ip: IpAddr, ts_us: u64, count: u64, bytes: u64, dir: Dir) {
+        self.entry(ip).add_packets(ts_us, count, bytes, dir);
+    }
+
     pub fn observe_lost(&mut self, ip: IpAddr, ts_us: u64, lost: u64, dir: Dir) {
         self.entry(ip).add_lost(ts_us, lost, dir);
     }
@@ -379,6 +395,12 @@ impl IpStatsStore {
         let mut v: Vec<IpStats> = self.map.values().cloned().collect();
         v.sort_by_key(|s| s.ip);
         v
+    }
+
+    /// Drop IPs with no active calls and no packets since `cutoff_us`.
+    pub fn prune_idle(&mut self, cutoff_us: u64) {
+        self.map
+            .retain(|_, s| s.active_calls > 0 || s.last_seen_us.unwrap_or(0) >= cutoff_us);
     }
 }
 
@@ -465,5 +487,34 @@ mod tests {
         let cols = s.heatmap_columns(60, 60);
         assert_eq!(cols.len(), 1);
         assert!((cols[0].1 - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn observe_packets_matches_per_packet_totals() {
+        let mut st = IpStatsStore::new();
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        st.observe_packets(ip, 1_000_000, 50, 50 * 160, Dir::Tx);
+        st.observe_lost(ip, 1_000_000, 2, Dir::Tx);
+        let s = st.snapshot().pop().unwrap();
+        assert_eq!(s.pkts_tx, 50);
+        assert_eq!(s.bytes_tx, 50 * 160);
+        assert_eq!(s.lost_tx, 2);
+        assert!((s.loss_pct(0, Dir::Tx).unwrap() - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prune_idle_drops_stale_ips() {
+        let mut st = IpStatsStore::new();
+        let old: IpAddr = "10.1.2.3".parse().unwrap();
+        let live: IpAddr = "10.1.2.4".parse().unwrap();
+        let held: IpAddr = "10.1.2.5".parse().unwrap();
+        st.observe_packet(old, 1_000_000, 100, Dir::Tx);
+        st.observe_packet(live, 3_600_000_000, 100, Dir::Tx);
+        st.add_active(held, 1);
+        st.prune_idle(3_000_000_000);
+        let ips: Vec<_> = st.snapshot().into_iter().map(|s| s.ip).collect();
+        assert!(!ips.contains(&old));
+        assert!(ips.contains(&live));
+        assert!(ips.contains(&held));
     }
 }

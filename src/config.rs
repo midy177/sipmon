@@ -54,6 +54,14 @@ pub struct Config {
     /// the arrows show ingress/egress. Empty = no directional anchor (raw
     /// `src → dst` is shown instead).
     pub local_ips: Vec<std::net::IpAddr>,
+    /// Drop idle and terminated calls after this many seconds (0 = keep until
+    /// `max_calls`). Live/record default 15 minutes so a multi-hour capture
+    /// cannot retain every SIP raw forever.
+    pub call_ttl_secs: u64,
+    /// When false (headless `record`), drop a call from memory as soon as it
+    /// reaches a terminal state — the evlog already has SipMsg/StreamSnap/Call
+    /// teardown. TUI/file/replay keep terminated calls for inspection.
+    pub keep_terminated: bool,
 }
 
 impl Default for Config {
@@ -73,6 +81,8 @@ impl Default for Config {
             diag_level: "warn".to_string(),
             turn_servers: Vec::new(),
             local_ips: Vec::new(),
+            call_ttl_secs: 15 * 60,
+            keep_terminated: true,
         }
     }
 }

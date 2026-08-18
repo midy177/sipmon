@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::analyze::media_stats::{MediaStats, MediaStatsAccumulator};
 use crate::analyze::mos;
 use crate::model::media::{RatePoint, StreamSummary};
@@ -31,7 +33,7 @@ pub struct RtpStream {
     /// Cumulative RTP bytes observed.
     pub bytes: u64,
     /// Periodic 5s throughput/quality samples (oldest first, capped).
-    pub history: Vec<RatePoint>,
+    pub history: VecDeque<RatePoint>,
     last_sample_bytes: u64,
     last_sample_packets: u64,
 }
@@ -56,7 +58,7 @@ impl RtpStream {
             leg: None,
             via_turn: false,
             bytes: 0,
-            history: Vec::new(),
+            history: VecDeque::new(),
             last_sample_bytes: 0,
             last_sample_packets: 0,
         }
@@ -87,7 +89,7 @@ impl RtpStream {
     pub fn sample(&mut self, ts_us: u64) {
         if self
             .history
-            .last()
+            .back()
             .is_some_and(|h| ts_us.saturating_sub(h.ts_us) < SAMPLE_WINDOW_US)
         {
             return;
@@ -95,7 +97,7 @@ impl RtpStream {
         let st = self.acc.snapshot();
         let oneway =
             mean(&self.oneway_samples).or_else(|| mean(&self.rtt_samples).map(|r| r / 2.0));
-        self.history.push(RatePoint {
+        self.history.push_back(RatePoint {
             ts_us,
             bytes: self.bytes.saturating_sub(self.last_sample_bytes),
             packets: st.packet_count.saturating_sub(self.last_sample_packets),
@@ -110,7 +112,7 @@ impl RtpStream {
             ),
         });
         if self.history.len() > MAX_SAMPLES {
-            self.history.remove(0);
+            self.history.pop_front();
         }
         self.last_sample_bytes = self.bytes;
         self.last_sample_packets = st.packet_count;
@@ -159,7 +161,48 @@ impl RtpStream {
             leg: self.leg.map(|l| l.label().to_string()),
             via_turn: self.via_turn,
             bytes: self.bytes,
-            history: self.history.clone(),
+            history: self.history.iter().cloned().collect(),
+        }
+    }
+
+    /// StreamSnap for the evlog: same numbers as `summary()` without cloning
+    /// the 10-minute sparkline history (unused by the event).
+    pub fn to_snap_evt(&self, ts_us: u64) -> crate::store::evlog::StreamSnapEvt {
+        let st = self.snapshot_stats();
+        let rtt_avg = mean(&self.rtt_samples);
+        let rtt_min = self.rtt_samples.iter().copied().fold(None, min_opt);
+        let rtt_max = self.rtt_samples.iter().copied().fold(None, max_opt);
+        let oneway = mean(&self.oneway_samples).or_else(|| rtt_avg.map(|r| r / 2.0));
+        let mos = mos::estimate_mos(
+            self.codec.as_deref(),
+            self.payload_type,
+            st.loss_percent,
+            oneway,
+            st.jitter_ms,
+        );
+        crate::store::evlog::StreamSnapEvt {
+            ts_us,
+            call_id: self.call_id.clone(),
+            ssrc: self.ssrc,
+            flow: self.flow,
+            codec: self.codec.clone(),
+            payload_type: self.payload_type,
+            packets: st.packet_count,
+            lost: st.lost_packets,
+            expected: st.expected_packets,
+            loss_pct: st.loss_percent,
+            jitter_ms: st.jitter_ms,
+            mos,
+            direction: self.direction.clone(),
+            bytes: self.bytes,
+            first_ts_us: self.first_ts_us,
+            last_ts_us: self.last_ts_us,
+            rtt_min_ms: rtt_min,
+            rtt_avg_ms: rtt_avg,
+            rtt_max_ms: rtt_max,
+            oneway_ms: oneway,
+            leg: self.leg.map(|l| l.label().to_string()),
+            via_turn: self.via_turn,
         }
     }
 }

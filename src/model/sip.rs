@@ -212,6 +212,8 @@ pub struct Call {
     /// IPs that contributed to the per-IP active-call count (the two signaling
     /// endpoints of the initial INVITE), decremented at teardown.
     pub active_ips: Vec<std::net::IpAddr>,
+    /// Last SIP/RTP/RTCP timestamp; used to evict idle and abandoned dialogs.
+    pub last_ts_us: u64,
 }
 
 impl Call {
@@ -250,6 +252,7 @@ impl Call {
             invite_key: None,
             ips: Vec::new(),
             active_ips: Vec::new(),
+            last_ts_us: 0,
         }
     }
 

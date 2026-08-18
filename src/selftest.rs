@@ -143,10 +143,10 @@ mod tests {
         // Endless garbage after a header claiming a huge Content-Length must
         // not grow the buffer beyond the cap.
         let hdr = b"INVITE sip:x SIP/2.0\r\nContent-Length: 2000000000\r\n\r\n";
-        reasm.feed(flow, hdr);
+        reasm.feed(flow, hdr, 0);
         let chunk = vec![0x41u8; 8192];
         for _ in 0..1024 {
-            reasm.feed(flow, &chunk);
+            reasm.feed(flow, &chunk, 0);
         }
         assert!(
             reasm.buffered_bytes() <= crate::decode::tcp_reasm::MAX_STREAM_BUF,
@@ -316,6 +316,97 @@ mod tests {
             terminal_done <= 200 + 16,
             "terminal_done grew to {terminal_done} (50k calls)"
         );
+    }
+
+    /// Headless record drops a call from RAM as soon as it tears down (the
+    /// evlog already has SipMsg + Call teardown).
+    #[test]
+    fn headless_drops_call_on_terminal() {
+        let cfg = Config {
+            keep_terminated: false,
+            ..Config::default()
+        };
+        let mut corr = Correlator::new(&cfg, "headless".into());
+        complete_call(&mut corr, 1_000_000, 1);
+        assert!(
+            corr.reg.calls.is_empty(),
+            "terminated call retained: {}",
+            corr.reg.calls.len()
+        );
+        let (invite_rr, terminal_done) = corr.test_bookkeeping_lens();
+        assert_eq!(invite_rr, 0);
+        assert_eq!(terminal_done, 0);
+        assert_eq!(corr.reg.completed + corr.reg.failed, 1);
+    }
+
+    /// Terminated and idle calls older than the TTL are evicted on flush.
+    #[test]
+    fn terminated_calls_evicted_by_ttl() {
+        let cfg = Config {
+            call_ttl_secs: 60,
+            max_calls: 100_000,
+            ..Config::default()
+        };
+        let mut corr = Correlator::new(&cfg, "ttl".into());
+        complete_call(&mut corr, 1_000_000, 1);
+        assert_eq!(corr.reg.calls.len(), 1);
+        // Prime the flush clock, then jump past the 60s TTL.
+        corr.maybe_periodic_flush(1_000_000);
+        corr.maybe_periodic_flush(70_000_000);
+        assert!(
+            corr.reg.calls.is_empty(),
+            "TTL did not drop terminated call: {}",
+            corr.reg.calls.len()
+        );
+        let (invite_rr, terminal_done) = corr.test_bookkeeping_lens();
+        assert_eq!(invite_rr, 0);
+        assert_eq!(terminal_done, 0);
+    }
+
+    /// last_lost must not outlive the streams it tracks.
+    #[test]
+    fn last_lost_pruned_after_stream_evict() {
+        use crate::correlate::turn::Encap;
+        use crate::decode::rtp::RtpHeader;
+        let cfg = Config {
+            keep_terminated: false,
+            ..Config::default()
+        };
+        let mut corr = Correlator::new(&cfg, "lostmap".into());
+        let id = "lost-prune";
+        corr.ingest_sip(sdp_msg(
+            1_000_000,
+            id,
+            true,
+            Method::Invite,
+            None,
+            "10.10.0.1:5060",
+            "10.20.0.1:5060",
+            "10.10.0.1",
+            20000,
+            false,
+        ));
+        let hdr = RtpHeader {
+            version: 2,
+            payload_type: 0,
+            sequence_number: 1,
+            timestamp: 0,
+            ssrc: 0x1111,
+        };
+        let flow = Flow5Tuple {
+            proto: Proto::Udp,
+            src: "10.10.0.1:20000".parse().unwrap(),
+            dst: "10.20.0.1:20000".parse().unwrap(),
+        };
+        corr.ingest_rtp(2_000_000, flow, hdr, 172, Encap::Direct);
+        corr.maybe_periodic_flush(2_000_000);
+        corr.maybe_periodic_flush(8_000_000);
+        assert!(corr.test_last_lost_len() > 0);
+        corr.ingest_sip(sip(9_000_000, id, Method::Bye, true));
+        corr.ingest_sip(sip_resp(9_100_000, id, 200, "BYE"));
+        corr.maybe_periodic_flush(15_000_000);
+        assert_eq!(corr.test_last_lost_len(), 0);
+        assert!(corr.reg.streams.is_empty());
     }
 
     /// A single pathological call (thousands of messages) must not grow the

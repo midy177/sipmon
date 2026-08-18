@@ -30,6 +30,14 @@ pub struct Correlator {
     pending_events: Vec<crate::store::evlog::Event>,
     last_flush_us: Option<u64>,
     pub turn: turn::TurnTracker,
+    /// When false (replay), skip building evlog records that would just be
+    /// discarded — SIP ingest otherwise clones every raw message into a
+    /// SipMsgEvt on the hot path.
+    emit_evlog: bool,
+    /// When false, drop a call from RAM as soon as it tears down.
+    keep_terminated: bool,
+    /// Idle/terminated call TTL in seconds (0 = disabled).
+    call_ttl_secs: u64,
 }
 
 fn debug_enabled() -> bool {
@@ -55,6 +63,9 @@ impl Correlator {
             pending_events: Vec::new(),
             last_flush_us: None,
             turn: turn::TurnTracker::new(&config.turn_servers),
+            emit_evlog: true,
+            keep_terminated: config.keep_terminated,
+            call_ttl_secs: config.call_ttl_secs,
         }
     }
 
@@ -79,6 +90,18 @@ impl Correlator {
         std::mem::take(&mut self.pending_events)
     }
 
+    /// Replay does not write an evlog; skip building records that would be
+    /// thrown away (most importantly a clone of every SIP message's raw bytes).
+    pub fn disable_evlog_emit(&mut self) {
+        self.emit_evlog = false;
+    }
+
+    fn push_ev(&mut self, ev: crate::store::evlog::Event) {
+        if self.emit_evlog {
+            self.pending_events.push(ev);
+        }
+    }
+
     /// Every ~5s of capture time: emit StreamSnap events for active streams.
     pub fn maybe_periodic_flush(&mut self, ts_us: u64) {
         let due = match self.last_flush_us {
@@ -95,63 +118,64 @@ impl Correlator {
         // Periodic bounded-memory maintenance.
         self.reg.prune_heatmap();
         self.turn.prune();
+        self.tcp_reasm
+            .prune(ts_us, crate::decode::tcp_reasm::IDLE_US);
+        let keep_history = self.keep_terminated;
+        let emit_evlog = self.emit_evlog;
         let keys: Vec<StreamKey> = self.reg.streams.keys().copied().collect();
         for key in keys {
-            let Some(s) = self.reg.streams.get_mut(&key) else {
+            let Some((flow, lost_now, evt)) = self.reg.streams.get_mut(&key).map(|s| {
+                if keep_history {
+                    s.sample(ts_us);
+                }
+                let lost_now = s.snapshot_stats().lost_packets;
+                let evt = emit_evlog.then(|| s.to_snap_evt(ts_us));
+                (s.flow, lost_now, evt)
+            }) else {
                 continue;
             };
-            // Record a 5s throughput/quality sample and derive the loss delta.
-            s.sample(ts_us);
-            let sum = s.summary();
             // Attribute the newly-observed lost packets to both endpoints of
             // the stream in the per-IP network stats (1s bucket resolution).
             // From each IP's viewpoint: lost egress packets at the source,
             // lost ingress packets at the destination.
-            let lost_now = sum.lost;
             let lost_delta =
                 lost_now.saturating_sub(self.last_lost.get(&key).copied().unwrap_or(0));
             self.last_lost.insert(key, lost_now);
             if lost_delta > 0 {
                 self.reg.ipstats.observe_lost(
-                    s.flow.src.ip(),
+                    flow.src.ip(),
                     ts_us,
                     lost_delta,
                     crate::store::ipstats::Dir::Tx,
                 );
                 self.reg.ipstats.observe_lost(
-                    s.flow.dst.ip(),
+                    flow.dst.ip(),
                     ts_us,
                     lost_delta,
                     crate::store::ipstats::Dir::Rx,
                 );
             }
-            self.pending_events
-                .push(crate::store::evlog::Event::StreamSnap(
-                    crate::store::evlog::StreamSnapEvt {
-                        ts_us,
-                        call_id: s.call_id.clone(),
-                        ssrc: s.ssrc,
-                        flow: s.flow,
-                        codec: s.codec.clone(),
-                        payload_type: s.payload_type,
-                        packets: sum.packets,
-                        lost: sum.lost,
-                        expected: sum.expected,
-                        loss_pct: sum.loss_pct,
-                        jitter_ms: sum.jitter_ms,
-                        mos: sum.mos,
-                        direction: s.direction.clone(),
-                        bytes: s.bytes,
-                        first_ts_us: s.first_ts_us,
-                        last_ts_us: s.last_ts_us,
-                        rtt_min_ms: sum.rtt_min_ms,
-                        rtt_avg_ms: sum.rtt_avg_ms,
-                        rtt_max_ms: sum.rtt_max_ms,
-                        oneway_ms: sum.oneway_ms,
-                        leg: sum.leg.clone(),
-                        via_turn: sum.via_turn,
-                    },
-                ));
+            if let Some(evt) = evt {
+                self.pending_events
+                    .push(crate::store::evlog::Event::StreamSnap(evt));
+            }
+        }
+        self.reg.evict_stale(self.call_ttl_secs, ts_us);
+        self.reg.evict_if_needed();
+        self.last_lost
+            .retain(|k, _| self.reg.streams.contains_key(k));
+        self.prune_removed_bookkeeping();
+        // Drop IPs idle for more than an hour (1s buckets only retain 10 min).
+        const IPSTATS_IDLE_US: u64 = 3_600_000_000;
+        self.reg
+            .ipstats
+            .prune_idle(ts_us.saturating_sub(IPSTATS_IDLE_US));
+    }
+
+    fn prune_removed_bookkeeping(&mut self) {
+        for removed in self.reg.drain_removed() {
+            self.invite_rr.remove(&removed);
+            self.terminal_done.remove(&removed);
         }
     }
 
@@ -159,6 +183,11 @@ impl Correlator {
     #[cfg(test)]
     pub(crate) fn test_bookkeeping_lens(&self) -> (usize, usize) {
         (self.invite_rr.len(), self.terminal_done.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_last_lost_len(&self) -> usize {
+        self.last_lost.len()
     }
 
     /// Process one raw frame end-to-end.
@@ -172,7 +201,7 @@ impl Correlator {
         match decoded.l4 {
             frame::L4::Udp(payload) => self.handle_udp(frame.ts_us, decoded.flow, &payload),
             frame::L4::Tcp(payload) => {
-                for msg in self.tcp_reasm.feed(decoded.flow, &payload) {
+                for msg in self.tcp_reasm.feed(decoded.flow, &payload, frame.ts_us) {
                     if let Some(sip) =
                         sipd::parse_sip(frame.ts_us, decoded.flow, &msg, self.raw_truncate)
                     {
@@ -342,7 +371,7 @@ impl Correlator {
         }
 
         // Evlog: record the SIP message (raw optionally truncated upstream).
-        self.pending_events.push(crate::store::evlog::Event::SipMsg(
+        self.push_ev(crate::store::evlog::Event::SipMsg(
             crate::store::evlog::SipMsgEvt {
                 ts_us: ts,
                 flow: msg.flow,
@@ -556,6 +585,7 @@ impl Correlator {
         // Update call counters.
         if let Some(c) = self.reg.calls.get_mut(&call_id) {
             c.pkts_rtp += 1;
+            c.last_ts_us = ts;
         }
     }
 
@@ -603,6 +633,7 @@ impl Correlator {
                 .and_then(|s| self.reg.calls.get_mut(&s.call_id))
         {
             c.pkts_rtcp += 1;
+            c.last_ts_us = ts;
         }
         let arrival_ntp = rtcp_rtt::unix_us_to_ntp_secs(ts);
         if debug_enabled() {
@@ -675,16 +706,15 @@ impl Correlator {
             if let Some(cid) = call_id
                 && rtt.is_some()
             {
-                self.pending_events
-                    .push(crate::store::evlog::Event::RtcpRtt(
-                        crate::store::evlog::RtcpRttEvt {
-                            ts_us: ts,
-                            call_id: cid,
-                            ssrc,
-                            rtt_ms: rtt.unwrap_or(0.0),
-                            oneway_ms: oneway,
-                        },
-                    ));
+                self.push_ev(crate::store::evlog::Event::RtcpRtt(
+                    crate::store::evlog::RtcpRttEvt {
+                        ts_us: ts,
+                        call_id: cid,
+                        ssrc,
+                        rtt_ms: rtt.unwrap_or(0.0),
+                        oneway_ms: oneway,
+                    },
+                ));
             }
         }
     }
@@ -696,7 +726,7 @@ impl Correlator {
             return;
         }
         // Evlog record.
-        self.pending_events.push(crate::store::evlog::Event::Diag(
+        self.push_ev(crate::store::evlog::Event::Diag(
             crate::store::evlog::DiagEvt {
                 ts_us: d.ts_us,
                 call_id: d.call_id.clone(),
@@ -808,7 +838,7 @@ impl Correlator {
                 let code_str = hangup_code.map(|v| v.to_string()).unwrap_or_default();
                 self.reg
                     .push_event(format!("call {call_id} -> {state_label} ({code_str})"));
-                self.pending_events.push(crate::store::evlog::Event::Call(
+                self.push_ev(crate::store::evlog::Event::Call(
                     crate::store::evlog::CallEvt {
                         ts_us: evt_ts,
                         call_id: call_id.to_string(),
@@ -841,14 +871,16 @@ impl Correlator {
                 Some(CallState::Failed) | Some(CallState::Canceled) => self.reg.failed += 1,
                 _ => {}
             }
-            self.reg.evict_if_needed();
+            if !self.keep_terminated {
+                // Headless record: evlog already has the dialog; free RAM now.
+                self.reg.remove_call(call_id);
+            } else {
+                self.reg.evict_if_needed();
+            }
         }
         // Prune per-call bookkeeping for evicted calls so long-running sessions
         // stay bounded (invite_rr / terminal_done would otherwise grow forever).
-        for removed in self.reg.drain_removed() {
-            self.invite_rr.remove(&removed);
-            self.terminal_done.remove(&removed);
-        }
+        self.prune_removed_bookkeeping();
     }
 
     /// Per-leg quality decomposition for TURN-relayed calls: compare average

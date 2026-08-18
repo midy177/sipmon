@@ -217,10 +217,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::store::registry::CallSummary;
-    use crate::ui::app::{App, Page, RecordState};
+    use crate::ui::app::{App, Page, RecordState, wrap_snap};
 
     fn render_overview(privacy: bool) -> String {
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             calls: vec![CallSummary {
                 call_id: "c1".into(),
                 from_user: Some("13812345678".into()),
@@ -247,7 +247,7 @@ mod tests {
                 ips: vec!["10.10.0.8".parse().unwrap()],
             }],
             ..Snapshot::default()
-        }));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),

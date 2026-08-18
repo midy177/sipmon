@@ -28,6 +28,7 @@ pub fn user_of(value: &str) -> Option<String> {
 pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
     call.pkts_sip += 1;
     call.bytes += msg.raw.len() as u64;
+    call.last_ts_us = msg.ts_us;
     call.messages.push(msg.clone());
 
     // Populate identities from the first INVITE if not set.

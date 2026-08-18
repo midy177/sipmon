@@ -29,7 +29,8 @@ sipmon live -i any                 # live monitoring (TUI)
 sipmon live -i eth0 -f "udp port 5060"   # with a BPF filter
 sipmon record -i any -w cap.evlog --headless   # record to an event log
 sipmon record -i any -w cap.evlog -d --pidfile /run/sipmon.pid --logfile /var/log/sipmon.log
-sipmon replay -l cap.evlog         # replay a recording (TUI)
+sipmon replay cap.evlog            # replay a recording (TUI)
+sipmon stats cap.evlog             # ASR, traffic, 5-minute quality windows
 sipmon file -r capture.pcap        # offline pcap analysis
 sipmon capture.pcap                # default mode: dispatch by extension
 sipmon cap.evlog                   #   *.pcap/.pcapng → file, *.evlog → replay, *.jsonl → snapshot view
@@ -43,11 +44,12 @@ tcpdump -i eth0 -w - | sipmon -    # read a live tcpdump stream
 |---|---|
 | `(none)` | Default mode: positional `FILE` dispatched by extension (`.pcap/.pcapng` → `file`, `.evlog` → `replay`, `.jsonl` → snapshot view); no FILE starts a live capture. `--no-tui` for headless output |
 | `live` | Live capture + TUI. `-i` interface, `-f` BPF filter, `--no-media` disables RTP/RTCP analysis, `-w` also writes an event log |
-| `record` | Live capture → event log (`-w` required). Live TUI on a tty; `--headless` disables it. `-d` daemonizes, `--pidfile`/`--logfile` for daemon runs. Flushes gracefully on SIGTERM/SIGINT |
+| `record` | Live capture → event log (`-w` required). Live TUI on a tty; `--headless` disables it. `-d` daemonizes, `--pidfile`/`--logfile` for daemon runs. Flushes gracefully on SIGTERM/SIGINT. Headless/`-d` drops completed calls from RAM immediately (they are already in the evlog); live TUI keeps them for `--call-ttl-mins` |
 | `-` | Read a pcap byte stream from stdin |
 | `file` | Offline pcap/pcapng. `--rate 1x` replay speed multiplier, `--no-tui`, `--print-events` |
-| `replay` | Replay an event log (TUI / `--no-tui`) |
+| `replay` | Replay an event log (`sipmon replay FILE`; `-l/--evlog` still works). TUI / `--no-tui` |
 | `query` | No TUI; exports flow + stream stats + RTT + diagnostics for a Call-ID (script friendly) |
+| `stats` | No TUI; ASR / CCR / PDD / ACD, RTP+SIP traffic, MOS/jitter/RTT, top-IP loss, and 5-minute load/quality windows (`sipmon stats FILE`, `--json`, `--top N`) |
 | `export` | Rebuild a snapshot from an event log → JSONL, with `--from/--to` time filtering |
 
 ### Common options
@@ -55,6 +57,8 @@ tcpdump -i eth0 -w - | sipmon -    # read a live tcpdump stream
 ```
 --dry-run            In-memory analysis only, writes no files
 --max-calls N        Max calls retained in memory (default 100000)
+--call-ttl-mins N    Drop idle/terminated calls after N minutes (default 15;
+                     0 = keep until --max-calls). File/replay ignore this.
 --max-streams N      RTP stream ring cap (default 50000)
 --max-diagnostics N  Diagnostics ring cap (default 50000)
 --diag-level X       info|warn|critical (default warn)

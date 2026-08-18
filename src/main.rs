@@ -15,7 +15,7 @@ mod ui;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -36,7 +36,7 @@ use ui::app::RecordState;
 )]
 struct Cli {
     /// Default capture source: a .pcap/.pcapng file to analyze, or a .evlog to
-    /// replay. Equivalent to `sipmon file -r FILE` / `sipmon replay -l FILE`.
+    /// replay. Equivalent to `sipmon file -r FILE` / `sipmon replay FILE`.
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
 
@@ -53,6 +53,10 @@ struct Cli {
     /// Max retained calls (evict oldest terminated first)
     #[arg(long, default_value = "100000")]
     max_calls: usize,
+    /// Drop idle/terminated calls after N minutes (0 = keep until --max-calls).
+    /// Live/record default 15. File/replay ignore this and retain the capture.
+    #[arg(long, default_value = "15")]
+    call_ttl_mins: u64,
     /// Max retained RTP streams
     #[arg(long, default_value = "50000")]
     max_streams: usize,
@@ -142,8 +146,12 @@ enum Cmd {
     },
     /// Replay a sipmon event log
     Replay {
-        #[arg(short = 'l', long)]
-        evlog: String,
+        /// Event log to replay
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Alias for FILE
+        #[arg(short = 'l', long = "evlog", value_name = "FILE")]
+        evlog: Option<PathBuf>,
         #[arg(long)]
         no_tui: bool,
     },
@@ -153,6 +161,21 @@ enum Cmd {
         evlog: String,
         #[arg(short = 'c', long)]
         call_id: String,
+    },
+    /// Summarize an event log: ASR/traffic/reliability + 5-minute windows
+    Stats {
+        /// Event log to summarize
+        #[arg(value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Alias for FILE
+        #[arg(short = 'l', long = "evlog", value_name = "FILE")]
+        evlog: Option<PathBuf>,
+        /// Emit JSON instead of the text table
+        #[arg(long)]
+        json: bool,
+        /// How many IPs to rank by loss% (default 10)
+        #[arg(long, default_value_t = 10)]
+        top: usize,
     },
     /// Export an event log to JSONL
     Export {
@@ -170,7 +193,7 @@ enum Cmd {
 }
 
 struct Shared {
-    snap: Arc<Mutex<Snapshot>>,
+    snap: Arc<Mutex<Arc<Snapshot>>>,
     pause: Arc<AtomicBool>,
     focus: Arc<Mutex<Option<String>>>,
     quit: Arc<AtomicBool>,
@@ -182,7 +205,7 @@ struct Shared {
 impl Shared {
     fn new() -> Self {
         Self {
-            snap: Arc::new(Mutex::new(Snapshot::default())),
+            snap: Arc::new(Mutex::new(Arc::new(Snapshot::default()))),
             pause: Arc::new(AtomicBool::new(false)),
             focus: Arc::new(Mutex::new(None)),
             quit: Arc::new(AtomicBool::new(false)),
@@ -237,6 +260,8 @@ fn main() -> Result<()> {
             print_events,
             no_tui,
         }) => {
+            let mut cfg = cfg;
+            cfg.call_ttl_secs = 0; // offline: retain the whole capture
             let source = capture::file::FileSource::open(&read, rate)?;
             run_capture_loop(
                 Box::new(source),
@@ -270,10 +295,23 @@ fn main() -> Result<()> {
                 headless || global_no_tui,
             )
         }
-        Some(Cmd::Replay { evlog, no_tui }) => {
-            run_replay(&cfg, &evlog, want_tui(no_tui || global_no_tui))
+        Some(Cmd::Replay {
+            file,
+            evlog,
+            no_tui,
+        }) => {
+            let mut cfg = cfg;
+            cfg.call_ttl_secs = 0;
+            let path = take_evlog(file, evlog)?;
+            run_replay(&cfg, &path, want_tui(no_tui || global_no_tui))
         }
         Some(Cmd::Query { evlog, call_id }) => run_query(&evlog, &call_id),
+        Some(Cmd::Stats {
+            file,
+            evlog,
+            json,
+            top,
+        }) => run_stats(&take_evlog(file, evlog)?, json, top),
         Some(Cmd::Export {
             evlog,
             jsonl,
@@ -309,20 +347,26 @@ fn run_default_file(cfg: &Config, path: &std::path::Path, no_tui: bool) -> Resul
         .to_ascii_lowercase();
     match ext.as_str() {
         "pcap" | "pcapng" => {
+            let mut cfg = cfg.clone();
+            cfg.call_ttl_secs = 0;
             let source = capture::file::FileSource::open(&path.to_string_lossy(), None)?;
             run_capture_loop(
                 Box::new(source),
-                cfg.clone(),
+                cfg,
                 format!("file:{}", path.display()),
                 want_tui(no_tui),
                 false,
                 false,
             )
         }
-        "evlog" => run_replay(cfg, &path.to_string_lossy(), want_tui(no_tui)),
+        "evlog" => {
+            let mut cfg = cfg.clone();
+            cfg.call_ttl_secs = 0;
+            run_replay(&cfg, &path.to_string_lossy(), want_tui(no_tui))
+        }
         "jsonl" => run_jsonl_view(cfg, path, want_tui(no_tui)),
         _ => anyhow::bail!(
-            "unrecognized file type '{ext}': pass `file -r FILE` for pcap/pcapng, `replay -l FILE` for an evlog, or a .jsonl snapshot export"
+            "unrecognized file type '{ext}': pass `file -r FILE` for pcap/pcapng, `replay FILE` for an evlog, or a .jsonl snapshot export"
         ),
     }
 }
@@ -334,11 +378,19 @@ fn want_tui(explicit_no_tui: bool) -> bool {
     !explicit_no_tui && std::io::stdout().is_terminal()
 }
 
+/// `replay`/`stats` accept a positional FILE or the older `-l/--evlog` flag.
+fn take_evlog(file: Option<PathBuf>, flag: Option<PathBuf>) -> Result<String> {
+    file.or(flag)
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!("missing event log FILE (example: sipmon stats cap.evlog)"))
+}
+
 fn build_config(cli: &Cli) -> Config {
     let mut c = Config {
         raw_truncate: cli.raw_truncate,
         dry_run: cli.dry_run,
         max_calls: cli.max_calls,
+        call_ttl_secs: cli.call_ttl_mins.saturating_mul(60),
         max_streams: cli.max_streams,
         max_diagnostics: cli.max_diagnostics,
         diag_level: cli.diag_level.clone(),
@@ -359,7 +411,8 @@ fn build_config(cli: &Cli) -> Config {
 }
 
 fn run_stdin(cli: Cli, with_tui: bool) -> Result<()> {
-    let cfg = build_config(&cli);
+    let mut cfg = build_config(&cli);
+    cfg.call_ttl_secs = 0;
     let source = unsafe { capture::stdin::StdinSource::open()? };
     run_capture_loop(
         Box::new(source),
@@ -493,12 +546,17 @@ fn write_pidfile(path: &std::path::Path) -> Result<()> {
 /// Core pipeline: pull frames → correlate → publish snapshots (+ evlog).
 fn run_capture_loop(
     source: Box<dyn CaptureSource>,
-    cfg: Config,
+    mut cfg: Config,
     name: String,
     with_tui: bool,
     print_events: bool,
     quiet: bool,
 ) -> Result<()> {
+    // Headless record: the evlog already holds every SIP/stream/teardown
+    // event, so keep completed calls out of RAM.
+    if !with_tui && quiet {
+        cfg.keep_terminated = false;
+    }
     let shared = Arc::new(Shared::new());
     let evlog_path: Option<PathBuf> = if cfg.dry_run { None } else { cfg.evlog.clone() };
     if let Some(p) = &evlog_path {
@@ -587,13 +645,15 @@ fn run_capture_loop(
                 }
             }
 
-            if last_publish.elapsed() >= Duration::from_millis(100) {
-                let cur_pkts = corr.reg.pkts_total;
-                let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
-                if cur_pkts != last_pub_pkts || cur_focus != last_pub_focus {
-                    publish(&shared2, &mut corr, false);
-                    last_pub_pkts = cur_pkts;
-                    last_pub_focus = cur_focus;
+            if last_publish.elapsed() >= Duration::from_millis(if with_tui { 100 } else { 1000 }) {
+                if with_tui {
+                    let cur_pkts = corr.reg.pkts_total;
+                    let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
+                    if cur_pkts != last_pub_pkts || cur_focus != last_pub_focus {
+                        publish(&shared2, &mut corr, false);
+                        last_pub_pkts = cur_pkts;
+                        last_pub_focus = cur_focus;
+                    }
                 }
                 flush_recorder(&mut writer, &shared2.record);
                 last_publish = std::time::Instant::now();
@@ -683,7 +743,7 @@ fn publish(shared: &Shared, corr: &mut Correlator, full: bool) {
         corr.reg.snapshot(500)
     };
     if let Ok(mut s) = shared.snap.lock() {
-        *s = snap;
+        *s = Arc::new(snap);
     }
 }
 
@@ -739,11 +799,15 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
     // Restore the recording machine's UTC offset so the UI can render the
     // original local wall-clock ("当时的时间") instead of guessing at replay time.
     corr.reg.tz_offset_secs = reader.tz_offset_secs();
+    // Replay never writes an evlog; skip cloning every SIP raw into a discarded
+    // SipMsgEvt (that clone dominated CPU on multi-MB recordings).
+    corr.disable_evlog_emit();
 
     let shared2 = shared.clone();
     let handle = std::thread::spawn(move || {
         let mut corr = corr;
         let mut last_pub_focus: Option<String> = Some("\u{0}init".to_string());
+        let mut last_publish = Instant::now();
         let mut done = false;
         loop {
             if shared2.quit.load(Ordering::Relaxed) {
@@ -762,44 +826,58 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
                     // Anchor the session start on the first record so the flow's
                     // already-recorded-duration delta matches the recording.
                     corr.reg.ensure_start(ev.ts_us());
-                    if let Event::SipMsg(e) = &ev {
-                        let msg = capture::replay::evt_to_sipmsg(e);
-                        corr.ingest_sip(msg);
-                    } else if let Event::StreamSnap(e) = &ev {
-                        corr.reg.push_event(format!(
-                            "stream {} ssrc={:#x} pkts={} loss={:.1}%",
-                            e.call_id, e.ssrc, e.packets, e.loss_pct
-                        ));
-                        corr.reg.add_imported_stream(snap_evt_to_summary(e));
-                    } else if let Event::Diag(e) = &ev {
-                        corr.reg
-                            .push_event(format!("[{}] {} {}", e.severity, e.code, e.message));
-                        // Restore the diagnostic so the Call Detail pane and the
-                        // per-call Diag column show it after a replay.
-                        let severity = match e.severity {
-                            0 => Severity::Info,
-                            1 => Severity::Warn,
-                            _ => Severity::Critical,
-                        };
-                        if let Some(c) = corr.reg.calls.get_mut(&e.call_id) {
-                            match severity {
-                                Severity::Critical => c.critical_count += 1,
-                                Severity::Warn => c.warn_count += 1,
-                                Severity::Info => {}
+                    match &ev {
+                        Event::SipMsg(e) => {
+                            let msg = capture::replay::evt_to_sipmsg(e);
+                            corr.ingest_sip(msg);
+                        }
+                        Event::StreamSnap(e) => {
+                            // Event Log is a 1000-line ring: only keep snaps
+                            // that actually lost packets (the rest is noise and
+                            // format!-alloc on every 5s flush of every stream).
+                            if e.lost > 0 {
+                                corr.reg.push_event(format!(
+                                    "stream {} ssrc={:#x} pkts={} loss={:.1}%",
+                                    e.call_id, e.ssrc, e.packets, e.loss_pct
+                                ));
+                            }
+                            corr.reg.import_stream_snap(e.ts_us, snap_evt_to_summary(e));
+                        }
+                        Event::Diag(e) => {
+                            corr.reg
+                                .push_event(format!("[{}] {} {}", e.severity, e.code, e.message));
+                            // Restore the diagnostic so the Call Detail pane and the
+                            // per-call Diag column show it after a replay.
+                            let severity = match e.severity {
+                                0 => Severity::Info,
+                                1 => Severity::Warn,
+                                _ => Severity::Critical,
+                            };
+                            if let Some(c) = corr.reg.calls.get_mut(&e.call_id) {
+                                match severity {
+                                    Severity::Critical => c.critical_count += 1,
+                                    Severity::Warn => c.warn_count += 1,
+                                    Severity::Info => {}
+                                }
+                            }
+                            corr.reg.diagnostics.push_back(diagnostics::Diagnostic {
+                                ts_us: e.ts_us,
+                                call_id: e.call_id.clone(),
+                                severity,
+                                code: diagnostics::code_from_str(&e.code),
+                                message: e.message.clone(),
+                            });
+                            while corr.reg.diagnostics.len() > corr.reg.max_diagnostics {
+                                corr.reg.diagnostics.pop_front();
                             }
                         }
-                        corr.reg.diagnostics.push_back(diagnostics::Diagnostic {
-                            ts_us: e.ts_us,
-                            call_id: e.call_id.clone(),
-                            severity,
-                            code: diagnostics::code_from_str(&e.code),
-                            message: e.message.clone(),
-                        });
-                        while corr.reg.diagnostics.len() > corr.reg.max_diagnostics {
-                            corr.reg.diagnostics.pop_front();
-                        }
+                        _ => {}
                     }
-                    corr.take_events(); // replay does not re-write evlog
+                    // Keep the TUI live while ingesting a large evlog.
+                    if with_tui && last_publish.elapsed() >= Duration::from_millis(200) {
+                        publish(&shared2, &mut corr, false);
+                        last_publish = Instant::now();
+                    }
                 }
                 Ok(None) => {
                     if !done {
@@ -857,7 +935,7 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
 fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Result<()> {
     let base = export::jsonl::import_snapshot(path)?;
     let shared = Arc::new(Shared::new());
-    *shared.snap.lock().unwrap() = base.clone();
+    *shared.snap.lock().unwrap() = Arc::new(base.clone());
 
     let shared2 = shared.clone();
     let handle = std::thread::spawn(move || {
@@ -873,7 +951,7 @@ fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Resul
             if shared2.clear.swap(false, Ordering::Relaxed)
                 && let Ok(mut s) = shared2.snap.lock()
             {
-                *s = store::registry::Snapshot::default();
+                *s = Arc::new(store::registry::Snapshot::default());
             }
             let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
             if cur_focus != last_pub_focus {
@@ -914,7 +992,7 @@ fn publish_jsonl(shared: &Shared, base: &store::registry::Snapshot, focus: Optio
     let mut snap = base.clone();
     snap.focus = focus.and_then(|id| build_jsonl_focus(base, id));
     if let Ok(mut s) = shared.snap.lock() {
-        *s = snap;
+        *s = Arc::new(snap);
     }
 }
 
@@ -1015,6 +1093,25 @@ fn run_query(evlog: &str, call_id: &str) -> Result<()> {
         }
     }
     eprintln!("query: {found} sip msgs, {streams} stream snaps, {rtts} rtt samples for {call_id}");
+    Ok(())
+}
+
+// ----------------------------- stats -----------------------------
+
+fn run_stats(evlog: &str, json: bool, top: usize) -> Result<()> {
+    let t0 = Instant::now();
+    let stats = store::evstats::scan_path(evlog, top)?;
+    let elapsed = t0.elapsed();
+    if json {
+        println!("{}", stats.to_json());
+    } else {
+        print!("{}", stats.render_text());
+    }
+    eprintln!(
+        "stats: {} events in {:.2}s",
+        stats.events.total(),
+        elapsed.as_secs_f64()
+    );
     Ok(())
 }
 

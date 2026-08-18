@@ -77,7 +77,7 @@ fn default_positional_pcap_mode() {
 
 #[test]
 fn default_positional_evlog_replays() {
-    // `sipmon <file.evlog>` without a subcommand is equivalent to `replay -l`.
+    // `sipmon <file.evlog>` without a subcommand is equivalent to `replay FILE`.
     let dir = tempfile::tempdir().unwrap();
     let evlog = dir.path().join("t.evlog");
     let mut cmd = bin();
@@ -146,9 +146,53 @@ fn evlog_roundtrip_and_query() {
         "expected periodic stream snapshots, got {streams}"
     );
 
+    // stats: positional FILE (and -l still works)
+    let s = bin().args(["stats"]).arg(&evlog).output().unwrap();
+    assert!(
+        s.status.success(),
+        "stats failed: {}",
+        String::from_utf8_lossy(&s.stderr)
+    );
+    let sout = String::from_utf8_lossy(&s.stdout);
+    assert!(sout.contains("Calls"), "stats must list dialogs: {sout}");
+    assert!(
+        sout.contains("Reliability") && sout.contains("ASR"),
+        "stats must report ASR: {sout}"
+    );
+    assert!(
+        sout.contains("Traffic"),
+        "stats must report traffic: {sout}"
+    );
+    assert!(
+        sout.contains("5-minute windows"),
+        "stats must list 5-minute windows: {sout}"
+    );
+    let s_flag = bin().args(["stats", "-l"]).arg(&evlog).output().unwrap();
+    assert!(
+        s_flag.status.success(),
+        "-l/--evlog alias must still work: {}",
+        String::from_utf8_lossy(&s_flag.stderr)
+    );
+    let sj = bin()
+        .args(["stats"])
+        .arg(&evlog)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(sj.status.success());
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&sj.stdout)).unwrap();
+    assert!(v["calls"]["unique"].as_u64().unwrap_or(0) >= 1);
+    assert!(v["reliability"]["seizures"].as_u64().unwrap_or(0) >= 1);
+    assert!(
+        v["windows"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    );
+
     // replay reproduces the same terminal state
     let r = bin()
-        .args(["replay", "-l"])
+        .args(["replay"])
         .arg(&evlog)
         .arg("--no-tui")
         .output()

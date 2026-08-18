@@ -1294,7 +1294,7 @@ mod tests {
 
     use crate::model::packet::{Flow5Tuple, Proto};
     use crate::store::registry::{Focus, Snapshot};
-    use crate::ui::app::{Page, RecordState};
+    use crate::ui::app::{Page, RecordState, wrap_snap};
 
     /// The Network tab's media table must fit inside the right pane at typical
     /// widths without the header wrapping onto a second line. Regression test
@@ -1347,10 +1347,10 @@ mod tests {
             ],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1407,10 +1407,10 @@ mod tests {
             }],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1444,10 +1444,10 @@ mod tests {
             end_ts: Some(11_010_000),
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1553,10 +1553,10 @@ mod tests {
             }],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1816,10 +1816,10 @@ mod tests {
             }),
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1878,10 +1878,10 @@ mod tests {
             }),
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),

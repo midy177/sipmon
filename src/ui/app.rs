@@ -9,6 +9,15 @@ use ratatui::widgets::TableState;
 use crate::model::sip::CallState;
 use crate::store::registry::{CallSummary, Snapshot};
 
+/// Shared snapshot cell: the pipeline publishes a new `Arc` so the TUI can
+/// cheaply clone the pointer every frame instead of cloning the whole tree.
+pub type SnapLock = Arc<Mutex<Arc<Snapshot>>>;
+
+#[cfg(test)]
+pub fn wrap_snap(s: Snapshot) -> SnapLock {
+    Arc::new(Mutex::new(Arc::new(s)))
+}
+
 /// Overview call-list filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallFilter {
@@ -135,7 +144,7 @@ pub struct RecordState {
 }
 
 pub struct App {
-    pub snap: Arc<Mutex<Snapshot>>,
+    pub snap: SnapLock,
     pub pause: Arc<AtomicBool>,
     pub focus_id: Arc<Mutex<Option<String>>>,
     pub clear: Arc<AtomicBool>,
@@ -184,7 +193,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        snap: Arc<Mutex<Snapshot>>,
+        snap: SnapLock,
         pause: Arc<AtomicBool>,
         focus: Arc<Mutex<Option<String>>>,
         clear: Arc<AtomicBool>,
@@ -225,8 +234,11 @@ impl App {
         }
     }
 
-    pub fn snapshot(&self) -> Snapshot {
-        self.snap.lock().map(|s| s.clone()).unwrap_or_default()
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.snap
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| Arc::new(Snapshot::default()))
     }
 
     pub fn set_status(&mut self, s: impl Into<String>) {
@@ -237,7 +249,8 @@ impl App {
     pub fn poll(&mut self, timeout: Duration) -> bool {
         if event::poll(timeout).unwrap_or(false)
             && let Ok(Event::Key(key)) = event::read()
-            && key.kind == KeyEventKind::Press
+            && (key.kind == KeyEventKind::Press
+                || (key.kind == KeyEventKind::Repeat && is_nav_key(key.code)))
         {
             self.on_key(key.code, key.modifiers);
         }
@@ -430,14 +443,25 @@ impl App {
 
     fn page_key(&mut self, code: KeyCode) {
         let snap = self.snapshot();
+        let overview_n = self.filtered_calls(&snap).len();
+        let search_n = search_results(&snap, &self.search_query).len();
+        let flow_n = snap.focus.as_ref().map(|f| f.messages.len()).unwrap_or(0);
         match self.page {
             Page::Overview => match code {
                 KeyCode::Down => {
-                    self.table_state.select_next();
+                    table_nudge(&mut self.table_state, 1, overview_n);
                     self.sync_overview_selection(&snap);
                 }
                 KeyCode::Up => {
-                    self.table_state.select_previous();
+                    table_nudge(&mut self.table_state, -1, overview_n);
+                    self.sync_overview_selection(&snap);
+                }
+                KeyCode::PageDown => {
+                    table_nudge(&mut self.table_state, PAGE_ROWS, overview_n);
+                    self.sync_overview_selection(&snap);
+                }
+                KeyCode::PageUp => {
+                    table_nudge(&mut self.table_state, -PAGE_ROWS, overview_n);
                     self.sync_overview_selection(&snap);
                 }
                 KeyCode::Enter => {
@@ -457,8 +481,10 @@ impl App {
                 _ => {}
             },
             Page::Search => match code {
-                KeyCode::Down => self.search_state.select_next(),
-                KeyCode::Up => self.search_state.select_previous(),
+                KeyCode::Down => table_nudge(&mut self.search_state, 1, search_n),
+                KeyCode::Up => table_nudge(&mut self.search_state, -1, search_n),
+                KeyCode::PageDown => table_nudge(&mut self.search_state, PAGE_ROWS, search_n),
+                KeyCode::PageUp => table_nudge(&mut self.search_state, -PAGE_ROWS, search_n),
                 KeyCode::Enter => {
                     let results = search_results(&snap, &self.search_query);
                     let idx = self
@@ -474,26 +500,50 @@ impl App {
                 _ => {}
             },
             Page::CallDetail => match code {
-                KeyCode::Down => self.flow_state.select_next(),
-                KeyCode::Up => self.flow_state.select_previous(),
-                KeyCode::PageDown => self.raw_scroll = self.raw_scroll.saturating_add(1),
-                KeyCode::PageUp => self.raw_scroll = self.raw_scroll.saturating_sub(1),
+                KeyCode::Down => table_nudge(&mut self.flow_state, 1, flow_n),
+                KeyCode::Up => table_nudge(&mut self.flow_state, -1, flow_n),
+                KeyCode::PageDown => {
+                    self.raw_scroll = self.raw_scroll.saturating_add(PAGE_ROWS as usize);
+                }
+                KeyCode::PageUp => {
+                    self.raw_scroll = self.raw_scroll.saturating_sub(PAGE_ROWS as usize);
+                }
                 _ => {}
             },
             Page::Streams => match code {
-                KeyCode::Down => self.streams_state.select_next(),
-                KeyCode::Up => self.streams_state.select_previous(),
+                KeyCode::Down => table_nudge(&mut self.streams_state, 1, snap.streams.len()),
+                KeyCode::Up => table_nudge(&mut self.streams_state, -1, snap.streams.len()),
+                KeyCode::PageDown => {
+                    table_nudge(&mut self.streams_state, PAGE_ROWS, snap.streams.len())
+                }
+                KeyCode::PageUp => {
+                    table_nudge(&mut self.streams_state, -PAGE_ROWS, snap.streams.len())
+                }
                 _ => {}
             },
             Page::EventLog => match code {
                 KeyCode::Down => self.eventlog_scroll = self.eventlog_scroll.saturating_add(1),
                 KeyCode::Up => self.eventlog_scroll = self.eventlog_scroll.saturating_sub(1),
+                KeyCode::PageDown => {
+                    self.eventlog_scroll = self.eventlog_scroll.saturating_add(PAGE_ROWS as u16);
+                }
+                KeyCode::PageUp => {
+                    self.eventlog_scroll = self.eventlog_scroll.saturating_sub(PAGE_ROWS as u16);
+                }
                 _ => {}
             },
             Page::IpStats => self.ip_key(code, &snap),
             Page::Heatmap => match code {
                 KeyCode::Char('s') => self.next_ip_sort(),
                 KeyCode::Char('w') => self.cycle_ip_window(),
+                KeyCode::Down => table_nudge(&mut self.ip_table_state, 1, snap.ip_stats.len()),
+                KeyCode::Up => table_nudge(&mut self.ip_table_state, -1, snap.ip_stats.len()),
+                KeyCode::PageDown => {
+                    table_nudge(&mut self.ip_table_state, PAGE_ROWS, snap.ip_stats.len())
+                }
+                KeyCode::PageUp => {
+                    table_nudge(&mut self.ip_table_state, -PAGE_ROWS, snap.ip_stats.len())
+                }
                 _ => {}
             },
         }
@@ -509,9 +559,20 @@ impl App {
     fn ip_key(&mut self, code: KeyCode, snap: &Snapshot) {
         if self.ip_drill.is_some() {
             // Drill-down: navigate the selected IP's calls, Enter opens one.
+            let calls_len = crate::ui::ipstats::calls_for_ip(snap, self.ip_drill).len();
             match code {
-                KeyCode::Down => self.ip_drill_state.select_next(),
-                KeyCode::Up => self.ip_drill_state.select_previous(),
+                KeyCode::Down => {
+                    table_nudge(&mut self.ip_drill_state, 1, calls_len);
+                }
+                KeyCode::Up => {
+                    table_nudge(&mut self.ip_drill_state, -1, calls_len);
+                }
+                KeyCode::PageDown => {
+                    table_nudge(&mut self.ip_drill_state, PAGE_ROWS, calls_len);
+                }
+                KeyCode::PageUp => {
+                    table_nudge(&mut self.ip_drill_state, -PAGE_ROWS, calls_len);
+                }
                 KeyCode::Enter => {
                     let calls = crate::ui::ipstats::calls_for_ip(snap, self.ip_drill);
                     let idx = self
@@ -528,12 +589,19 @@ impl App {
             }
             return;
         }
+        let n = snap.ip_stats.len();
         match code {
             KeyCode::Down => {
-                self.ip_table_state.select_next();
+                table_nudge(&mut self.ip_table_state, 1, n);
             }
             KeyCode::Up => {
-                self.ip_table_state.select_previous();
+                table_nudge(&mut self.ip_table_state, -1, n);
+            }
+            KeyCode::PageDown => {
+                table_nudge(&mut self.ip_table_state, PAGE_ROWS, n);
+            }
+            KeyCode::PageUp => {
+                table_nudge(&mut self.ip_table_state, -PAGE_ROWS, n);
             }
             KeyCode::Enter => {
                 let rows = crate::ui::ipstats::ordered_rows(snap, self);
@@ -570,6 +638,41 @@ impl App {
     }
 }
 
+/// Rows jumped by PageUp / PageDown on tables and the event log.
+const PAGE_ROWS: i32 = 10;
+
+fn is_nav_key(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Home
+            | KeyCode::End
+    )
+}
+
+fn table_nudge(state: &mut TableState, delta: i32, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let max = (len - 1) as i32;
+    // No selection yet: Down/PageDown start before row 0 so the first Down
+    // lands on 0 (matching TableState::select_next). Up/PageUp stay at 0.
+    let cur = match state.selected() {
+        Some(i) => i as i32,
+        None if delta > 0 => -1,
+        None => 0,
+    };
+    let next = (cur + delta).clamp(0, max) as usize;
+    state.select(Some(next));
+}
+
 /// sngrep-style search: Call-ID / From / To / remote IP / SSRC substring.
 pub fn search_results<'a>(
     snap: &'a Snapshot,
@@ -603,7 +706,7 @@ mod tests {
 
     fn app() -> App {
         App::new(
-            Arc::new(Mutex::new(Snapshot::default())),
+            wrap_snap(Snapshot::default()),
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             Arc::new(AtomicBool::new(false)),
@@ -698,5 +801,28 @@ mod tests {
             !top.contains("REC"),
             "indicator must be hidden when idle: {top:?}"
         );
+    }
+
+    #[test]
+    fn page_up_down_scrolls_lists() {
+        let mut a = app();
+        // Event log: PageDown used to be a no-op.
+        a.page = Page::EventLog;
+        a.on_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(a.eventlog_scroll, PAGE_ROWS as u16);
+        a.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(a.eventlog_scroll, 0);
+
+        // Call Detail raw pane: jump a page of lines, not one.
+        a.page = Page::CallDetail;
+        a.on_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(a.raw_scroll, PAGE_ROWS as usize);
+        a.on_key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(a.raw_scroll, 0);
+
+        // IP Stats: PageDown selects a row (empty list stays unselected).
+        a.page = Page::IpStats;
+        a.on_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(a.ip_table_state.selected(), None);
     }
 }

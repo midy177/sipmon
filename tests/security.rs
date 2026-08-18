@@ -194,6 +194,8 @@ fn nonexistent_inputs_clean_errors() {
         vec!["file", "-r", "/nonexistent/nope.pcap", "--no-tui"],
         vec!["query", "-l", "/nonexistent/nope.evlog", "-c", "x"],
         vec!["replay", "-l", "/nonexistent/nope.evlog", "--no-tui"],
+        vec!["replay", "/nonexistent/nope.evlog", "--no-tui"],
+        vec!["stats", "/nonexistent/nope.evlog"],
     ] {
         let mut c = bin();
         for a in &args {

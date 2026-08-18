@@ -182,13 +182,13 @@ fn record_indicator(record: &RecordState) -> Option<Span<'static>> {
 /// Page-specific key hints shown on the top bar's third line.
 fn page_keys(page: Page) -> &'static str {
     match page {
-        Page::Overview => "[↑↓] select [Enter] open call detail",
-        Page::Search => "[↑↓] select [Enter] open call detail [/] new query",
+        Page::Overview => "[↑↓/PgUp/PgDn] select [Enter] open call detail",
+        Page::Search => "[↑↓/PgUp/PgDn] select [Enter] open call detail [/] new query",
         Page::CallDetail => "[↑↓] select msg [PgUp/PgDn] scroll raw [←/Esc] back to list",
-        Page::Heatmap => "[s] sort [w] loss window",
-        Page::Streams => "[↑↓] select stream",
-        Page::EventLog => "[↑↓] scroll",
-        Page::IpStats => "[↑↓] select [Enter] calls [s] sort [w] window [c] loss-only",
+        Page::Heatmap => "[↑↓/PgUp/PgDn] scroll [s] sort [w] loss window",
+        Page::Streams => "[↑↓/PgUp/PgDn] select stream",
+        Page::EventLog => "[↑↓/PgUp/PgDn] scroll",
+        Page::IpStats => "[↑↓/PgUp/PgDn] select [Enter] calls [s] sort [w] window [c] loss-only",
     }
 }
 
