@@ -25,7 +25,7 @@ analysis results (JSONL).
 ## Quick start
 
 ```sh
-sipmon live -i any                 # live monitoring (TUI)
+sipmon live -i any                 # live monitoring (TUI); quit prints a stats report
 sipmon live -i eth0 -f "udp port 5060"   # with a BPF filter
 sipmon record -i any -w cap.evlog --headless   # record to an event log
 sipmon record -i any -w cap.evlog -d --pidfile /run/sipmon.pid --logfile /var/log/sipmon.log
@@ -43,7 +43,7 @@ tcpdump -i eth0 -w - | sipmon -    # read a live tcpdump stream
 | Command | Description |
 |---|---|
 | `(none)` | Default mode: positional `FILE` dispatched by extension (`.pcap/.pcapng` → `file`, `.evlog` → `replay`, `.jsonl` → snapshot view); no FILE starts a live capture. `--no-tui` for headless output |
-| `live` | Live capture + TUI. `-i` interface, `-f` BPF filter, `--no-media` disables RTP/RTCP analysis, `-w` also writes an event log |
+| `live` | Live capture + TUI. `-i` interface, `-f` BPF filter, `--no-media` disables RTP/RTCP analysis, `-w` also writes an event log. On quit, prints the same ASR/traffic/5-minute report as `stats` (from in-memory events, not the TTL-trimmed call table) |
 | `record` | Live capture → event log (`-w` required). Live TUI on a tty; `--headless` disables it. `-d` daemonizes, `--pidfile`/`--logfile` for daemon runs. Flushes gracefully on SIGTERM/SIGINT. Headless/`-d` drops completed calls from RAM immediately (they are already in the evlog); live TUI keeps them for `--call-ttl-mins` |
 | `-` | Read a pcap byte stream from stdin |
 | `file` | Offline pcap/pcapng. `--rate 1x` replay speed multiplier, `--no-tui`, `--print-events` |

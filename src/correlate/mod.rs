@@ -5,7 +5,6 @@ pub mod turn;
 use std::collections::HashMap;
 
 use crate::analyze::rtcp_rtt;
-use crate::capture::RawFrame;
 use crate::config::Config;
 use crate::decode::{frame, rtcp as rtcpc, rtp as rtpp, sdp, sip as sipd, stun};
 use crate::diagnostics::{Diagnostic, Severity, rules};
@@ -38,6 +37,9 @@ pub struct Correlator {
     keep_terminated: bool,
     /// Idle/terminated call TTL in seconds (0 = disabled).
     call_ttl_secs: u64,
+    /// Live-session stats (same report as `sipmon stats`), fed from correlator
+    /// events so TTL eviction does not drop the summary.
+    session_stats: Option<crate::store::evstats::StatsAcc>,
 }
 
 fn debug_enabled() -> bool {
@@ -66,6 +68,7 @@ impl Correlator {
             emit_evlog: true,
             keep_terminated: config.keep_terminated,
             call_ttl_secs: config.call_ttl_secs,
+            session_stats: None,
         }
     }
 
@@ -83,6 +86,9 @@ impl Correlator {
         self.pending_events.clear();
         self.last_flush_us = None;
         self.turn.clear();
+        if self.session_stats.is_some() {
+            self.session_stats = Some(crate::store::evstats::StatsAcc::new());
+        }
     }
 
     /// Drain buffered evlog events (consumed by the pipeline's writer thread).
@@ -96,7 +102,20 @@ impl Correlator {
         self.emit_evlog = false;
     }
 
+    /// Accumulate the same report `sipmon stats` produces, from in-memory
+    /// correlator events (used on live exit).
+    pub fn enable_session_stats(&mut self) {
+        self.session_stats = Some(crate::store::evstats::StatsAcc::new());
+    }
+
+    pub fn take_session_stats(&mut self) -> Option<crate::store::evstats::StatsAcc> {
+        self.session_stats.take()
+    }
+
     fn push_ev(&mut self, ev: crate::store::evlog::Event) {
+        if let Some(s) = &mut self.session_stats {
+            s.ingest(&ev);
+        }
         if self.emit_evlog {
             self.pending_events.push(ev);
         }
@@ -121,7 +140,7 @@ impl Correlator {
         self.tcp_reasm
             .prune(ts_us, crate::decode::tcp_reasm::IDLE_US);
         let keep_history = self.keep_terminated;
-        let emit_evlog = self.emit_evlog;
+        let emit_snap = self.emit_evlog || self.session_stats.is_some();
         let keys: Vec<StreamKey> = self.reg.streams.keys().copied().collect();
         for key in keys {
             let Some((flow, lost_now, evt)) = self.reg.streams.get_mut(&key).map(|s| {
@@ -129,7 +148,7 @@ impl Correlator {
                     s.sample(ts_us);
                 }
                 let lost_now = s.snapshot_stats().lost_packets;
-                let evt = emit_evlog.then(|| s.to_snap_evt(ts_us));
+                let evt = emit_snap.then(|| s.to_snap_evt(ts_us));
                 (s.flow, lost_now, evt)
             }) else {
                 continue;
@@ -156,8 +175,7 @@ impl Correlator {
                 );
             }
             if let Some(evt) = evt {
-                self.pending_events
-                    .push(crate::store::evlog::Event::StreamSnap(evt));
+                self.push_ev(crate::store::evlog::Event::StreamSnap(evt));
             }
         }
         self.reg.evict_stale(self.call_ttl_secs, ts_us);
@@ -191,29 +209,48 @@ impl Correlator {
     }
 
     /// Process one raw frame end-to-end.
-    pub fn ingest_frame(&mut self, frame: RawFrame) {
+    ///
+    /// `data` is borrowed from the capture ring and must not be retained.
+    pub fn ingest_frame(&mut self, ts_us: u64, linktype: u32, data: &[u8]) {
         self.reg.pkts_total += 1;
-        self.reg.touch_time(frame.ts_us);
+        self.reg.touch_time(ts_us);
 
-        let Some(decoded) = frame::decode(frame.linktype, &frame.data) else {
+        let Some(decoded) = frame::decode(linktype, data) else {
             return;
         };
         match decoded.l4 {
-            frame::L4::Udp(payload) => self.handle_udp(frame.ts_us, decoded.flow, &payload),
+            frame::L4::Udp(payload) => self.handle_udp(ts_us, decoded.flow, payload),
             frame::L4::Tcp(payload) => {
-                for msg in self.tcp_reasm.feed(decoded.flow, &payload, frame.ts_us) {
-                    if let Some(sip) =
-                        sipd::parse_sip(frame.ts_us, decoded.flow, &msg, self.raw_truncate)
+                for msg in self.tcp_reasm.feed(decoded.flow, payload, ts_us) {
+                    if let Some(sip) = sipd::parse_sip(ts_us, decoded.flow, &msg, self.raw_truncate)
                     {
                         self.ingest_sip(sip);
                     }
                 }
             }
-            frame::L4::Other => {}
         }
     }
 
     fn handle_udp(&mut self, ts: u64, flow: Flow5Tuple, payload: &[u8]) {
+        // RTP/RTCP first: SIP never has version-bits `10`, and this is the
+        // overwhelming majority of packets on a live VoIP capture.
+        if !self.no_media {
+            match rtpp::classify(payload) {
+                rtpp::MediaKind::Rtp => {
+                    if let Some(h) = rtpp::parse_rtp_header(payload) {
+                        self.ingest_rtp(ts, flow, h, payload.len(), Encap::Direct);
+                    }
+                    return;
+                }
+                rtpp::MediaKind::Rtcp => {
+                    for m in rtcpc::parse_all(payload) {
+                        self.ingest_rtcp(ts, flow, &m);
+                    }
+                    return;
+                }
+                rtpp::MediaKind::Other => {}
+            }
+        }
         if sipd::looks_like_sip(payload) {
             if let Some(msg) = sipd::parse_sip(ts, flow, payload, self.raw_truncate) {
                 self.ingest_sip(msg);
@@ -223,33 +260,18 @@ impl Correlator {
         if self.no_media {
             return;
         }
-        match rtpp::classify(payload) {
-            rtpp::MediaKind::Rtp => {
-                if let Some(h) = rtpp::parse_rtp_header(payload) {
-                    self.ingest_rtp(ts, flow, h, payload.len(), Encap::Direct);
-                }
+        if stun::is_stun(payload) {
+            let (diags, media) = self.turn.ingest(ts, &flow, payload);
+            for d in diags {
+                self.add_diagnostic(d);
             }
-            rtpp::MediaKind::Rtcp => {
-                for m in rtcpc::parse_all(payload) {
-                    self.ingest_rtcp(ts, flow, &m);
-                }
+            for m in media {
+                self.dispatch_media(ts, flow, &m, Encap::SendIndication);
             }
-            rtpp::MediaKind::Other => {
-                if stun::is_stun(payload) {
-                    let (diags, media) = self.turn.ingest(ts, &flow, payload);
-                    for d in diags {
-                        self.add_diagnostic(d);
-                    }
-                    for m in media {
-                        // Send/Data indication carrying media.
-                        self.dispatch_media(ts, flow, &m, Encap::SendIndication);
-                    }
-                } else if stun::is_channel_data(payload)
-                    && let Some(inner) = stun::channel_data_payload(payload)
-                {
-                    self.dispatch_media(ts, flow, inner, Encap::ChannelData);
-                }
-            }
+        } else if stun::is_channel_data(payload)
+            && let Some(inner) = stun::channel_data_payload(payload)
+        {
+            self.dispatch_media(ts, flow, inner, Encap::ChannelData);
         }
     }
 
@@ -419,14 +441,13 @@ impl Correlator {
         len: usize,
         encap: Encap,
     ) {
-        // Per-IP network stats: attribute every packet to both endpoint IPs —
-        // egress from the source, ingress to the destination.
-        self.reg
-            .ipstats
-            .observe_packet(flow.src.ip(), ts, len, crate::store::ipstats::Dir::Tx);
-        self.reg
-            .ipstats
-            .observe_packet(flow.dst.ip(), ts, len, crate::store::ipstats::Dir::Rx);
+        let key = StreamKey {
+            flow,
+            ssrc: header.ssrc,
+        };
+        if self.observe_existing_rtp(ts, flow, header, len, key) {
+            return;
+        }
         // Resolve call via SDP endpoints (two O(1) lookups).
         let Some(call_id) = self
             .reg
@@ -447,126 +468,101 @@ impl Correlator {
             );
         }
 
-        let key = StreamKey {
-            flow,
-            ssrc: header.ssrc,
-        };
-        let is_new = !self.reg.streams.contains_key(&key);
-        // Reverse-direction check via the per-call index (O(streams in call)).
+        self.reg
+            .ipstats
+            .observe_packet(flow.src.ip(), ts, len, crate::store::ipstats::Dir::Tx);
+        self.reg
+            .ipstats
+            .observe_packet(flow.dst.ip(), ts, len, crate::store::ipstats::Dir::Rx);
+
         let reverse_flow = flow.reverse();
         let reverse_exists = self
             .reg
             .stream_index
             .get(&call_id)
             .is_some_and(|keys| keys.iter().any(|k| k.flow == reverse_flow));
-
-        // TURN relay classification for this media leg.
         let leg = self.turn.leg_of(&flow);
-
-        // Negotiated media is only needed for new streams (creation-time
-        // diagnostics + codec resolution); skip the clone on the hot path.
-        let neg_for_new = if is_new {
-            self.reg.calls.get(&call_id).map(|c| c.negotiated.clone())
-        } else {
-            None
-        };
+        let neg_for_new = self.reg.calls.get(&call_id).map(|c| c.negotiated.clone());
 
         let mut diags: Vec<Diagnostic> = Vec::new();
         {
             let stream = self.reg.streams.entry(key).or_insert_with(|| {
                 crate::correlate::stream::RtpStream::new(flow, header.ssrc, call_id.clone())
             });
-            let prev_pt = stream.last_pt;
-            if is_new {
-                if let Some(neg) = &neg_for_new {
-                    // Resolve codec name from the negotiated set for this PT.
-                    stream.codec = neg
-                        .pts
-                        .iter()
-                        .position(|p| *p == header.payload_type)
-                        .and_then(|i| neg.codecs.get(i).cloned());
-                }
-                // TURN relay labeling (once per stream).
-                if let Some(l) = leg {
-                    stream.via_turn = true;
-                    stream.leg = Some(l);
-                }
-                if encap != Encap::Direct {
-                    stream.via_turn = true;
-                }
+            if let Some(neg) = &neg_for_new {
+                stream.codec = neg
+                    .pts
+                    .iter()
+                    .position(|p| *p == header.payload_type)
+                    .and_then(|i| neg.codecs.get(i).cloned());
+            }
+            if let Some(l) = leg {
+                stream.via_turn = true;
+                stream.leg = Some(l);
+            }
+            if encap != Encap::Direct {
+                stream.via_turn = true;
             }
             stream.observe(ts, header, len);
             if reverse_exists {
                 stream.reverse_seen = true;
             }
+        }
+
+        self.reg.note_stream(&call_id, key);
+        if let Some(c) = self.reg.calls.get_mut(&call_id) {
+            for ip in [flow.src.ip(), flow.dst.ip()] {
+                if !c.ips.contains(&ip) {
+                    c.ips.push(ip);
+                }
+            }
+        }
+        if let Some(neg) = &neg_for_new {
             if let Some(d) =
-                rules::check_pt_change(ts, &call_id, header.ssrc, header.payload_type, prev_pt)
+                rules::check_rtp_pt(ts, &call_id, header.ssrc, header.payload_type, neg)
             {
                 diags.push(d);
             }
+            if let Some(d) = rules::check_rtp_flow(ts, &call_id, &flow, neg) {
+                diags.push(d);
+            }
         }
-
-        if is_new {
-            // New stream: register in indices and run creation-time diagnostics.
-            self.reg.note_stream(&call_id, key);
-            // Remember this stream's endpoint IPs on the owning call (used by
-            // the per-IP network-stats drill-down).
-            if let Some(c) = self.reg.calls.get_mut(&call_id) {
-                for ip in [flow.src.ip(), flow.dst.ip()] {
-                    if !c.ips.contains(&ip) {
-                        c.ips.push(ip);
-                    }
-                }
-            }
-            if let Some(neg) = &neg_for_new {
-                if let Some(d) =
-                    rules::check_rtp_pt(ts, &call_id, header.ssrc, header.payload_type, neg)
-                {
-                    diags.push(d);
-                }
-                if let Some(d) = rules::check_rtp_flow(ts, &call_id, &flow, neg) {
-                    diags.push(d);
-                }
-            }
-            // TURN media diagnostics (call-scoped, once per stream).
-            if encap == Encap::ChannelData {
-                diags.push(Diagnostic {
-                    ts_us: ts,
-                    call_id: call_id.clone(),
-                    severity: Severity::Info,
-                    code: crate::diagnostics::TURN_CHANNEL_MEDIA,
-                    message: format!(
-                        "RTP ssrc={:#x} carried in TURN ChannelData on {}",
-                        header.ssrc, flow
-                    ),
-                });
-            } else if encap == Encap::SendIndication {
-                diags.push(Diagnostic {
-                    ts_us: ts,
-                    call_id: call_id.clone(),
-                    severity: Severity::Info,
-                    code: crate::diagnostics::TURN_SEND_IND_MEDIA,
-                    message: format!(
-                        "RTP ssrc={:#x} carried in TURN Send/Data indication on {}",
-                        header.ssrc, flow
-                    ),
-                });
-            }
-            if let Some(l) = leg {
-                diags.push(Diagnostic {
-                    ts_us: ts,
-                    call_id: call_id.clone(),
-                    severity: Severity::Info,
-                    code: crate::diagnostics::TURN_RELAY_MEDIA,
-                    message: format!("media relayed via TURN ({}-leg) on {}", l.label(), flow),
-                });
-            }
-            // Mark the owning call as TURN-relayed.
-            if (leg.is_some() || encap != Encap::Direct)
-                && let Some(c) = self.reg.calls.get_mut(&call_id)
-            {
-                c.via_turn = true;
-            }
+        if encap == Encap::ChannelData {
+            diags.push(Diagnostic {
+                ts_us: ts,
+                call_id: call_id.clone(),
+                severity: Severity::Info,
+                code: crate::diagnostics::TURN_CHANNEL_MEDIA,
+                message: format!(
+                    "RTP ssrc={:#x} carried in TURN ChannelData on {}",
+                    header.ssrc, flow
+                ),
+            });
+        } else if encap == Encap::SendIndication {
+            diags.push(Diagnostic {
+                ts_us: ts,
+                call_id: call_id.clone(),
+                severity: Severity::Info,
+                code: crate::diagnostics::TURN_SEND_IND_MEDIA,
+                message: format!(
+                    "RTP ssrc={:#x} carried in TURN Send/Data indication on {}",
+                    header.ssrc, flow
+                ),
+            });
+        }
+        if let Some(l) = leg {
+            diags.push(Diagnostic {
+                ts_us: ts,
+                call_id: call_id.clone(),
+                severity: Severity::Info,
+                code: crate::diagnostics::TURN_RELAY_MEDIA,
+                message: format!("media relayed via TURN ({}-leg) on {}", l.label(), flow),
+            });
+        }
+        if (leg.is_some() || encap != Encap::Direct)
+            && let Some(c) = self.reg.calls.get_mut(&call_id)
+        {
+            c.via_turn = true;
         }
 
         for d in diags {
@@ -582,11 +578,53 @@ impl Correlator {
             rs.reverse_seen = true;
         }
 
-        // Update call counters.
         if let Some(c) = self.reg.calls.get_mut(&call_id) {
             c.pkts_rtp += 1;
             c.last_ts_us = ts;
         }
+    }
+
+    /// Hot path for an already-tracked RTP stream: no Call-ID clone, no
+    /// endpoint lookup, no stream creation. Returns false if `key` is unknown.
+    fn observe_existing_rtp(
+        &mut self,
+        ts: u64,
+        flow: Flow5Tuple,
+        header: rtpp::RtpHeader,
+        len: usize,
+        key: StreamKey,
+    ) -> bool {
+        let pt_diag = {
+            let streams = &mut self.reg.streams;
+            let calls = &mut self.reg.calls;
+            let ipstats = &mut self.reg.ipstats;
+            let Some(stream) = streams.get_mut(&key) else {
+                return false;
+            };
+            let prev_pt = stream.last_pt;
+            stream.observe(ts, header, len);
+            if let Some(c) = calls.get_mut(&stream.call_id) {
+                c.pkts_rtp += 1;
+                c.last_ts_us = ts;
+            }
+            ipstats.observe_packet(flow.src.ip(), ts, len, crate::store::ipstats::Dir::Tx);
+            ipstats.observe_packet(flow.dst.ip(), ts, len, crate::store::ipstats::Dir::Rx);
+            if prev_pt.is_some_and(|p| p != header.payload_type) {
+                rules::check_pt_change(
+                    ts,
+                    &stream.call_id,
+                    header.ssrc,
+                    header.payload_type,
+                    prev_pt,
+                )
+            } else {
+                None
+            }
+        };
+        if let Some(d) = pt_diag {
+            self.add_diagnostic(d);
+        }
+        true
     }
 
     /// One-way media detection, invoked at call teardown.

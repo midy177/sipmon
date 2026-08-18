@@ -252,6 +252,7 @@ fn main() -> Result<()> {
                 want_tui(false),
                 false,
                 false,
+                true,
             )
         }
         Some(Cmd::File {
@@ -269,6 +270,7 @@ fn main() -> Result<()> {
                 format!("file:{read}"),
                 want_tui(no_tui || global_no_tui),
                 print_events,
+                false,
                 false,
             )
         }
@@ -332,6 +334,7 @@ fn main() -> Result<()> {
                 want_tui(false),
                 false,
                 false,
+                true,
             )
         }
     }
@@ -355,6 +358,7 @@ fn run_default_file(cfg: &Config, path: &std::path::Path, no_tui: bool) -> Resul
                 cfg,
                 format!("file:{}", path.display()),
                 want_tui(no_tui),
+                false,
                 false,
                 false,
             )
@@ -421,6 +425,7 @@ fn run_stdin(cli: Cli, with_tui: bool) -> Result<()> {
         with_tui,
         false,
         false,
+        false,
     )
 }
 
@@ -457,6 +462,7 @@ fn run_record(
         want_tui(explicit_headless),
         false,
         true,
+        false,
     )
 }
 
@@ -551,6 +557,7 @@ fn run_capture_loop(
     with_tui: bool,
     print_events: bool,
     quiet: bool,
+    print_stats: bool,
 ) -> Result<()> {
     // Headless record: the evlog already holds every SIP/stream/teardown
     // event, so keep completed calls out of RAM.
@@ -567,7 +574,10 @@ fn run_capture_loop(
         shared.record.active.store(true, Ordering::Relaxed);
     }
 
-    let corr = Correlator::new(&cfg, name.clone());
+    let mut corr = Correlator::new(&cfg, name.clone());
+    if print_stats {
+        corr.enable_session_stats();
+    }
     let writer = match &evlog_path {
         Some(p) => Some(EvlogWriter::create(p)?),
         None => None,
@@ -603,7 +613,11 @@ fn run_capture_loop(
                 corr.clear();
                 publish(&shared2, &mut corr, false);
             }
-            let Some(frame) = source.next_frame() else {
+            let mut ts = 0u64;
+            if !source.next_frame(&mut |frame_ts, linktype, data| {
+                ts = frame_ts;
+                corr.ingest_frame(frame_ts, linktype, data);
+            }) {
                 if !exhausted {
                     // Source EOF: final flush + full-fidelity publish so the
                     // UI/export sees the complete capture.
@@ -630,9 +644,7 @@ fn run_capture_loop(
                     continue;
                 }
                 break;
-            };
-            let ts = frame.ts_us;
-            corr.ingest_frame(frame);
+            }
             corr.maybe_periodic_flush(ts);
 
             // Drain evlog events.
@@ -669,28 +681,32 @@ fn run_capture_loop(
         // Final publish: full fidelity (all calls + all streams) for
         // headless output and exports.
         publish(&shared2, &mut corr, true);
+        corr.take_session_stats()
     });
 
-    if with_tui {
+    let session_stats = if with_tui {
         run_tui(shared.clone(), &cfg.local_ips)?;
         shared.quit.store(true, Ordering::Relaxed);
         handle
             .join()
-            .map_err(|_| anyhow::anyhow!("pipeline thread panicked"))?;
+            .map_err(|_| anyhow::anyhow!("pipeline thread panicked"))?
     } else {
         handle
             .join()
-            .map_err(|_| anyhow::anyhow!("pipeline thread panicked"))?;
-        // Headless: print final per-call JSON lines (unless quiet, e.g. record).
-        if !quiet {
-            let snap = shared.snap.lock().unwrap().clone();
-            for c in &snap.calls {
-                println!(
-                    "{}",
-                    serde_json::json!({"kind": "call", "call_id": c.call_id, "state": c.state.label(), "pdd_ms": c.pdd_ms, "setup_ms": c.setup_ms, "warn": c.warn_count, "crit": c.critical_count})
-                );
-            }
+            .map_err(|_| anyhow::anyhow!("pipeline thread panicked"))?
+    };
+    // Headless: print final per-call JSON lines (unless quiet, e.g. record).
+    if !with_tui && !quiet && !print_stats {
+        let snap = shared.snap.lock().unwrap().clone();
+        for c in &snap.calls {
+            println!(
+                "{}",
+                serde_json::json!({"kind": "call", "call_id": c.call_id, "state": c.state.label(), "pdd_ms": c.pdd_ms, "setup_ms": c.setup_ms, "warn": c.warn_count, "crit": c.critical_count})
+            );
         }
+    }
+    if print_stats && let Some(acc) = session_stats {
+        print!("{}", acc.finish(name, 0, None, 10).render_text());
     }
 
     final_exports(&cfg, &shared)?;

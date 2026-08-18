@@ -100,19 +100,20 @@ impl MediaStatsAccumulator {
         let Some(last) = self.last_sequence else {
             return;
         };
-        let expired: Vec<u16> = self
-            .pending_missing
-            .iter()
-            .copied()
-            .filter(|s| {
-                let age = last.wrapping_sub(*s);
-                age > RTP_REORDER_WINDOW && age < 0x8000
-            })
-            .collect();
-        self.lost_packets += expired.len() as u64;
-        for s in expired {
-            self.pending_missing.remove(&s);
+        if self.pending_missing.is_empty() {
+            return;
         }
+        let mut expired = 0u64;
+        self.pending_missing.retain(|s| {
+            let age = last.wrapping_sub(*s);
+            if age > RTP_REORDER_WINDOW && age < 0x8000 {
+                expired += 1;
+                false
+            } else {
+                true
+            }
+        });
+        self.lost_packets += expired;
     }
 
     fn observe_jitter(&mut self, arrival_us: u64, rtp_ts: u32, clock_rate: u32) {

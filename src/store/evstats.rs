@@ -200,6 +200,317 @@ struct StreamQuality {
     rtt_ms: Option<f64>,
 }
 
+/// Incremental `sipmon stats` accumulator. Fed either by scanning an evlog
+/// or by the live correlator (so a TUI session can print the same report on
+/// exit without re-reading a file).
+#[derive(Default)]
+pub struct StatsAcc {
+    events: EventCounts,
+    call_ids: HashSet<String>,
+    seizure_ids: HashSet<String>,
+    calls: CallCounts,
+    last_snap: HashMap<(String, StreamId), StreamSnapState>,
+    last_quality: HashMap<(String, StreamId), StreamQuality>,
+    windows: BTreeMap<u64, WindowAcc>,
+    ip_loss: HashMap<IpAddr, Counters>,
+    all: Counters,
+    sip_bytes: u64,
+    sip_class: [u64; 7],
+    hangup: HashMap<u32, u64>,
+    pdd_samples: Vec<u32>,
+    setup_sum: f64,
+    setup_n: u64,
+    talk_sum: f64,
+    talk_n: u64,
+    call_dur_sum: f64,
+    call_dur_n: u64,
+    answered: u64,
+    rtt_sum: f64,
+    rtt_n: u64,
+    start_ts_us: Option<u64>,
+    end_ts_us: Option<u64>,
+}
+
+impl StatsAcc {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn ingest(&mut self, ev: &Event) {
+        let ts = ev.ts_us();
+        if self.start_ts_us.is_none() {
+            self.start_ts_us = Some(ts);
+        }
+        self.end_ts_us = Some(ts);
+        let win = ts / WINDOW_US * WINDOW_US;
+        match ev {
+            Event::SipMsg(e) => {
+                self.events.sip += 1;
+                self.call_ids.insert(e.call_id.clone());
+                self.sip_bytes += e.raw.len() as u64;
+                let w = self.windows.entry(win).or_default();
+                w.calls.insert(e.call_id.clone());
+                w.sip_msgs += 1;
+                w.sip_bytes += e.raw.len() as u64;
+                if e.is_request {
+                    match e
+                        .method
+                        .as_deref()
+                        .map(|m| m.to_ascii_uppercase())
+                        .as_deref()
+                    {
+                        Some("INVITE") => {
+                            self.calls.invite += 1;
+                            self.seizure_ids.insert(e.call_id.clone());
+                            w.invites.insert(e.call_id.clone());
+                        }
+                        Some("BYE") => self.calls.bye += 1,
+                        Some("CANCEL") => self.calls.cancel += 1,
+                        _ => {}
+                    }
+                } else if let Some(status) = e.status {
+                    let class = (status / 100) as usize;
+                    if (1..=6).contains(&class) {
+                        self.sip_class[class] += 1;
+                    }
+                }
+            }
+            Event::Txn(_) => self.events.txn += 1,
+            Event::Call(e) => {
+                self.events.call += 1;
+                self.call_ids.insert(e.call_id.clone());
+                if !matches!(e.kind, CallEvtKind::Teardown) {
+                    return;
+                }
+                let w = self.windows.entry(win).or_default();
+                w.teardowns += 1;
+                w.calls.insert(e.call_id.clone());
+                match e.state {
+                    3 => self.calls.completed += 1,
+                    4 => self.calls.failed += 1,
+                    5 => self.calls.canceled += 1,
+                    _ => {}
+                }
+                if e.answer_ts.is_some() {
+                    self.answered += 1;
+                    w.answered += 1;
+                }
+                if let Some(p) = e.pdd_ms {
+                    self.pdd_samples.push(p);
+                }
+                if let Some(s) = e.setup_ms {
+                    self.setup_sum += s as f64;
+                    self.setup_n += 1;
+                }
+                if let (Some(a), Some(end)) = (e.answer_ts, e.end_ts.or(e.bye_ts))
+                    && end >= a
+                {
+                    self.talk_sum += (end - a) as f64 / 1000.0;
+                    self.talk_n += 1;
+                }
+                if let (Some(inv), Some(end)) = (e.invite_ts, e.end_ts.or(e.bye_ts))
+                    && end >= inv
+                {
+                    self.call_dur_sum += (end - inv) as f64 / 1000.0;
+                    self.call_dur_n += 1;
+                }
+                if let Some(code) = e.hangup_code {
+                    *self.hangup.entry(code).or_default() += 1;
+                }
+            }
+            Event::StreamSnap(e) => {
+                self.events.stream_snap += 1;
+                self.call_ids.insert(e.call_id.clone());
+                let sid = StreamId {
+                    ssrc: e.ssrc,
+                    flow: e.flow,
+                };
+                let key = (e.call_id.clone(), sid);
+                let prev = self
+                    .last_snap
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(StreamSnapState {
+                        packets: 0,
+                        lost: 0,
+                        bytes: 0,
+                    });
+                let pkts = e.packets.saturating_sub(prev.packets);
+                let lost = e.lost.saturating_sub(prev.lost);
+                let bytes_d = e.bytes.saturating_sub(prev.bytes);
+                self.last_snap.insert(
+                    key.clone(),
+                    StreamSnapState {
+                        packets: e.packets,
+                        lost: e.lost,
+                        bytes: e.bytes,
+                    },
+                );
+                self.last_quality.insert(
+                    key,
+                    StreamQuality {
+                        packets: e.packets,
+                        mos: e.mos,
+                        jitter_ms: e.jitter_ms,
+                        rtt_ms: e.rtt_avg_ms,
+                    },
+                );
+                let w = self.windows.entry(win).or_default();
+                w.loss.add(pkts, lost, bytes_d);
+                w.calls.insert(e.call_id.clone());
+                w.streams.insert((e.call_id.clone(), e.ssrc));
+                self.all.add(pkts, lost, bytes_d);
+                if pkts > 0 || lost > 0 || bytes_d > 0 {
+                    self.ip_loss
+                        .entry(e.flow.src.ip())
+                        .or_default()
+                        .add(pkts, lost, bytes_d);
+                    self.ip_loss
+                        .entry(e.flow.dst.ip())
+                        .or_default()
+                        .add(pkts, lost, bytes_d);
+                }
+            }
+            Event::RtcpRtt(e) => {
+                self.events.rtcp_rtt += 1;
+                self.rtt_sum += e.rtt_ms;
+                self.rtt_n += 1;
+                let w = self.windows.entry(win).or_default();
+                w.rtt_sum += e.rtt_ms;
+                w.rtt_n += 1;
+            }
+            Event::HealthBucket(_) => self.events.health += 1,
+            Event::Error(_) => self.events.error += 1,
+            Event::Diag(_) => self.events.diag += 1,
+        }
+    }
+
+    /// Seal the accumulator into the printable/JSON report.
+    pub fn finish(
+        mut self,
+        file: String,
+        bytes: u64,
+        tz_offset_secs: Option<i32>,
+        top_ips: usize,
+    ) -> EvlogStats {
+        self.calls.unique = self.call_ids.len();
+        let seizures = self.seizure_ids.len() as u64;
+        let rate = |n: u64| {
+            if seizures == 0 {
+                None
+            } else {
+                Some(n as f64 / seizures as f64 * 100.0)
+            }
+        };
+
+        self.pdd_samples.sort_unstable();
+        let reliability = Reliability {
+            seizures,
+            answered: self.answered,
+            asr_pct: rate(self.answered),
+            ccr_pct: rate(self.calls.completed),
+            fail_pct: rate(self.calls.failed),
+            cancel_pct: rate(self.calls.canceled),
+            avg_pdd_ms: mean_u32(&self.pdd_samples),
+            p50_pdd_ms: percentile(&self.pdd_samples, 0.50),
+            p95_pdd_ms: percentile(&self.pdd_samples, 0.95),
+            avg_setup_ms: mean_f64(self.setup_sum, self.setup_n),
+            avg_talk_ms: mean_f64(self.talk_sum, self.talk_n),
+            avg_call_ms: mean_f64(self.call_dur_sum, self.call_dur_n),
+            hangup_codes: top_codes(self.hangup, 10),
+        };
+
+        let span_us = match (self.start_ts_us, self.end_ts_us) {
+            (Some(a), Some(b)) if b > a => b - a,
+            _ => 0,
+        };
+        let span_s = (span_us as f64 / 1_000_000.0).max(1e-9);
+
+        let (mos_sum, mos_w, jit_sum, jit_w, snap_rtt_sum, snap_rtt_w) =
+            quality_weighted(&self.last_quality);
+        let avg_rtt_ms =
+            mean_f64(self.rtt_sum, self.rtt_n).or_else(|| mean_f64(snap_rtt_sum, snap_rtt_w));
+        let traffic = Traffic {
+            rtp_pkts: self.all.pkts,
+            rtp_lost: self.all.lost,
+            rtp_bytes: self.all.bytes,
+            sip_msgs: self.events.sip,
+            sip_bytes: self.sip_bytes,
+            loss_pct: self.all.loss_pct(),
+            avg_bps: (self.all.bytes > 0).then_some(self.all.bytes as f64 * 8.0 / span_s),
+            avg_rtp_pps: (self.all.pkts > 0).then_some(self.all.pkts as f64 / span_s),
+            avg_cps: (seizures > 0).then_some(seizures as f64 / span_s),
+            avg_mos: mean_f64(mos_sum, mos_w),
+            avg_jitter_ms: mean_f64(jit_sum, jit_w),
+            avg_rtt_ms,
+            rtt_samples: self.rtt_n,
+            sip_class: self.sip_class,
+        };
+
+        let windows: Vec<LossWindow> = self
+            .windows
+            .into_iter()
+            .map(|(start_ts_us, w)| {
+                let asr_pct = if w.teardowns == 0 {
+                    None
+                } else {
+                    Some(w.answered as f64 / w.teardowns as f64 * 100.0)
+                };
+                LossWindow {
+                    start_ts_us,
+                    calls: w.calls.len(),
+                    streams: w.streams.len(),
+                    invites: w.invites.len(),
+                    teardowns: w.teardowns,
+                    answered: w.answered,
+                    asr_pct,
+                    pkts: w.loss.pkts,
+                    lost: w.loss.lost,
+                    rtp_bytes: w.loss.bytes,
+                    sip_msgs: w.sip_msgs,
+                    loss_pct: w.loss.loss_pct(),
+                    avg_rtt_ms: mean_f64(w.rtt_sum, w.rtt_n),
+                }
+            })
+            .collect();
+
+        let mut top_list: Vec<IpLoss> = self
+            .ip_loss
+            .into_iter()
+            .map(|(ip, c)| IpLoss {
+                ip,
+                pkts: c.pkts,
+                lost: c.lost,
+                bytes: c.bytes,
+                loss_pct: c.loss_pct(),
+            })
+            .collect();
+        top_list.sort_by(|a, b| {
+            b.loss_pct
+                .unwrap_or(0.0)
+                .partial_cmp(&a.loss_pct.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.lost.cmp(&a.lost))
+        });
+        top_list.truncate(top_ips);
+
+        EvlogStats {
+            file,
+            bytes,
+            tz_offset_secs,
+            start_ts_us: self.start_ts_us,
+            end_ts_us: self.end_ts_us,
+            events: self.events,
+            calls: self.calls,
+            reliability,
+            traffic,
+            loss: self.all,
+            windows,
+            top_ips: top_list,
+        }
+    }
+}
+
 /// Scan `path` once and build the report. `top_ips` caps the IP ranking.
 pub fn scan_path(path: impl AsRef<Path>, top_ips: usize) -> Result<EvlogStats> {
     let path = path.as_ref();
@@ -215,288 +526,11 @@ pub fn scan(
     top_ips: usize,
 ) -> Result<EvlogStats> {
     let tz = reader.tz_offset_secs();
-    let mut events = EventCounts::default();
-    let mut call_ids: HashSet<String> = HashSet::new();
-    let mut seizure_ids: HashSet<String> = HashSet::new();
-    let mut calls = CallCounts::default();
-    let mut last_snap: HashMap<(String, StreamId), StreamSnapState> = HashMap::new();
-    let mut last_quality: HashMap<(String, StreamId), StreamQuality> = HashMap::new();
-    let mut windows: BTreeMap<u64, WindowAcc> = BTreeMap::new();
-    let mut ip_loss: HashMap<IpAddr, Counters> = HashMap::new();
-    let mut all = Counters::default();
-    let mut sip_bytes = 0u64;
-    let mut sip_class = [0u64; 7];
-    let mut hangup: HashMap<u32, u64> = HashMap::new();
-    let mut pdd_samples: Vec<u32> = Vec::new();
-    let mut setup_sum = 0.0f64;
-    let mut setup_n = 0u64;
-    let mut talk_sum = 0.0f64;
-    let mut talk_n = 0u64;
-    let mut call_dur_sum = 0.0f64;
-    let mut call_dur_n = 0u64;
-    let mut answered = 0u64;
-    let mut rtt_sum = 0.0f64;
-    let mut rtt_n = 0u64;
-    let mut start_ts_us = None;
-    let mut end_ts_us = None;
-
+    let mut acc = StatsAcc::new();
     while let Some(ev) = reader.next_event()? {
-        let ts = ev.ts_us();
-        if start_ts_us.is_none() {
-            start_ts_us = Some(ts);
-        }
-        end_ts_us = Some(ts);
-        let win = ts / WINDOW_US * WINDOW_US;
-        match ev {
-            Event::SipMsg(e) => {
-                events.sip += 1;
-                call_ids.insert(e.call_id.clone());
-                sip_bytes += e.raw.len() as u64;
-                let w = windows.entry(win).or_default();
-                w.calls.insert(e.call_id.clone());
-                w.sip_msgs += 1;
-                w.sip_bytes += e.raw.len() as u64;
-                if e.is_request {
-                    match e
-                        .method
-                        .as_deref()
-                        .map(|m| m.to_ascii_uppercase())
-                        .as_deref()
-                    {
-                        Some("INVITE") => {
-                            calls.invite += 1;
-                            seizure_ids.insert(e.call_id.clone());
-                            w.invites.insert(e.call_id.clone());
-                        }
-                        Some("BYE") => calls.bye += 1,
-                        Some("CANCEL") => calls.cancel += 1,
-                        _ => {}
-                    }
-                } else if let Some(status) = e.status {
-                    let class = (status / 100) as usize;
-                    if (1..=6).contains(&class) {
-                        sip_class[class] += 1;
-                    }
-                }
-            }
-            Event::Txn(_) => events.txn += 1,
-            Event::Call(e) => {
-                events.call += 1;
-                call_ids.insert(e.call_id.clone());
-                if !matches!(e.kind, CallEvtKind::Teardown) {
-                    continue;
-                }
-                let w = windows.entry(win).or_default();
-                w.teardowns += 1;
-                w.calls.insert(e.call_id.clone());
-                match e.state {
-                    3 => calls.completed += 1,
-                    4 => calls.failed += 1,
-                    5 => calls.canceled += 1,
-                    _ => {}
-                }
-                if e.answer_ts.is_some() {
-                    answered += 1;
-                    w.answered += 1;
-                }
-                if let Some(p) = e.pdd_ms {
-                    pdd_samples.push(p);
-                }
-                if let Some(s) = e.setup_ms {
-                    setup_sum += s as f64;
-                    setup_n += 1;
-                }
-                if let (Some(a), Some(end)) = (e.answer_ts, e.end_ts.or(e.bye_ts))
-                    && end >= a
-                {
-                    talk_sum += (end - a) as f64 / 1000.0;
-                    talk_n += 1;
-                }
-                if let (Some(inv), Some(end)) = (e.invite_ts, e.end_ts.or(e.bye_ts))
-                    && end >= inv
-                {
-                    call_dur_sum += (end - inv) as f64 / 1000.0;
-                    call_dur_n += 1;
-                }
-                if let Some(code) = e.hangup_code {
-                    *hangup.entry(code).or_default() += 1;
-                }
-            }
-            Event::StreamSnap(e) => {
-                events.stream_snap += 1;
-                call_ids.insert(e.call_id.clone());
-                let sid = StreamId {
-                    ssrc: e.ssrc,
-                    flow: e.flow,
-                };
-                let key = (e.call_id.clone(), sid);
-                let prev = last_snap.get(&key).copied().unwrap_or(StreamSnapState {
-                    packets: 0,
-                    lost: 0,
-                    bytes: 0,
-                });
-                let pkts = e.packets.saturating_sub(prev.packets);
-                let lost = e.lost.saturating_sub(prev.lost);
-                let bytes_d = e.bytes.saturating_sub(prev.bytes);
-                last_snap.insert(
-                    key.clone(),
-                    StreamSnapState {
-                        packets: e.packets,
-                        lost: e.lost,
-                        bytes: e.bytes,
-                    },
-                );
-                last_quality.insert(
-                    key,
-                    StreamQuality {
-                        packets: e.packets,
-                        mos: e.mos,
-                        jitter_ms: e.jitter_ms,
-                        rtt_ms: e.rtt_avg_ms,
-                    },
-                );
-                let w = windows.entry(win).or_default();
-                w.loss.add(pkts, lost, bytes_d);
-                w.calls.insert(e.call_id.clone());
-                w.streams.insert((e.call_id, e.ssrc));
-                all.add(pkts, lost, bytes_d);
-                if pkts > 0 || lost > 0 || bytes_d > 0 {
-                    ip_loss
-                        .entry(e.flow.src.ip())
-                        .or_default()
-                        .add(pkts, lost, bytes_d);
-                    ip_loss
-                        .entry(e.flow.dst.ip())
-                        .or_default()
-                        .add(pkts, lost, bytes_d);
-                }
-            }
-            Event::RtcpRtt(e) => {
-                events.rtcp_rtt += 1;
-                rtt_sum += e.rtt_ms;
-                rtt_n += 1;
-                let w = windows.entry(win).or_default();
-                w.rtt_sum += e.rtt_ms;
-                w.rtt_n += 1;
-            }
-            Event::HealthBucket(_) => events.health += 1,
-            Event::Error(_) => events.error += 1,
-            Event::Diag(_) => events.diag += 1,
-        }
+        acc.ingest(&ev);
     }
-
-    calls.unique = call_ids.len();
-    let seizures = seizure_ids.len() as u64;
-    let rate = |n: u64| {
-        if seizures == 0 {
-            None
-        } else {
-            Some(n as f64 / seizures as f64 * 100.0)
-        }
-    };
-
-    pdd_samples.sort_unstable();
-    let reliability = Reliability {
-        seizures,
-        answered,
-        asr_pct: rate(answered),
-        ccr_pct: rate(calls.completed),
-        fail_pct: rate(calls.failed),
-        cancel_pct: rate(calls.canceled),
-        avg_pdd_ms: mean_u32(&pdd_samples),
-        p50_pdd_ms: percentile(&pdd_samples, 0.50),
-        p95_pdd_ms: percentile(&pdd_samples, 0.95),
-        avg_setup_ms: mean_f64(setup_sum, setup_n),
-        avg_talk_ms: mean_f64(talk_sum, talk_n),
-        avg_call_ms: mean_f64(call_dur_sum, call_dur_n),
-        hangup_codes: top_codes(hangup, 10),
-    };
-
-    let span_us = match (start_ts_us, end_ts_us) {
-        (Some(a), Some(b)) if b > a => b - a,
-        _ => 0,
-    };
-    let span_s = (span_us as f64 / 1_000_000.0).max(1e-9);
-
-    let (mos_sum, mos_w, jit_sum, jit_w, snap_rtt_sum, snap_rtt_w) =
-        quality_weighted(&last_quality);
-    let avg_rtt_ms = mean_f64(rtt_sum, rtt_n).or_else(|| mean_f64(snap_rtt_sum, snap_rtt_w));
-    let traffic = Traffic {
-        rtp_pkts: all.pkts,
-        rtp_lost: all.lost,
-        rtp_bytes: all.bytes,
-        sip_msgs: events.sip,
-        sip_bytes,
-        loss_pct: all.loss_pct(),
-        avg_bps: (all.bytes > 0).then_some(all.bytes as f64 * 8.0 / span_s),
-        avg_rtp_pps: (all.pkts > 0).then_some(all.pkts as f64 / span_s),
-        avg_cps: (seizures > 0).then_some(seizures as f64 / span_s),
-        avg_mos: mean_f64(mos_sum, mos_w),
-        avg_jitter_ms: mean_f64(jit_sum, jit_w),
-        avg_rtt_ms,
-        rtt_samples: rtt_n,
-        sip_class,
-    };
-
-    let windows: Vec<LossWindow> = windows
-        .into_iter()
-        .map(|(start_ts_us, w)| {
-            let asr_pct = if w.teardowns == 0 {
-                None
-            } else {
-                Some(w.answered as f64 / w.teardowns as f64 * 100.0)
-            };
-            LossWindow {
-                start_ts_us,
-                calls: w.calls.len(),
-                streams: w.streams.len(),
-                invites: w.invites.len(),
-                teardowns: w.teardowns,
-                answered: w.answered,
-                asr_pct,
-                pkts: w.loss.pkts,
-                lost: w.loss.lost,
-                rtp_bytes: w.loss.bytes,
-                sip_msgs: w.sip_msgs,
-                loss_pct: w.loss.loss_pct(),
-                avg_rtt_ms: mean_f64(w.rtt_sum, w.rtt_n),
-            }
-        })
-        .collect();
-
-    let mut top_list: Vec<IpLoss> = ip_loss
-        .into_iter()
-        .map(|(ip, c)| IpLoss {
-            ip,
-            pkts: c.pkts,
-            lost: c.lost,
-            bytes: c.bytes,
-            loss_pct: c.loss_pct(),
-        })
-        .collect();
-    top_list.sort_by(|a, b| {
-        b.loss_pct
-            .unwrap_or(0.0)
-            .partial_cmp(&a.loss_pct.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.lost.cmp(&a.lost))
-    });
-    top_list.truncate(top_ips);
-
-    Ok(EvlogStats {
-        file,
-        bytes,
-        tz_offset_secs: tz,
-        start_ts_us,
-        end_ts_us,
-        events,
-        calls,
-        reliability,
-        traffic,
-        loss: all,
-        windows,
-        top_ips: top_list,
-    })
+    Ok(acc.finish(file, bytes, tz, top_ips))
 }
 
 fn quality_weighted(
@@ -667,7 +701,14 @@ impl EvlogStats {
             _ => "empty".into(),
         };
         out.push_str(&format!("== {} ==\n", self.file));
-        out.push_str(&format!("  size      {}\n", fmt_bytes(self.bytes)));
+        out.push_str(&format!(
+            "  size      {}\n",
+            if self.bytes == 0 {
+                "in-memory".to_string()
+            } else {
+                fmt_bytes(self.bytes)
+            }
+        ));
         out.push_str(&format!("  span      {span}\n"));
         out.push_str(&format!(
             "  events    {}  (sip {}  stream-snap {}  call {}  diag {}  rtt {})\n",

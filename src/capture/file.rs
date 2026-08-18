@@ -1,9 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bytes::Bytes;
-
-use super::{CaptureSource, RawFrame};
+use super::{CaptureSource, pcap_ts_us};
 
 /// Offline capture from a pcap/pcapng file (libpcap handles both).
 pub struct FileSource {
@@ -37,19 +35,18 @@ impl CaptureSource for FileSource {
         self.stop = Some(stop);
     }
 
-    fn next_frame(&mut self) -> Option<RawFrame> {
+    fn next_frame(&mut self, f: &mut dyn FnMut(u64, u32, &[u8])) -> bool {
         loop {
             if self
                 .stop
                 .as_ref()
                 .is_some_and(|s| s.load(Ordering::Relaxed))
             {
-                return None;
+                return false;
             }
             match self.cap.next_packet() {
                 Ok(pkt) => {
-                    let header = pkt.header;
-                    let ts_us = header.ts.tv_sec as u64 * 1_000_000 + header.ts.tv_usec as u64;
+                    let ts_us = pcap_ts_us(pkt.header);
 
                     // Optional real-time pacing for offline replay.
                     if let Some(speed) = self.speed {
@@ -78,23 +75,20 @@ impl CaptureSource for FileSource {
                                     }
                                 };
                                 if !ok {
-                                    return None;
+                                    return false;
                                 }
                             }
                         }
                     }
 
-                    return Some(RawFrame {
-                        ts_us,
-                        linktype: self.linktype,
-                        data: Bytes::copy_from_slice(pkt.data),
-                    });
+                    f(ts_us, self.linktype, pkt.data);
+                    return true;
                 }
-                Err(pcap::Error::NoMorePackets) => return None,
+                Err(pcap::Error::NoMorePackets) => return false,
                 Err(pcap::Error::TimeoutExpired) => continue,
                 Err(e) => {
                     tracing::warn!(error = %e, "file capture error, stopping");
-                    return None;
+                    return false;
                 }
             }
         }
