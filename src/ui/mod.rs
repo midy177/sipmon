@@ -184,7 +184,9 @@ fn page_keys(page: Page) -> &'static str {
     match page {
         Page::Overview => "[↑↓/PgUp/PgDn] select [Enter] open call detail",
         Page::Search => "[↑↓/PgUp/PgDn] select [Enter] open call detail [/] new query",
-        Page::CallDetail => "[↑↓] select msg [PgUp/PgDn] scroll raw [←/Esc] back to list",
+        Page::CallDetail => {
+            "[↑↓] msg  [l] link b-leg  [L] unlink  [PgUp/PgDn] raw  [←/Esc] back"
+        }
         Page::Heatmap => "[↑↓/PgUp/PgDn] scroll [s] sort [w] loss window",
         Page::Streams => "[↑↓/PgUp/PgDn] select stream",
         Page::EventLog => "[↑↓/PgUp/PgDn] scroll",

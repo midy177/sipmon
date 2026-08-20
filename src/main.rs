@@ -25,7 +25,7 @@ use config::{Bucket, Config};
 use correlate::Correlator;
 use diagnostics::Severity;
 use store::evlog::{Event, EvlogReader, EvlogWriter, decode_payload, parse_stream_summary};
-use store::registry::Snapshot;
+use store::registry::{FocusHint, Snapshot};
 use ui::app::RecordState;
 
 #[derive(Parser)]
@@ -195,7 +195,7 @@ enum Cmd {
 struct Shared {
     snap: Arc<Mutex<Arc<Snapshot>>>,
     pause: Arc<AtomicBool>,
-    focus: Arc<Mutex<Option<String>>>,
+    focus: Arc<Mutex<Option<FocusHint>>>,
     quit: Arc<AtomicBool>,
     clear: Arc<AtomicBool>,
     /// Live event-log recording state for the TUI top-bar indicator.
@@ -595,7 +595,7 @@ fn run_capture_loop(
         source.set_stop(shared2.quit.clone());
         // Idle-skip bookkeeping: republish only when traffic or focus changed.
         let mut last_pub_pkts = u64::MAX;
-        let mut last_pub_focus: Option<String> = Some("\u{0}init".to_string());
+        let mut last_pub_focus: Option<FocusHint> = Some(FocusHint::primary("\u{0}init"));
         let mut exhausted = false;
         loop {
             if quit_sig_raised() {
@@ -854,7 +854,7 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
     let shared2 = shared.clone();
     let handle = std::thread::spawn(move || {
         let mut corr = corr;
-        let mut last_pub_focus: Option<String> = Some("\u{0}init".to_string());
+        let mut last_pub_focus: Option<FocusHint> = Some(FocusHint::primary("\u{0}init"));
         let mut last_publish = Instant::now();
         let mut done = false;
         loop {
@@ -942,7 +942,7 @@ fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Resul
 
     let shared2 = shared.clone();
     let handle = std::thread::spawn(move || {
-        let mut last_pub_focus: Option<String> = Some("\u{0}init".to_string());
+        let mut last_pub_focus: Option<FocusHint> = Some(FocusHint::primary("\u{0}init"));
         loop {
             if shared2.quit.load(Ordering::Relaxed) {
                 break;
@@ -958,7 +958,7 @@ fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Resul
             }
             let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
             if cur_focus != last_pub_focus {
-                publish_jsonl(&shared2, &base, cur_focus.as_deref());
+                publish_jsonl(&shared2, &base, cur_focus.as_ref());
                 last_pub_focus = cur_focus;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -991,9 +991,9 @@ fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Resul
 /// Rebuild the published snapshot for a jsonl view, filling in the focused
 /// call's detail (streams/messages are not present in the export, so the detail
 /// is limited to its diagnostics).
-fn publish_jsonl(shared: &Shared, base: &store::registry::Snapshot, focus: Option<&str>) {
+fn publish_jsonl(shared: &Shared, base: &store::registry::Snapshot, focus: Option<&FocusHint>) {
     let mut snap = base.clone();
-    snap.focus = focus.and_then(|id| build_jsonl_focus(base, id));
+    snap.focus = focus.and_then(|h| build_jsonl_focus(base, &h.primary));
     if let Ok(mut s) = shared.snap.lock() {
         *s = Arc::new(snap);
     }

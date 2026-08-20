@@ -5,6 +5,29 @@ use crate::model::media::StreamSummary;
 use crate::model::sip::{B2buaInfo, Call, CallState, HangupBy, Method, Outcome, SipMsg};
 use crate::store::ipstats::{Dir, IpStats, IpStatsStore};
 
+/// UI focus request: primary Call-ID plus an optional linked b-leg Call-ID.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FocusHint {
+    pub primary: String,
+    pub linked: Option<String>,
+}
+
+impl FocusHint {
+    pub fn primary(id: impl Into<String>) -> Self {
+        Self {
+            primary: id.into(),
+            linked: None,
+        }
+    }
+
+    pub fn with_linked(primary: impl Into<String>, linked: impl Into<String>) -> Self {
+        Self {
+            primary: primary.into(),
+            linked: Some(linked.into()),
+        }
+    }
+}
+
 /// Focused-call detail payload for the Call Detail page.
 #[derive(Debug, Clone, Default)]
 pub struct Focus {
@@ -183,8 +206,9 @@ pub struct Registry {
     pub diagnostics: VecDeque<Diagnostic>,
     /// Heatmap aggregation buckets.
     pub heatmap: crate::store::heatmap::Heatmap,
-    /// UI focus hint: call id whose detail should be included in snapshots.
-    pub focus_hint: Option<String>,
+    /// UI focus hint: primary (+ optional linked b-leg) whose detail is included
+    /// in snapshots.
+    pub focus_hint: Option<FocusHint>,
     /// Call-ids removed by eviction since the last drain (lets the correlator
     /// prune its own per-call maps like `invite_rr` / `terminal_done`, keeping
     /// long-running sessions bounded).
@@ -414,8 +438,10 @@ impl Registry {
             .calls
             .iter()
             .filter(|(id, c)| {
-                if focus.as_deref() == Some(id.as_str()) {
-                    return false;
+                if let Some(h) = &focus {
+                    if h.primary == **id || h.linked.as_deref() == Some(id.as_str()) {
+                        return false;
+                    }
                 }
                 let terminal = matches!(
                     c.state,
@@ -709,18 +735,28 @@ impl Registry {
             focus: self
                 .focus_hint
                 .as_ref()
-                .and_then(|id| self.focus_detail(id)),
+                .and_then(|h| self.focus_detail(h)),
             paused: false,
         }
     }
 
     /// Build the focus payload for the Call Detail page.
-    fn focus_detail(&self, call_id: &str) -> Option<Focus> {
-        let call = self.calls.get(call_id)?;
-        let msgs = if call.messages.len() > 1000 {
-            call.messages[call.messages.len() - 1000..].to_vec()
+    fn focus_detail(&self, hint: &FocusHint) -> Option<Focus> {
+        let call = self.calls.get(&hint.primary)?;
+        let primary_msgs = trim_msgs(&call.messages);
+        // Linked b-leg (different Call-ID): merge chronologically and force
+        // legs 0/1 so the swimlane can draw a 3-column A|mid|B view. Linked
+        // overrides same-Call-ID dual-dialog classification.
+        let (msgs, legs, leg_count) = if let Some(linked_id) = hint.linked.as_deref() {
+            let linked_msgs = self
+                .calls
+                .get(linked_id)
+                .map(|c| trim_msgs(&c.messages))
+                .unwrap_or_default();
+            merge_leg_msgs(primary_msgs, linked_msgs)
         } else {
-            call.messages.clone()
+            let (legs, leg_count) = dialog_legs(&primary_msgs);
+            (primary_msgs, legs, leg_count)
         };
         // Party identities from the SIP messages: the initial INVITE identifies
         // the caller, the first response identifies the callee.
@@ -739,28 +775,24 @@ impl Registry {
             .map(|m| m.flow.src.ip())
             .or_else(|| call.invite_key.as_deref().and_then(|k| k.parse().ok()));
         let mut streams: Vec<_> = self
-            .call_stream_keys(call_id)
+            .call_stream_keys(&hint.primary)
             .iter()
             .filter_map(|k| self.streams.get(k))
             .map(|s| s.summary())
             .collect();
-        streams.extend(self.imported_for_call(call_id).cloned());
+        streams.extend(self.imported_for_call(&hint.primary).cloned());
         let diagnostics = self
             .diagnostics
             .iter()
-            .filter(|d| d.call_id == call_id)
+            .filter(|d| d.call_id == hint.primary)
             .cloned()
             .collect();
-        // Dialog (leg) derivation: every message of a dialog shares the same
-        // From tag (fallback: branch). ≥2 distinct legs inside one Call-ID is a
-        // same-Call-ID B2BUA split.
-        let (legs, leg_count) = dialog_legs(&msgs);
         let b2bua = (leg_count >= 2).then(|| B2buaInfo {
             addr: common_flow_ip(&msgs, &legs),
             legs: leg_count,
         });
         Some(Focus {
-            call_id: call_id.to_string(),
+            call_id: hint.primary.clone(),
             state: Some(call.state),
             from_user: call.from_user.clone(),
             to_user: call.to_user.clone(),
@@ -836,6 +868,29 @@ impl Registry {
     pub fn call_messages(&self, call_id: &str) -> Option<&[crate::model::sip::SipMsg]> {
         self.calls.get(call_id).map(|c| c.messages.as_slice())
     }
+}
+
+/// Cap stored messages for the focus payload (keeps the TUI responsive).
+fn trim_msgs(msgs: &[SipMsg]) -> Vec<SipMsg> {
+    if msgs.len() > 1000 {
+        msgs[msgs.len() - 1000..].to_vec()
+    } else {
+        msgs.to_vec()
+    }
+}
+
+/// Merge primary + linked call messages by timestamp; primary → leg 0, linked → leg 1.
+fn merge_leg_msgs(primary: Vec<SipMsg>, linked: Vec<SipMsg>) -> (Vec<SipMsg>, Vec<u8>, u8) {
+    let mut merged: Vec<(SipMsg, u8)> = primary
+        .into_iter()
+        .map(|m| (m, 0u8))
+        .chain(linked.into_iter().map(|m| (m, 1u8)))
+        .collect();
+    merged.sort_by_key(|(m, _)| m.ts_us);
+    let legs: Vec<u8> = merged.iter().map(|(_, l)| *l).collect();
+    let msgs: Vec<SipMsg> = merged.into_iter().map(|(m, _)| m).collect();
+    let leg_count = if msgs.is_empty() { 0 } else { 2 };
+    (msgs, legs, leg_count)
 }
 
 /// Extract the value of a single-line SIP header from raw message bytes.
@@ -977,7 +1032,7 @@ mod tests {
             mk_sip(Some("t2"), "2.2.2.2:5060", "3.3.3.3:5060"),
         ];
         call.messages = msgs;
-        reg.focus_hint = Some("c1".into());
+        reg.focus_hint = Some(FocusHint::primary("c1"));
         let focus = reg.snapshot_full().focus.expect("focus detail present");
         assert_eq!(focus.legs, vec![0, 1]);
         let b2bua = focus.b2bua.expect("same Call-ID split must be detected");
@@ -996,10 +1051,41 @@ mod tests {
             mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060"),
             mk_sip(Some("t1"), "2.2.2.2:5060", "1.1.1.1:5060"),
         ];
-        reg.focus_hint = Some("c1".into());
+        reg.focus_hint = Some(FocusHint::primary("c1"));
         let focus = reg.snapshot_full().focus.expect("focus detail present");
         assert_eq!(focus.legs, vec![0, 0]);
         assert!(focus.b2bua.is_none(), "single dialog must not be a B2BUA");
+    }
+
+    #[test]
+    fn focus_detail_merges_linked_b_leg_by_timestamp() {
+        let mut reg = Registry::with_source("t".into());
+        {
+            let a = reg.get_or_create_call("a-leg");
+            let mut m0 = mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060");
+            m0.ts_us = 1_000_000;
+            let mut m2 = mk_sip(Some("t1"), "2.2.2.2:5060", "1.1.1.1:5060");
+            m2.ts_us = 1_100_000;
+            m2.is_request = false;
+            m2.method = None;
+            m2.status = Some(100);
+            a.messages = vec![m0, m2];
+        }
+        {
+            let b = reg.get_or_create_call("b-leg");
+            let mut m1 = mk_sip(Some("t2"), "2.2.2.2:5060", "3.3.3.3:5060");
+            m1.ts_us = 1_050_000;
+            b.messages = vec![m1];
+        }
+        reg.focus_hint = Some(FocusHint::with_linked("a-leg", "b-leg"));
+        let focus = reg.snapshot_full().focus.expect("focus detail present");
+        assert_eq!(focus.call_id, "a-leg");
+        assert_eq!(focus.messages.len(), 3);
+        assert_eq!(focus.legs, vec![0, 1, 0]);
+        assert_eq!(focus.messages[0].ts_us, 1_000_000);
+        assert_eq!(focus.messages[1].ts_us, 1_050_000);
+        assert_eq!(focus.messages[2].ts_us, 1_100_000);
+        assert_eq!(focus.b2bua.as_ref().map(|b| b.legs), Some(2));
     }
 
     #[test]
@@ -1024,7 +1110,7 @@ mod tests {
         assert_eq!(snap.streams[0].ssrc, 0x1000);
 
         // Focus detail (Call Detail media table) includes it with flow/pkts.
-        reg.focus_hint = Some("c1".into());
+        reg.focus_hint = Some(FocusHint::primary("c1"));
         let snap = reg.snapshot_full();
         let focus = snap.focus.expect("focus detail present");
         assert_eq!(focus.streams.len(), 1, "media table must show the stream");

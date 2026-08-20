@@ -251,7 +251,7 @@ mod tests {
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(Mutex::new(Some(crate::store::registry::FocusHint::primary("c1")))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );

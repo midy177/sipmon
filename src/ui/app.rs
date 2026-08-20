@@ -7,7 +7,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
 
 use crate::model::sip::CallState;
-use crate::store::registry::{CallSummary, Snapshot};
+use crate::store::registry::{CallSummary, FocusHint, Snapshot};
 
 /// Shared snapshot cell: the pipeline publishes a new `Arc` so the TUI can
 /// cheaply clone the pointer every frame instead of cloning the whole tree.
@@ -146,7 +146,7 @@ pub struct RecordState {
 pub struct App {
     pub snap: SnapLock,
     pub pause: Arc<AtomicBool>,
-    pub focus_id: Arc<Mutex<Option<String>>>,
+    pub focus_id: Arc<Mutex<Option<FocusHint>>>,
     pub clear: Arc<AtomicBool>,
     pub page: Page,
     pub search_query: String,
@@ -160,6 +160,12 @@ pub struct App {
     /// Call-id currently selected in the Overview table (anchored so new calls
     /// don't shift the highlight).
     pub selected_call: Option<String>,
+    /// Optional b-leg Call-ID linked into the focused call's swimlane.
+    pub linked_call_id: Option<String>,
+    /// When set, Call Detail shows a searchable overlay to pick a b-leg.
+    pub b_leg_picker: bool,
+    pub b_leg_query: String,
+    pub b_leg_state: TableState,
     pub filter: CallFilter,
     pub streams_state: TableState,
     pub eventlog_scroll: u16,
@@ -195,7 +201,7 @@ impl App {
     pub fn new(
         snap: SnapLock,
         pause: Arc<AtomicBool>,
-        focus: Arc<Mutex<Option<String>>>,
+        focus: Arc<Mutex<Option<FocusHint>>>,
         clear: Arc<AtomicBool>,
         record: RecordState,
     ) -> Self {
@@ -211,6 +217,10 @@ impl App {
             table_state: TableState::default(),
             focus_pending: None,
             selected_call: None,
+            linked_call_id: None,
+            b_leg_picker: false,
+            b_leg_query: String::new(),
+            b_leg_state: TableState::default(),
             filter: CallFilter::All,
             streams_state: TableState::default(),
             eventlog_scroll: 0,
@@ -269,6 +279,11 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // B-leg picker captures keys while open (search + navigate).
+        if self.b_leg_picker {
+            self.b_leg_picker_key(code);
+            return;
+        }
         // Global: quit / pause / page switching / export.
         if self.search_editing {
             match code {
@@ -293,9 +308,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => {
                 if self.page == Page::CallDetail {
                     // Esc goes back to the previous list view.
-                    self.page = Page::Overview;
-                    self.focus_pending = None;
-                    self.focus_id.lock().ok().map(|mut f| f.take());
+                    self.close_detail();
                 } else if self.page == Page::IpStats && self.ip_drill.is_some() {
                     // Esc closes the per-IP call drill-down.
                     self.ip_drill = None;
@@ -305,9 +318,7 @@ impl App {
             }
             KeyCode::Left => {
                 if self.page == Page::CallDetail {
-                    self.page = Page::Overview;
-                    self.focus_pending = None;
-                    self.focus_id.lock().ok().map(|mut f| f.take());
+                    self.close_detail();
                 } else if self.page == Page::IpStats && self.ip_drill.is_some() {
                     self.ip_drill = None;
                 }
@@ -349,9 +360,98 @@ impl App {
                 // Drop the stale selection anchors.
                 self.selected_call = None;
                 self.focus_pending = None;
+                self.linked_call_id = None;
+                self.b_leg_picker = false;
                 self.ip_drill = None;
             }
             _ => self.page_key(code),
+        }
+    }
+
+    fn close_detail(&mut self) {
+        self.page = Page::Overview;
+        self.focus_pending = None;
+        self.linked_call_id = None;
+        self.b_leg_picker = false;
+        self.b_leg_query.clear();
+        self.focus_id.lock().ok().map(|mut f| f.take());
+    }
+
+    /// Publish the current primary (+ optional linked) focus hint to the pipeline.
+    fn publish_focus(&mut self, primary: String) {
+        let hint = match &self.linked_call_id {
+            Some(linked) => FocusHint::with_linked(primary.clone(), linked.clone()),
+            None => FocusHint::primary(primary.clone()),
+        };
+        if let Ok(mut f) = self.focus_id.lock() {
+            *f = Some(hint);
+        }
+        self.focus_pending = Some(primary);
+    }
+
+    fn open_b_leg_picker(&mut self) {
+        self.b_leg_picker = true;
+        self.b_leg_query.clear();
+        self.b_leg_state.select(Some(0));
+        self.set_status("pick b-leg Call-ID (Enter) — Esc cancel");
+    }
+
+    fn clear_b_leg_link(&mut self) {
+        self.linked_call_id = None;
+        self.b_leg_picker = false;
+        if let Some(id) = self
+            .focus_pending
+            .clone()
+            .or_else(|| self.selected_call.clone())
+        {
+            self.publish_focus(id);
+            self.set_status("b-leg unlinked");
+        }
+    }
+
+    fn b_leg_picker_key(&mut self, code: KeyCode) {
+        let snap = self.snapshot();
+        let primary = snap
+            .focus
+            .as_ref()
+            .map(|f| f.call_id.as_str())
+            .or(self.focus_pending.as_deref())
+            .or(self.selected_call.as_deref())
+            .unwrap_or("");
+        let n = b_leg_candidates(&snap, primary, &self.b_leg_query).len();
+        match code {
+            KeyCode::Esc => {
+                self.b_leg_picker = false;
+                self.b_leg_query.clear();
+                self.set_status("b-leg pick cancelled");
+            }
+            KeyCode::Enter => {
+                let cands = b_leg_candidates(&snap, primary, &self.b_leg_query);
+                let idx = self
+                    .b_leg_state
+                    .selected()
+                    .or_else(|| (!cands.is_empty()).then_some(0));
+                if let Some(i) = idx
+                    && let Some(c) = cands.get(i)
+                {
+                    let linked = c.call_id.clone();
+                    let primary = primary.to_string();
+                    self.linked_call_id = Some(linked.clone());
+                    self.b_leg_picker = false;
+                    self.b_leg_query.clear();
+                    self.publish_focus(primary);
+                    self.set_status(format!("b-leg linked: {linked}"));
+                }
+            }
+            KeyCode::Down => table_nudge(&mut self.b_leg_state, 1, n),
+            KeyCode::Up => table_nudge(&mut self.b_leg_state, -1, n),
+            KeyCode::PageDown => table_nudge(&mut self.b_leg_state, PAGE_ROWS, n),
+            KeyCode::PageUp => table_nudge(&mut self.b_leg_state, -PAGE_ROWS, n),
+            KeyCode::Backspace => {
+                self.b_leg_query.pop();
+            }
+            KeyCode::Char(c) => self.b_leg_query.push(c),
+            _ => {}
         }
     }
 
@@ -401,12 +501,13 @@ impl App {
     /// pipeline republishes the snapshot with the focused detail.
     fn open_detail(&mut self, call_id: String) {
         self.selected_call = Some(call_id.clone());
-        if let Ok(mut f) = self.focus_id.lock() {
-            *f = Some(call_id.clone());
-        }
-        self.focus_pending = Some(call_id);
+        self.linked_call_id = None;
+        self.b_leg_picker = false;
+        self.b_leg_query.clear();
+        self.publish_focus(call_id);
         self.page = Page::CallDetail;
         self.raw_scroll = 0;
+        self.flow_state.select(Some(0));
     }
 
     /// Calls currently visible under `filter`, in display order.
@@ -508,6 +609,8 @@ impl App {
                 KeyCode::PageUp => {
                     self.raw_scroll = self.raw_scroll.saturating_sub(PAGE_ROWS as usize);
                 }
+                KeyCode::Char('l') => self.open_b_leg_picker(),
+                KeyCode::Char('L') => self.clear_b_leg_link(),
                 _ => {}
             },
             Page::Streams => match code {
@@ -681,21 +784,44 @@ pub fn search_results<'a>(
     let q = query.trim().to_ascii_lowercase();
     snap.calls
         .iter()
-        .filter(|c| {
-            if q.is_empty() {
-                return true;
-            }
-            c.call_id.to_ascii_lowercase().contains(&q)
-                || c.from_user
-                    .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(&q))
-                    .unwrap_or(false)
-                || c.to_user
-                    .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(&q))
-                    .unwrap_or(false)
-        })
+        .filter(|c| call_matches_query(c, &q))
         .collect()
+}
+
+/// Candidates for the b-leg picker: every call except the focused primary,
+/// filtered by the same substring rules as Search.
+pub fn b_leg_candidates<'a>(
+    snap: &'a Snapshot,
+    primary: &str,
+    query: &str,
+) -> Vec<&'a CallSummary> {
+    let q = query.trim().to_ascii_lowercase();
+    snap.calls
+        .iter()
+        .filter(|c| c.call_id != primary)
+        .filter(|c| call_matches_query(c, &q))
+        .collect()
+}
+
+fn call_matches_query(c: &CallSummary, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    c.call_id.to_ascii_lowercase().contains(q)
+        || c.from_user
+            .as_deref()
+            .map(|v| v.to_ascii_lowercase().contains(q))
+            .unwrap_or(false)
+        || c.to_user
+            .as_deref()
+            .map(|v| v.to_ascii_lowercase().contains(q))
+            .unwrap_or(false)
+        || c.caller_ip
+            .map(|ip| ip.to_string().to_ascii_lowercase().contains(q))
+            .unwrap_or(false)
+        || c.ips
+            .iter()
+            .any(|ip| ip.to_string().to_ascii_lowercase().contains(q))
 }
 
 #[cfg(test)]
@@ -730,6 +856,29 @@ mod tests {
             a.on_key(KeyCode::Tab, KeyModifiers::NONE);
         }
         assert_eq!(a.page, Page::Overview);
+    }
+
+    #[test]
+    fn call_detail_l_opens_picker_and_unlinks() {
+        let mut a = app();
+        a.page = Page::CallDetail;
+        a.selected_call = Some("a".into());
+        a.focus_pending = Some("a".into());
+        a.on_key(KeyCode::Char('l'), KeyModifiers::NONE);
+        assert!(a.b_leg_picker, "l must open the b-leg picker");
+        a.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!a.b_leg_picker, "Esc closes picker without leaving detail");
+        assert_eq!(a.page, Page::CallDetail);
+
+        a.linked_call_id = Some("b".into());
+        a.on_key(KeyCode::Char('L'), KeyModifiers::NONE);
+        assert!(a.linked_call_id.is_none(), "L unlinks the b-leg");
+        let hint = a.focus_id.lock().unwrap().clone();
+        assert_eq!(
+            hint,
+            Some(FocusHint::primary("a")),
+            "unlinking republishes primary-only focus"
+        );
     }
 
     #[test]

@@ -72,8 +72,8 @@ impl Correlator {
         }
     }
 
-    pub fn set_focus(&mut self, id: Option<String>) {
-        self.reg.focus_hint = id;
+    pub fn set_focus(&mut self, hint: Option<crate::store::registry::FocusHint>) {
+        self.reg.focus_hint = hint;
     }
 
     /// Reset all in-memory state (TUI `x` clear): registry + correlator
