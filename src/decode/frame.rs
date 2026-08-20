@@ -4,8 +4,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use crate::model::packet::{Flow5Tuple, Proto};
 
 /// Well-known pcap datalink types we support.
+pub const DLT_NULL: u32 = 0;
 pub const DLT_EN10MB: u32 = 1;
 pub const DLT_RAW: u32 = 12;
+pub const DLT_LOOP: u32 = 108;
 pub const DLT_LINUX_SLL: u32 = 113;
 pub const DLT_LINUX_SLL2: u32 = 276;
 
@@ -73,6 +75,14 @@ enum FastL2<'a> {
 
 fn l2_payload(linktype: u32, data: &[u8]) -> FastL2<'_> {
     match linktype {
+        // 4-byte address-family header (host order on NULL, network order on
+        // LOOP); the IP version nibble check downstream filters non-IP.
+        DLT_NULL | DLT_LOOP => {
+            if data.len() < 4 {
+                return FastL2::Miss;
+            }
+            FastL2::Ip(&data[4..])
+        }
         DLT_EN10MB => ethernet_payload(data),
         DLT_RAW => FastL2::Ip(data),
         DLT_LINUX_SLL => {
@@ -230,6 +240,10 @@ fn decode_etherparse(linktype: u32, data: &[u8]) -> Option<Decoded<'_>> {
             let ip = data.get(20..)?;
             SlicedPacket::from_ip(ip).ok()?
         }
+        DLT_NULL | DLT_LOOP => {
+            let ip = data.get(4..)?;
+            SlicedPacket::from_ip(ip).ok()?
+        }
         _ => SlicedPacket::from_ethernet(data).ok()?,
     };
 
@@ -342,5 +356,26 @@ mod tests {
             L4::Udp(p) => assert_eq!(p, b"x"),
             L4::Tcp(_) => panic!("expected UDP"),
         }
+    }
+
+    #[test]
+    fn null_loopback_ipv4_udp() {
+        let eth = eth_ipv4_udp(b"INVITE sip:x SIP/2.0");
+        let ip = &eth[14..];
+        // DLT_NULL: 4-byte AF header, AF_INET=2 in host (little-endian) order.
+        let mut pkt = Vec::with_capacity(4 + ip.len());
+        pkt.extend_from_slice(&2u32.to_ne_bytes());
+        pkt.extend_from_slice(ip);
+        let d = decode(DLT_NULL, &pkt).expect("null decode");
+        assert_eq!(d.flow.src.port(), 5060);
+        match d.l4 {
+            L4::Udp(p) => assert_eq!(p, b"INVITE sip:x SIP/2.0"),
+            L4::Tcp(_) => panic!("expected UDP"),
+        }
+        // DLT_LOOP uses network (big-endian) order; same skip works.
+        let mut be = Vec::with_capacity(4 + ip.len());
+        be.extend_from_slice(&2u32.to_be_bytes());
+        be.extend_from_slice(ip);
+        assert!(decode(DLT_LOOP, &be).is_some());
     }
 }
