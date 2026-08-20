@@ -433,7 +433,7 @@ impl StatsAcc {
                 &StreamSnapLite {
                     call_id: &e.call_id,
                     ssrc: e.ssrc,
-                    flow: e.flow,
+                    flow: Some(e.flow),
                     packets: e.packets,
                     lost: e.lost,
                     bytes: e.bytes,
@@ -505,9 +505,14 @@ impl StatsAcc {
         self.events.stream_snap += 1;
         let cid = self.intern(e.call_id);
         self.call_ids.insert(cid);
+        let unknown_flow = Flow5Tuple {
+            proto: crate::model::packet::Proto::Udp,
+            src: "0.0.0.0:0".parse().unwrap(),
+            dst: "0.0.0.0:0".parse().unwrap(),
+        };
         let sid = StreamId {
             ssrc: e.ssrc,
-            flow: e.flow,
+            flow: e.flow.unwrap_or(unknown_flow),
         };
         let key = (cid, sid);
         let prev = self
@@ -545,16 +550,42 @@ impl StatsAcc {
         w.calls.insert(cid);
         w.streams.insert((cid, e.ssrc));
         self.all.add(pkts, lost, bytes_d);
-        if pkts > 0 || lost > 0 || bytes_d > 0 {
+        if (pkts > 0 || lost > 0 || bytes_d > 0)
+            && let Some(flow) = e.flow
+        {
             self.ip_loss
-                .entry(e.flow.src.ip())
+                .entry(flow.src.ip())
                 .or_default()
                 .add(pkts, lost, bytes_d);
             self.ip_loss
-                .entry(e.flow.dst.ip())
+                .entry(flow.dst.ip())
                 .or_default()
                 .add(pkts, lost, bytes_d);
         }
+    }
+
+    /// Replay feed: a reconstructed stream summary (flow may be unknown on
+    /// older logs). Same accounting as a live StreamSnap event.
+    pub fn ingest_stream_summary(&mut self, ts: u64, s: &crate::model::media::StreamSummary) {
+        self.ingest_stream_snap(
+            ts,
+            &StreamSnapLite {
+                call_id: s.call_id.as_deref().unwrap_or(""),
+                ssrc: s.ssrc,
+                flow: s.flow,
+                packets: s.packets,
+                lost: s.lost,
+                bytes: s.bytes,
+                jitter_ms: s.jitter_ms,
+                mos: s.mos,
+                rtt_avg_ms: s.rtt_avg_ms,
+            },
+        );
+    }
+
+    /// Replay feed: one RTCP RTT sample.
+    pub fn ingest_rtt_sample(&mut self, ts: u64, rtt_ms: f64) {
+        self.ingest_rtcp_rtt(ts, rtt_ms);
     }
 
     fn ingest_rtcp_rtt(&mut self, ts: u64, rtt_ms: f64) {

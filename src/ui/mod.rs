@@ -127,7 +127,7 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
     ));
     let line3 = if app.search_editing {
         Line::from(Span::styled(
-            " Search: type query — [Enter] apply [Esc] cancel",
+            " Search: type query — [↑↓/PgUp/PgDn] select [Enter] open call [Esc] cancel",
             Style::default().fg(theme::WARNING),
         ))
     } else {
@@ -195,7 +195,7 @@ fn page_keys(page: Page) -> &'static str {
         Page::Overview => "[↑↓/PgUp/PgDn] select [Enter] open call detail",
         Page::Search => "[↑↓/PgUp/PgDn] select [Enter] open call detail [/] new query",
         Page::CallDetail => "[↑↓] msg  [l] link b-leg  [L] unlink  [PgUp/PgDn] raw  [←/Esc] back",
-        Page::Heatmap => "[↑↓/PgUp/PgDn] scroll [s] sort [w] loss window",
+        Page::Heatmap => "[↑↓/PgUp/PgDn] scroll [s] sort [w] ASR bucket 1m/5m/15m",
         Page::Streams => "[↑↓/PgUp/PgDn] select stream",
         Page::EventLog => "[↑↓/PgUp/PgDn] scroll",
         Page::IpStats => "[↑↓/PgUp/PgDn] select [Enter] calls [s] sort [w] window [c] loss-only",
@@ -238,7 +238,7 @@ fn render_page_tabs(f: &mut Frame, area: Rect, app: &App) {
         (1, "Overview"),
         (2, "Search"),
         (3, "Detail"),
-        (4, "Heatmap"),
+        (4, "SIP Stats"),
         (5, "Streams"),
         (6, "EventLog"),
         (7, "IP Stats"),

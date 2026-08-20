@@ -286,7 +286,7 @@ fn render_drill(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
 }
 
 /// Per-IP loss heatmap: rows = IPs, columns = time buckets, color = loss%.
-/// Shared between the IP Stats page and the dedicated Heatmap page.
+/// Rendered at the bottom of the IP Stats page.
 pub fn render_loss_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let window = app.ip_window_secs;
     let col_secs = if window <= 600 {

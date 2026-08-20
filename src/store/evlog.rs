@@ -1070,7 +1070,8 @@ fn slice_u64_field(rd: &mut &[u8]) -> Result<u64> {
 pub(crate) struct StreamSnapLite<'a> {
     pub call_id: &'a str,
     pub ssrc: u32,
-    pub flow: Flow5Tuple,
+    /// None for summaries that predate 5-tuple logging.
+    pub flow: Option<Flow5Tuple>,
     pub packets: u64,
     pub lost: u64,
     pub bytes: u64,
@@ -1097,7 +1098,7 @@ pub(crate) fn parse_stream_snap_lite(mut rd: &[u8]) -> Result<StreamSnapLite<'_>
         return Ok(StreamSnapLite {
             call_id,
             ssrc,
-            flow,
+            flow: Some(flow),
             packets,
             lost,
             bytes: 0,
@@ -1114,7 +1115,7 @@ pub(crate) fn parse_stream_snap_lite(mut rd: &[u8]) -> Result<StreamSnapLite<'_>
     Ok(StreamSnapLite {
         call_id,
         ssrc,
-        flow,
+        flow: Some(flow),
         packets,
         lost,
         bytes,
@@ -1441,7 +1442,7 @@ mod tests {
                 Event::StreamSnap(e) => {
                     assert_eq!(lite.call_id, e.call_id);
                     assert_eq!(lite.ssrc, e.ssrc);
-                    assert_eq!(lite.flow, e.flow);
+                    assert_eq!(lite.flow, Some(e.flow));
                     assert_eq!(lite.packets, e.packets);
                     assert_eq!(lite.lost, e.lost);
                     assert_eq!(lite.bytes, e.bytes);

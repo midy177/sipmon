@@ -85,7 +85,7 @@ impl Page {
             Page::Overview => "Overview",
             Page::Search => "Search",
             Page::CallDetail => "Call Detail",
-            Page::Heatmap => "Heatmap",
+            Page::Heatmap => "SIP Stats",
             Page::Streams => "Streams",
             Page::EventLog => "Event Log",
             Page::IpStats => "IP Stats",
@@ -128,6 +128,32 @@ impl IpSort {
         }
     }
     pub fn next(self) -> IpSort {
+        let i = Self::ALL.iter().position(|&x| x == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
+
+/// Sort modes for the SIP Stats page (request/response distribution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SipSort {
+    /// Most INVITEs first.
+    Invites,
+    /// Most error responses (486/404/403/4xx/5xx/6xx) first.
+    Errors,
+    /// Lowest window ASR first (rows without INVITEs last).
+    Asr,
+}
+
+impl SipSort {
+    pub const ALL: [SipSort; 3] = [SipSort::Invites, SipSort::Errors, SipSort::Asr];
+    pub fn label(self) -> &'static str {
+        match self {
+            SipSort::Invites => "invites",
+            SipSort::Errors => "errors",
+            SipSort::Asr => "asr",
+        }
+    }
+    pub fn next(self) -> SipSort {
         let i = Self::ALL.iter().position(|&x| x == self).unwrap_or(0);
         Self::ALL[(i + 1) % Self::ALL.len()]
     }
@@ -191,6 +217,11 @@ pub struct App {
     pub ip_window_secs: u64, // heatmap window: 60s / 10m / 1h
     pub ip_drill: Option<std::net::IpAddr>,
     pub ip_drill_state: TableState,
+    /// SIP Stats page state: table selection, sort mode, ASR bucket width.
+    pub sip_table_state: TableState,
+    pub sip_sort: SipSort,
+    /// ASR heatmap bucket width: 60s / 300s / 900s (cell granularity).
+    pub sip_window_secs: u64,
     /// Live evlog recording state (blinking top-bar indicator).
     pub record: RecordState,
     /// Privacy mode: masks IPs and caller/callee identifiers (screenshot-safe).
@@ -242,6 +273,9 @@ impl App {
             ip_window_secs: 60,
             ip_drill: None,
             ip_drill_state: TableState::default(),
+            sip_table_state: TableState::default(),
+            sip_sort: SipSort::Invites,
+            sip_window_secs: 60,
             record,
             privacy: false,
             local_ips: Vec::new(),
@@ -291,6 +325,19 @@ impl App {
         }
     }
 
+    /// Keep the search-table selection inside the (possibly shrunken) result
+    /// set while the query is being typed, and default to the first row so
+    /// the highlight is visible right away.
+    fn clamp_search_selection(&mut self) {
+        let snap = self.snapshot();
+        let n = search_results(&snap, &self.search_query).len();
+        let idx = match self.search_state.selected() {
+            Some(i) if i < n => Some(i),
+            _ => (n > 0).then_some(0),
+        };
+        self.search_state.select(idx);
+    }
+
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         // B-leg picker captures keys while open (search + navigate).
         if self.b_leg_picker {
@@ -299,18 +346,42 @@ impl App {
         }
         // Global: quit / pause / page switching / export.
         if self.search_editing {
+            // Results stay live while typing: ↑↓/PgUp/PgDn move the selection
+            // without leaving edit mode, Enter jumps straight into the call.
+            let snap = self.snapshot();
+            let n = search_results(&snap, &self.search_query).len();
             match code {
                 KeyCode::Esc => {
                     self.search_editing = false;
                 }
+                KeyCode::Down => table_nudge(&mut self.search_state, 1, n),
+                KeyCode::Up => table_nudge(&mut self.search_state, -1, n),
+                KeyCode::PageDown => table_nudge(&mut self.search_state, PAGE_ROWS, n),
+                KeyCode::PageUp => table_nudge(&mut self.search_state, -PAGE_ROWS, n),
                 KeyCode::Enter => {
                     self.search_editing = false;
-                    self.search_state.select(Some(0));
+                    let results = search_results(&snap, &self.search_query);
+                    let idx = self
+                        .search_state
+                        .selected()
+                        .or_else(|| (!results.is_empty()).then_some(0));
+                    if let Some(i) = idx
+                        && let Some(c) = results.get(i)
+                    {
+                        let id = c.call_id.clone();
+                        self.sync_search_pin();
+                        self.open_detail(id);
+                        return;
+                    }
                 }
                 KeyCode::Backspace => {
                     self.search_query.pop();
+                    self.clamp_search_selection();
                 }
-                KeyCode::Char(c) => self.search_query.push(c),
+                KeyCode::Char(c) => {
+                    self.search_query.push(c);
+                    self.clamp_search_selection();
+                }
                 _ => {}
             }
             self.sync_search_pin();
@@ -354,6 +425,7 @@ impl App {
             KeyCode::Char('/') => {
                 self.page = Page::Search;
                 self.search_editing = true;
+                self.clamp_search_selection();
             }
             KeyCode::Char('e') => self.do_export(),
             KeyCode::Char('p') => {
@@ -650,19 +722,30 @@ impl App {
                 _ => {}
             },
             Page::IpStats => self.ip_key(code, &snap),
-            Page::Heatmap => match code {
-                KeyCode::Char('s') => self.next_ip_sort(),
-                KeyCode::Char('w') => self.cycle_ip_window(),
-                KeyCode::Down => table_nudge(&mut self.ip_table_state, 1, snap.ip_stats.len()),
-                KeyCode::Up => table_nudge(&mut self.ip_table_state, -1, snap.ip_stats.len()),
-                KeyCode::PageDown => {
-                    table_nudge(&mut self.ip_table_state, PAGE_ROWS, snap.ip_stats.len())
+            Page::Heatmap => {
+                // Rows = ALL row + per-IP rows.
+                let n = snap.sip_stats.len().max(1);
+                match code {
+                    KeyCode::Char('s') => {
+                        self.sip_sort = self.sip_sort.next();
+                        self.set_status(format!("SIP sort = {}", self.sip_sort.label()));
+                    }
+                    KeyCode::Char('w') => {
+                        let vals = crate::store::sipstats::SERIES_BUCKETS;
+                        let i = vals
+                            .iter()
+                            .position(|&s| s == self.sip_window_secs)
+                            .unwrap_or(0);
+                        self.sip_window_secs = vals[(i + 1) % vals.len()];
+                        self.set_status(format!("ASR bucket = {}s", self.sip_window_secs));
+                    }
+                    KeyCode::Down => table_nudge(&mut self.sip_table_state, 1, n),
+                    KeyCode::Up => table_nudge(&mut self.sip_table_state, -1, n),
+                    KeyCode::PageDown => table_nudge(&mut self.sip_table_state, PAGE_ROWS, n),
+                    KeyCode::PageUp => table_nudge(&mut self.sip_table_state, -PAGE_ROWS, n),
+                    _ => {}
                 }
-                KeyCode::PageUp => {
-                    table_nudge(&mut self.ip_table_state, -PAGE_ROWS, snap.ip_stats.len())
-                }
-                _ => {}
-            },
+            }
         }
     }
 
@@ -896,6 +979,90 @@ mod tests {
     }
 
     #[test]
+    fn search_edit_mode_navigates_and_enter_opens_detail() {
+        let mut a = app_with_calls();
+        a.page = Page::Search;
+        // `/` enters edit mode with row 0 preselected (visible highlight).
+        a.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(a.search_editing);
+        assert_eq!(a.search_state.selected(), Some(0), "row 0 preselected");
+        // Typing filters; ↑↓ move the selection without leaving edit mode.
+        for c in "bob".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(a.search_editing);
+        a.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert!(a.search_editing, "arrows stay in edit mode");
+        // Enter opens the selected call's detail directly.
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!a.search_editing);
+        assert_eq!(a.page, Page::CallDetail);
+        let selected = a.search_query.clone();
+        assert!(selected.contains("bob"));
+        assert_eq!(
+            a.selected_call.as_deref(),
+            Some("call-bobby"),
+            "Enter must open the highlighted row, not the first match"
+        );
+    }
+
+    #[test]
+    fn search_selection_clamps_when_query_shrinks_results() {
+        let mut a = app_with_calls();
+        a.page = Page::Search;
+        a.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "999".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(a.search_state.selected(), None, "no results: no selection");
+        // Removing the query restores a valid selection.
+        a.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+        a.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+        a.on_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(a.search_state.selected(), Some(0));
+    }
+
+    fn app_with_calls() -> App {
+        use crate::model::sip::{CallState, Outcome};
+        use crate::store::registry::CallSummary;
+        let mut snap = Snapshot::default();
+        for (id, user) in [
+            ("call-alice", "alice"),
+            ("call-bob", "bob"),
+            ("call-bobby", "bobby"),
+        ] {
+            snap.calls.push(CallSummary {
+                call_id: id.into(),
+                from_user: Some(user.into()),
+                to_user: Some("x".into()),
+                caller_ip: None,
+                state: CallState::Completed,
+                outcome: Outcome::Answered,
+                invite_ts: Some(1_000_000),
+                duration_ms: Some(1_000),
+                pdd_ms: None,
+                setup_ms: None,
+                ring_ms: None,
+                ring_code: None,
+                early_media: false,
+                hangup_by: None,
+                hangup_code: None,
+                pkts_sip: 1,
+                pkts_rtp: 0,
+                best_mos: None,
+                warn_count: 0,
+                critical_count: 0,
+                stream_count: 0,
+                via_turn: false,
+                ips: vec!["10.0.0.1".parse().unwrap()],
+            });
+        }
+        let a = app();
+        *a.snap.lock().unwrap() = Arc::new(snap);
+        a
+    }
+
+    #[test]
     fn bottom_tab_bar_renders_and_highlights_selected() {
         let mut a = app();
         a.page = Page::IpStats;
@@ -910,7 +1077,7 @@ mod tests {
             "1 Overview",
             "2 Search",
             "3 Detail",
-            "4 Heatmap",
+            "4 SIP Stats",
             "5 Streams",
             "6 EventLog",
             "7 IP Stats",

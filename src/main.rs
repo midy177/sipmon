@@ -24,7 +24,9 @@ use capture::CaptureSource;
 use config::{Bucket, Config};
 use correlate::Correlator;
 use diagnostics::Severity;
-use store::evlog::{Event, EvlogReader, EvlogWriter, decode_payload, parse_stream_summary};
+use store::evlog::{
+    Event, EvlogReader, EvlogWriter, decode_payload, parse_rtcp_rtt_ms, parse_stream_summary,
+};
 use store::registry::{FocusHint, Snapshot};
 use ui::app::RecordState;
 
@@ -579,7 +581,9 @@ fn run_capture_loop(
     }
 
     let mut corr = Correlator::new(&cfg, name.clone());
-    if print_stats {
+    // Session report on exit: TUI sessions print the full in-memory stats
+    // (same output as `sipmon stats`); `--print-stats` runs do too.
+    if with_tui || print_stats {
         corr.enable_session_stats();
     }
     let writer = match &evlog_path {
@@ -730,7 +734,8 @@ fn run_capture_loop(
             );
         }
     }
-    if print_stats && let Some(acc) = session_stats {
+    // Session report on exit: everything the correlator saw in memory.
+    if let Some(acc) = session_stats {
         print!(
             "{}",
             acc.finish(name, 0, None, store::evstats::DEFAULT_TOP_IPS)
@@ -830,7 +835,13 @@ fn replay_apply(corr: &mut Correlator, ty: u8, ts: u64, payload: &[u8]) {
                         s.ssrc, s.packets, s.loss_pct
                     ));
                 }
+                corr.replay_stream_summary(ts, &s);
                 corr.reg.import_stream_snap(ts, s);
+            }
+        }
+        5 => {
+            if let Ok(rtt) = parse_rtcp_rtt_ms(payload) {
+                corr.replay_rtt_sample(ts, rtt);
             }
         }
         8 => {
@@ -877,6 +888,12 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
     // Replay never writes an evlog; skip cloning every SIP raw into a discarded
     // SipMsgEvt (that clone dominated CPU on multi-MB recordings).
     corr.disable_evlog_emit();
+    // TUI sessions print the full session report on exit, straight from the
+    // replayed events (no evlog re-scan).
+    if with_tui {
+        corr.enable_session_stats();
+    }
+    let tz = reader.tz_offset_secs();
 
     let shared2 = shared.clone();
     let handle = std::thread::spawn(move || {
@@ -940,18 +957,29 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
             }
         }
         publish(&shared2, &mut corr, true);
+        corr.take_session_stats()
     });
 
     if with_tui {
         run_tui(shared.clone(), &cfg.local_ips)?;
         shared.quit.store(true, Ordering::Relaxed);
-        handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("replay thread panicked"))?;
+    }
+    let session_stats = handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("replay thread panicked"))?;
+    if let Some(acc) = session_stats {
+        // TUI exit: print the full in-memory report (same as `sipmon stats`).
+        print!(
+            "{}",
+            acc.finish(
+                format!("replay:{evlog}"),
+                0,
+                tz,
+                store::evstats::DEFAULT_TOP_IPS
+            )
+            .render_text()
+        );
     } else {
-        handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("replay thread panicked"))?;
         let snap = shared.snap.lock().unwrap().clone();
         for c in &snap.calls {
             println!(
@@ -1090,61 +1118,61 @@ fn run_query(evlog: &str, call_id: &str) -> Result<()> {
         };
         match ty {
             1 => {
-                if let Ok(Event::SipMsg(e)) = decode_payload(ty, ts, payload) {
-                    if e.call_id == call_id {
-                        found += 1;
-                        let label = if e.is_request {
-                            e.method.clone().unwrap_or_default()
-                        } else {
-                            e.status.map(|s| s.to_string()).unwrap_or_default()
-                        };
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "ts_us": e.ts_us, "msg": label,
-                                "src": e.flow.src.to_string(), "dst": e.flow.dst.to_string(),
-                                "cseq": e.cseq, "branch": e.branch,
-                                "from_tag": e.from_tag, "to_tag": e.to_tag,
-                                "raw_len": e.raw.len(),
-                            })
-                        );
-                    }
+                if let Ok(Event::SipMsg(e)) = decode_payload(ty, ts, payload)
+                    && e.call_id == call_id
+                {
+                    found += 1;
+                    let label = if e.is_request {
+                        e.method.clone().unwrap_or_default()
+                    } else {
+                        e.status.map(|s| s.to_string()).unwrap_or_default()
+                    };
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ts_us": e.ts_us, "msg": label,
+                            "src": e.flow.src.to_string(), "dst": e.flow.dst.to_string(),
+                            "cseq": e.cseq, "branch": e.branch,
+                            "from_tag": e.from_tag, "to_tag": e.to_tag,
+                            "raw_len": e.raw.len(),
+                        })
+                    );
                 }
             }
             4 => {
-                if let Ok(s) = parse_stream_summary(payload) {
-                    if s.call_id.as_deref() == Some(call_id) {
-                        streams += 1;
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "ts_us": ts, "stream": format!("{:#x}", s.ssrc),
-                                "codec": s.codec, "packets": s.packets, "lost": s.lost,
-                                "loss_pct": s.loss_pct, "jitter_ms": s.jitter_ms, "mos": s.mos,
-                            })
-                        );
-                    }
+                if let Ok(s) = parse_stream_summary(payload)
+                    && s.call_id.as_deref() == Some(call_id)
+                {
+                    streams += 1;
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ts_us": ts, "stream": format!("{:#x}", s.ssrc),
+                            "codec": s.codec, "packets": s.packets, "lost": s.lost,
+                            "loss_pct": s.loss_pct, "jitter_ms": s.jitter_ms, "mos": s.mos,
+                        })
+                    );
                 }
             }
             5 => {
-                if let Ok(Event::RtcpRtt(e)) = decode_payload(ty, ts, payload) {
-                    if e.call_id == call_id {
-                        rtts += 1;
-                        println!(
-                            "{}",
-                            serde_json::json!({"ts_us": e.ts_us, "ssrc": format!("{:#x}", e.ssrc), "rtt_ms": e.rtt_ms, "oneway_ms": e.oneway_ms})
-                        );
-                    }
+                if let Ok(Event::RtcpRtt(e)) = decode_payload(ty, ts, payload)
+                    && e.call_id == call_id
+                {
+                    rtts += 1;
+                    println!(
+                        "{}",
+                        serde_json::json!({"ts_us": e.ts_us, "ssrc": format!("{:#x}", e.ssrc), "rtt_ms": e.rtt_ms, "oneway_ms": e.oneway_ms})
+                    );
                 }
             }
             8 => {
-                if let Ok(Event::Diag(e)) = decode_payload(ty, ts, payload) {
-                    if e.call_id == call_id {
-                        println!(
-                            "{}",
-                            serde_json::json!({"ts_us": e.ts_us, "diag": e.code, "severity": e.severity, "message": e.message})
-                        );
-                    }
+                if let Ok(Event::Diag(e)) = decode_payload(ty, ts, payload)
+                    && e.call_id == call_id
+                {
+                    println!(
+                        "{}",
+                        serde_json::json!({"ts_us": e.ts_us, "diag": e.code, "severity": e.severity, "message": e.message})
+                    );
                 }
             }
             _ => {}
@@ -1198,37 +1226,31 @@ fn run_export(
             && to.map(|t| ts <= t * 1_000_000).unwrap_or(true);
         match ty {
             1 => {
-                if in_range {
-                    if let Ok(Event::SipMsg(e)) = decode_payload(ty, ts, payload) {
-                        corr.ingest_sip(capture::replay::evt_to_sipmsg(&e));
-                        // Replay never writes an evlog; drop the re-emitted events
-                        // immediately or `pending_events` grows with every message.
-                        corr.take_events();
-                    }
+                if in_range && let Ok(Event::SipMsg(e)) = decode_payload(ty, ts, payload) {
+                    corr.ingest_sip(capture::replay::evt_to_sipmsg(&e));
+                    // Replay never writes an evlog; drop the re-emitted events
+                    // immediately or `pending_events` grows with every message.
+                    corr.take_events();
                 }
             }
             4 => {
-                if in_range {
-                    if let Ok(s) = parse_stream_summary(payload) {
-                        streams_extra.push(s);
-                    }
+                if in_range && let Ok(s) = parse_stream_summary(payload) {
+                    streams_extra.push(s);
                 }
             }
             8 => {
-                if in_range {
-                    if let Ok(Event::Diag(e)) = decode_payload(ty, ts, payload) {
-                        diags_extra.push(diagnostics::Diagnostic {
-                            ts_us: e.ts_us,
-                            call_id: e.call_id.clone(),
-                            severity: match e.severity {
-                                0 => Severity::Info,
-                                1 => Severity::Warn,
-                                _ => Severity::Critical,
-                            },
-                            code: diagnostics::code_from_str(&e.code),
-                            message: e.message.clone(),
-                        });
-                    }
+                if in_range && let Ok(Event::Diag(e)) = decode_payload(ty, ts, payload) {
+                    diags_extra.push(diagnostics::Diagnostic {
+                        ts_us: e.ts_us,
+                        call_id: e.call_id.clone(),
+                        severity: match e.severity {
+                            0 => Severity::Info,
+                            1 => Severity::Warn,
+                            _ => Severity::Critical,
+                        },
+                        code: diagnostics::code_from_str(&e.code),
+                        message: e.message.clone(),
+                    });
                 }
             }
             6 => {

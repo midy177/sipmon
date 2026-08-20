@@ -18,7 +18,7 @@ analysis results (JSONL).
 - **Media quality**: RFC3550 jitter/loss, RTCP RR RTT, one-way delay estimate, E-model MOS
 - **TURN detection**: auto-learns TURN servers, labels `turn-client` / `turn-peer` relay legs
 - **Diagnostics**: 20+ rules for Contact reachability, Record-Route, SDP/RTP consistency, one-way media, TURN allocation/refresh
-- **TUI**: Overview / Search / Call Detail / Heatmap / Streams / Event Log / IP Stats pages
+- **TUI**: Overview / Search / Call Detail / SIP Stats / Streams / Event Log / IP Stats pages
 - **Analysis**: PDD/setup/ring timing, hangup initiator (BYE, CANCEL, reject), per-IP loss over 1s…1h windows
 - **Export**: JSONL on exit or via `export`; `query` fetches a Call-ID flow for scripting
 
@@ -74,11 +74,13 @@ tcpdump -i eth0 -w - | sipmon -    # read a live tcpdump stream
 
 ## TUI
 
-Pages: **Overview** `1` · **Search** `2`/`/` · **Call Detail** `3` · **Heatmap** `4` · **Streams** `5` · **Event Log** `6` · **IP Stats** `7`. `Tab`/`Shift-Tab` cycles pages, `Space` pauses, `e` exports JSONL, `x` clears in-memory stats, `q`/`Esc`/`Ctrl-C` quits.
+Pages: **Overview** `1` · **Search** `2`/`/` · **Call Detail** `3` · **SIP Stats** `4` · **Streams** `5` · **Event Log** `6` · **IP Stats** `7`. `Tab`/`Shift-Tab` cycles pages, `Space` pauses, `e` exports JSONL, `x` clears in-memory stats, `q`/`Esc`/`Ctrl-C` quits. Search stays editable while you navigate results (`↑`/`↓` select, `Enter` opens the call); quitting a TUI session prints the full in-memory stats report (same output as `sipmon stats`, 5-minute windows).
 
 Call Detail uses a fixed four-pane layout: **Flow** (sngrep-style swimlane, `↑`/`↓` selects) · **Raw** (syntax-highlighted bytes of the selected message, `PgUp`/`PgDn` scrolls) · **Diagnostics** · **Network** (traffic totals + per-stream media table). Flow headers are `ip:port` columns with a vertical bar under each party; rows are `Time | -- INVITE ->` / `<- 100 --` (short centered arrows; responses show the status code only). Same-Call-ID dual dialogs (or a manually linked b-leg via `l`) expand to three parties. `L` unlinks the b-leg.
 
 IP Stats aggregates per-IP conditions, split by direction (**TX** = sent by the IP, **RX** = received): `c` collapses to a loss-only summary, `w` cycles the time window, `s` sorts, `Enter` drills down to the calls involving an IP.
+
+SIP Stats shows the signaling health per endpoint IP: a request/response distribution table (`INVITE ACK BYE CANCEL OPTION INFO REGISTER MESSAGE oth | 100 180 183 200 486 404 403 408 480 487 3xx 4xx 5xx 6xx oth`) and an INVITE answer-rate heatmap (1m/5m/15m buckets via `w`, `s` sorts). Heatmap colors are relative to the window's global ASR baseline — cyan within ±10pp, green ≥ +10pp, orange −25pp, red below — so a naturally low-ASR route (e.g. 40% outbound) stays neutral and only real degradation turns red; cells with fewer than 3 invites are dimmed.
 
 ## Event log format
 

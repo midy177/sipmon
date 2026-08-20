@@ -113,6 +113,20 @@ impl Correlator {
         self.session_stats = Some(crate::store::evstats::StatsAcc::new());
     }
 
+    /// Feed a replayed stream summary into the live session report (if on).
+    pub fn replay_stream_summary(&mut self, ts_us: u64, s: &crate::model::media::StreamSummary) {
+        if let Some(acc) = &mut self.session_stats {
+            acc.ingest_stream_summary(ts_us, s);
+        }
+    }
+
+    /// Feed a replayed RTCP RTT sample into the live session report (if on).
+    pub fn replay_rtt_sample(&mut self, ts_us: u64, rtt_ms: f64) {
+        if let Some(acc) = &mut self.session_stats {
+            acc.ingest_rtt_sample(ts_us, rtt_ms);
+        }
+    }
+
     pub fn take_session_stats(&mut self) -> Option<crate::store::evstats::StatsAcc> {
         self.session_stats.take()
     }
@@ -197,6 +211,9 @@ impl Correlator {
         const IPSTATS_IDLE_US: u64 = 3_600_000_000;
         self.reg
             .ipstats
+            .prune_idle(ts_us.saturating_sub(IPSTATS_IDLE_US));
+        self.reg
+            .sipstats
             .prune_idle(ts_us.saturating_sub(IPSTATS_IDLE_US));
     }
 
@@ -324,6 +341,39 @@ impl Correlator {
         // Track whether the initial INVITE carried Record-Route.
         let is_initial_invite =
             matches!(msg.method, Some(Method::Invite)) && msg.is_request && msg.to_tag.is_none();
+
+        // SIP signaling stats (SIP Stats page): request/response distribution
+        // per sender IP. The first 2xx answering a dialog's INVITE is credited
+        // back to the initial INVITE's source IP so B2BUA-originated 200s
+        // still rate the originating sender.
+        let answer_for_ip = if !msg.is_request
+            && (200..300).contains(&(msg.status.unwrap_or(0)))
+            && msg
+                .cseq_method
+                .as_deref()
+                .is_some_and(|m| m.eq_ignore_ascii_case("INVITE"))
+        {
+            self.reg.calls.get(&call_id).and_then(|c| {
+                (c.answer_ts.is_none() && c.invite_ts.is_some())
+                    .then(|| {
+                        c.invite_key
+                            .as_deref()
+                            .and_then(|k| k.parse::<std::net::IpAddr>().ok())
+                    })
+                    .flatten()
+            })
+        } else {
+            None
+        };
+        self.reg.sipstats.observe(&crate::store::sipstats::SipObs {
+            ip: msg.flow.src.ip(),
+            ts_us: ts,
+            is_request: msg.is_request,
+            method: msg.method,
+            status: msg.status,
+            answer_for_ip,
+            initial_invite: is_initial_invite,
+        });
         if is_initial_invite {
             self.invite_rr
                 .entry(call_id.clone())

@@ -170,6 +170,8 @@ pub struct Snapshot {
     pub diagnostics: Vec<Diagnostic>,
     /// Per-IP network stats (IP page).
     pub ip_stats: Vec<IpStats>,
+    /// Per-IP SIP signaling stats (SIP Stats page): global ALL row first.
+    pub sip_stats: Vec<crate::store::sipstats::SipIpRow>,
     /// Heatmap cells: (bucket_us, key, metrics).
     pub buckets: Vec<(u64, String, crate::model::stats::MetricSet)>,
     /// Focused call detail (set by the UI via Correlator focus hint).
@@ -231,6 +233,8 @@ pub struct Registry {
     pub ssrc_index: HashMap<u32, Vec<StreamKey>>,
     /// Per-IP packet/loss statistics (updated on the RTP hot path + 5s flush).
     pub ipstats: IpStatsStore,
+    /// Per-IP SIP signaling statistics (SIP Stats page).
+    pub sipstats: crate::store::sipstats::SipStatsStore,
     /// Stream summaries reconstructed from a replay/import, keyed for O(1)
     /// upsert (StreamSnap is emitted every 5s; a Vec + linear scan was O(n²)
     /// on multi-hour recordings).
@@ -273,6 +277,7 @@ impl Default for Registry {
             stream_index: HashMap::new(),
             ssrc_index: HashMap::new(),
             ipstats: IpStatsStore::new(),
+            sipstats: crate::store::sipstats::SipStatsStore::new(),
             imported_streams: HashMap::new(),
             imported_by_call: HashMap::new(),
             removed: VecDeque::new(),
@@ -324,6 +329,7 @@ impl Registry {
         self.diagnostics.clear();
         self.heatmap = crate::store::heatmap::Heatmap::new(self.heatmap.bucket_secs());
         self.ipstats.clear();
+        self.sipstats.clear();
         self.imported_streams.clear();
         self.imported_by_call.clear();
         self.pkts_total = 0;
@@ -815,6 +821,7 @@ impl Registry {
             events: self.events.clone(),
             diagnostics: self.diagnostics.iter().cloned().collect(),
             ip_stats: self.ipstats.snapshot(),
+            sip_stats: self.sipstats.snapshot(),
             buckets: self.heatmap.flat(),
             focus: self.focus_hint.as_ref().and_then(|h| self.focus_detail(h)),
             paused: false,
