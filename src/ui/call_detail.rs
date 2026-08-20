@@ -277,7 +277,9 @@ fn render_swimlane(
     app: &mut App,
 ) {
     let first_ts = messages.first().map(|m| m.ts_us).unwrap_or(0);
-    let start = snap.start_us.unwrap_or(first_ts);
+    // Relative times count from the dialog's first message, not the capture
+    // start, so mid-capture dialogs begin at +0.00s.
+    let start = first_ts;
     let tz = snap.tz_offset_secs;
     let privacy = app.privacy;
     let labels: Vec<String> = parties
