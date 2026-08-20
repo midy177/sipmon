@@ -147,6 +147,9 @@ pub struct App {
     pub snap: SnapLock,
     pub pause: Arc<AtomicBool>,
     pub focus_id: Arc<Mutex<Option<FocusHint>>>,
+    /// Current search query, published to the pipeline so matching calls are
+    /// pinned (eviction-proof and always included in snapshots).
+    pub search_pin: Arc<Mutex<Option<String>>>,
     pub clear: Arc<AtomicBool>,
     pub page: Page,
     pub search_query: String,
@@ -209,6 +212,7 @@ impl App {
             snap,
             pause,
             focus_id: focus,
+            search_pin: Arc::new(Mutex::new(None)),
             clear,
             page: Page::Overview,
             search_query: String::new(),
@@ -278,6 +282,15 @@ impl App {
         self.page = Page::ALL[next];
     }
 
+    /// Push the current search query to the pipeline (pins matching calls).
+    /// Empty queries clear the pin.
+    fn sync_search_pin(&self) {
+        let q = self.search_query.trim().to_string();
+        if let Ok(mut s) = self.search_pin.lock() {
+            *s = (!q.is_empty()).then_some(q);
+        }
+    }
+
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         // B-leg picker captures keys while open (search + navigate).
         if self.b_leg_picker {
@@ -300,6 +313,7 @@ impl App {
                 KeyCode::Char(c) => self.search_query.push(c),
                 _ => {}
             }
+            self.sync_search_pin();
             return;
         }
 

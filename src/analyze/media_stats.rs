@@ -8,6 +8,13 @@
 
 pub const RTP_REORDER_WINDOW: u16 = 64;
 
+/// Forward sequence jump larger than this between two consecutive arrivals is
+/// treated as a sender restart / SSRC+port reuse, not packet loss: a single
+/// inter-arrival gap cannot legitimately skip thousands of packets (50 pps
+/// audio would need ~80s of sending into a black hole to reach it). The
+/// reorder window is flushed and tracking resumes from the new sequence.
+pub const RTP_RESTART_WINDOW: u16 = 4096;
+
 /// `|D|` larger than this (milliseconds) is a discontinuity, not jitter.
 pub const JITTER_DISCONT_MS: f64 = 1000.0;
 
@@ -24,6 +31,9 @@ pub struct RtpStatsHeader {
 pub struct MediaStatsAccumulator {
     pub packet_count: u64,
     pub lost_packets: u64,
+    /// Detected sequence restarts (SSRC/port reuse, sender restart) — not
+    /// counted as loss.
+    pub restarts: u64,
     pub payload_type: Option<u8>,
     pub clock_rate: Option<u32>,
     pub first_sequence: Option<u16>,
@@ -42,6 +52,7 @@ pub struct MediaStats {
     pub lost_packets: u64,
     pub expected_packets: u64,
     pub loss_percent: f64,
+    pub restarts: u64,
     pub jitter_ms: Option<f64>,
     pub payload_type: Option<u8>,
     pub clock_rate: Option<u32>,
@@ -98,6 +109,15 @@ impl MediaStatsAccumulator {
             return;
         }
         if diff < 0x8000 {
+            if diff > RTP_RESTART_WINDOW {
+                // Sender restart / SSRC+port reuse: booking thousands of
+                // packets lost off a single arrival would permanently inflate
+                // the cumulative loss rate. Reset tracking instead.
+                self.pending_missing.clear();
+                self.restarts += 1;
+                self.last_sequence = Some(seq);
+                return;
+            }
             if diff > 1 {
                 self.defer_missing(last, seq);
             }
@@ -177,6 +197,7 @@ impl MediaStatsAccumulator {
             lost_packets: lost,
             expected_packets: expected,
             loss_percent: loss_pct,
+            restarts: self.restarts,
             jitter_ms,
             payload_type: self.payload_type,
             clock_rate: self.clock_rate,
@@ -225,6 +246,43 @@ mod tests {
         let st = s.snapshot();
         assert_eq!(st.lost_packets, 1);
         assert_eq!(st.expected_packets, 3);
+    }
+
+    #[test]
+    fn large_forward_jump_is_restart_not_loss() {
+        // SSRC/port reuse or sender restart: the new session starts at an
+        // unrelated random sequence number.
+        let mut s = MediaStatsAccumulator::new();
+        s.observe(1_000_000, Some(hdr(100, 1_600)));
+        s.observe(1_020_000, Some(hdr(30_000, 480_000)));
+        s.observe(1_040_000, Some(hdr(30_001, 480_160)));
+        s.observe(1_060_000, Some(hdr(30_002, 480_320)));
+        let st = s.snapshot();
+        assert_eq!(st.lost_packets, 0, "restart must not book ~29k lost");
+        assert_eq!(st.restarts, 1);
+        assert_eq!(st.expected_packets, 4);
+    }
+
+    #[test]
+    fn restart_across_seq_wraparound() {
+        let mut s = MediaStatsAccumulator::new();
+        s.observe(1_000_000, Some(hdr(65_500, 1_600)));
+        s.observe(1_020_000, Some(hdr(5_000, 480_000)));
+        s.observe(1_040_000, Some(hdr(5_001, 480_160)));
+        let st = s.snapshot();
+        assert_eq!(st.lost_packets, 0, "wrapped restart must not book loss");
+        assert_eq!(st.restarts, 1);
+    }
+
+    #[test]
+    fn moderate_gap_still_counts_as_loss() {
+        // A 100-packet gap is below the restart threshold: still real loss.
+        let mut s = MediaStatsAccumulator::new();
+        s.observe(1_000_000, Some(hdr(100, 1_600)));
+        s.observe(1_020_000, Some(hdr(200, 3_200)));
+        let st = s.snapshot();
+        assert_eq!(st.lost_packets, 99);
+        assert_eq!(st.restarts, 0);
     }
 
     fn pcmu(seq: u16, ts: u32) -> RtpStatsHeader {

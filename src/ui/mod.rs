@@ -87,6 +87,16 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
             Style::default().fg(theme::ACCENT),
         ),
     ];
+    if snap.pkts_dropped > 0 {
+        // Monitor-side drops (kernel/libpcap ring overflow): the loss figures
+        // include packets this machine never captured.
+        spans.push(Span::styled(
+            format!("⚠ ifdrop {} ", snap.pkts_dropped),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if paused {
         spans.push(Span::styled(
             "⏸ PAUSED ",
@@ -184,9 +194,7 @@ fn page_keys(page: Page) -> &'static str {
     match page {
         Page::Overview => "[↑↓/PgUp/PgDn] select [Enter] open call detail",
         Page::Search => "[↑↓/PgUp/PgDn] select [Enter] open call detail [/] new query",
-        Page::CallDetail => {
-            "[↑↓] msg  [l] link b-leg  [L] unlink  [PgUp/PgDn] raw  [←/Esc] back"
-        }
+        Page::CallDetail => "[↑↓] msg  [l] link b-leg  [L] unlink  [PgUp/PgDn] raw  [←/Esc] back",
         Page::Heatmap => "[↑↓/PgUp/PgDn] scroll [s] sort [w] loss window",
         Page::Streams => "[↑↓/PgUp/PgDn] select stream",
         Page::EventLog => "[↑↓/PgUp/PgDn] scroll",

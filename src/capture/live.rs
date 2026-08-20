@@ -43,6 +43,11 @@ impl CaptureSource for LiveSource {
         self.stop = Some(stop);
     }
 
+    fn pcap_stats(&mut self) -> Option<(u64, u64)> {
+        let s = self.cap.stats().ok()?;
+        Some((u64::from(s.received), u64::from(s.dropped)))
+    }
+
     fn next_frame(&mut self, f: &mut dyn FnMut(u64, u32, &[u8])) -> bool {
         loop {
             if self

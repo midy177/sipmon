@@ -14,10 +14,17 @@ pub trait CaptureSource: Send {
     /// Invoke `f` with `(ts_us, linktype, packet_bytes)` for the next frame.
     /// Returns `false` on EOF or shutdown.
     fn next_frame(&mut self, f: &mut dyn FnMut(u64, u32, &[u8])) -> bool;
-
     /// Attach a pipeline shutdown signal. Once set, `next_frame` must return
     /// `false` promptly so the pipeline can drain and exit cleanly.
     fn set_stop(&mut self, _stop: Arc<AtomicBool>) {}
+
+    /// Live capture drop statistics, if the source can provide them:
+    /// `(received, dropped)` as reported by the kernel/libpcap. Non-zero
+    /// `dropped` means the monitor itself missed packets (loss figures may be
+    /// overstated). File/replay sources return `None`.
+    fn pcap_stats(&mut self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 impl CaptureSource for Box<dyn CaptureSource> {
@@ -26,6 +33,9 @@ impl CaptureSource for Box<dyn CaptureSource> {
     }
     fn set_stop(&mut self, stop: Arc<AtomicBool>) {
         (**self).set_stop(stop)
+    }
+    fn pcap_stats(&mut self) -> Option<(u64, u64)> {
+        (**self).pcap_stats()
     }
 }
 

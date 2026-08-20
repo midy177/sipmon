@@ -180,7 +180,11 @@ fn render_b_leg_picker(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App
     let title = format!(
         "Link b-leg  filter: {}{}  [{}]",
         app.b_leg_query,
-        if app.b_leg_query.is_empty() { "(type to search)" } else { "" },
+        if app.b_leg_query.is_empty() {
+            "(type to search)"
+        } else {
+            ""
+        },
         cands.len()
     );
     let filter = Paragraph::new(app.b_leg_query.as_str()).block(
@@ -209,11 +213,9 @@ fn render_b_leg_picker(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App
             Constraint::Length(10),
         ],
     )
-    .header(Row::new(
-        ["Call-ID", "From → To", "State"]
-            .iter()
-            .map(|h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD))),
-    ))
+    .header(Row::new(["Call-ID", "From → To", "State"].iter().map(
+        |h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)),
+    )))
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -312,10 +314,11 @@ fn render_swimlane(
         Cell::from("Time"),
         Cell::from(header_swim).style(Style::default().add_modifier(Modifier::BOLD)),
     ]))
-    .block(Block::default().borders(Borders::ALL).title(format!(
-        "Flow · {title_parties} ({} msgs)",
-        messages.len()
-    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Flow · {title_parties} ({} msgs)", messages.len())),
+    )
     .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, area, &mut app.flow_state);
 }
@@ -344,7 +347,9 @@ fn swim_header(labels: &[String], width: usize) -> String {
     let mut buf = vec![b' '; width];
     for (label, &c) in labels.iter().zip(&centers) {
         let bytes = label.as_bytes();
-        let start = c.saturating_sub(bytes.len() / 2).min(width.saturating_sub(1));
+        let start = c
+            .saturating_sub(bytes.len() / 2)
+            .min(width.saturating_sub(1));
         for (i, &b) in bytes.iter().enumerate() {
             if start + i < width {
                 buf[start + i] = b;
@@ -410,8 +415,8 @@ fn resolve_party_pair(
     }
     // 3-party fallback by dialog leg: a-leg spans 0↔1, b-leg spans 1↔2.
     if parties.len() == 3 {
-        let dst_mid = party_index(parties, m.flow.dst) == Some(1)
-            || m.flow.dst.ip() == parties[1].ip();
+        let dst_mid =
+            party_index(parties, m.flow.dst) == Some(1) || m.flow.dst.ip() == parties[1].ip();
         match leg {
             Some(0) => {
                 if dst_mid {
@@ -451,9 +456,9 @@ fn mid_socket(pbx: std::net::IpAddr, messages: &[SipMsg]) -> std::net::SocketAdd
 
 /// Endpoints for a single-dialog swimlane: initial INVITE src/dst, else first msg.
 fn two_parties(messages: &[SipMsg]) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
-    let invite = messages.iter().find(|m| {
-        m.is_request && matches!(m.method, Some(Method::Invite)) && m.to_tag.is_none()
-    });
+    let invite = messages
+        .iter()
+        .find(|m| m.is_request && matches!(m.method, Some(Method::Invite)) && m.to_tag.is_none());
     let m = invite.or_else(|| messages.first())?;
     Some((m.flow.src, m.flow.dst))
 }
@@ -1495,7 +1500,9 @@ mod tests {
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some(crate::store::registry::FocusHint::primary("c1")))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -1555,7 +1562,9 @@ mod tests {
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some(crate::store::registry::FocusHint::primary("c1")))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -1592,7 +1601,9 @@ mod tests {
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some(crate::store::registry::FocusHint::primary("c1")))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -1701,7 +1712,9 @@ mod tests {
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some(crate::store::registry::FocusHint::primary("c1")))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -1971,7 +1984,9 @@ mod tests {
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some(crate::store::registry::FocusHint::primary("c1")))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -2019,16 +2034,13 @@ mod tests {
         let focus = Focus {
             call_id: "c1".into(),
             state: Some(crate::model::sip::CallState::Active),
-            messages: vec![
-                mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"),
-                {
-                    let mut m = mk_msg(1_100_000, "2.2.2.2:5060", "1.1.1.1:5060", "t1");
-                    m.is_request = false;
-                    m.method = None;
-                    m.status = Some(100);
-                    m
-                },
-            ],
+            messages: vec![mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"), {
+                let mut m = mk_msg(1_100_000, "2.2.2.2:5060", "1.1.1.1:5060", "t1");
+                m.is_request = false;
+                m.method = None;
+                m.status = Some(100);
+                m
+            }],
             legs: vec![0, 0],
             ..Focus::default()
         };
@@ -2039,7 +2051,9 @@ mod tests {
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some(crate::store::registry::FocusHint::primary("c1")))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );

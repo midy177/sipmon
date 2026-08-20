@@ -76,6 +76,11 @@ impl Correlator {
         self.reg.focus_hint = hint;
     }
 
+    /// Update the UI search hint; pinned matches keep Search results stable.
+    pub fn set_search(&mut self, q: Option<String>) {
+        self.reg.set_search_hint(q.as_deref());
+    }
+
     /// Reset all in-memory state (TUI `x` clear): registry + correlator
     /// bookkeeping. Evlog writing is unaffected.
     pub fn clear(&mut self) {
@@ -177,6 +182,11 @@ impl Correlator {
             if let Some(evt) = evt {
                 self.push_ev(crate::store::evlog::Event::StreamSnap(evt));
             }
+        }
+        // Refresh search pins *before* eviction so newly-matched calls are
+        // protected in this cycle (new calls / late-filled From/To users).
+        if self.reg.search_hint.is_some() {
+            self.reg.refresh_search_matches();
         }
         self.reg.evict_stale(self.call_ttl_secs, ts_us);
         self.reg.evict_if_needed();

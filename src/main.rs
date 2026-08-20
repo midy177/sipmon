@@ -196,6 +196,9 @@ struct Shared {
     snap: Arc<Mutex<Arc<Snapshot>>>,
     pause: Arc<AtomicBool>,
     focus: Arc<Mutex<Option<FocusHint>>>,
+    /// Current UI search query: the pipeline pins matching calls so Search
+    /// results survive TTL eviction and the recent-calls snapshot window.
+    search: Arc<Mutex<Option<String>>>,
     quit: Arc<AtomicBool>,
     clear: Arc<AtomicBool>,
     /// Live event-log recording state for the TUI top-bar indicator.
@@ -208,6 +211,7 @@ impl Shared {
             snap: Arc::new(Mutex::new(Arc::new(Snapshot::default()))),
             pause: Arc::new(AtomicBool::new(false)),
             focus: Arc::new(Mutex::new(None)),
+            search: Arc::new(Mutex::new(None)),
             quit: Arc::new(AtomicBool::new(false)),
             clear: Arc::new(AtomicBool::new(false)),
             record: RecordState::default(),
@@ -596,6 +600,7 @@ fn run_capture_loop(
         // Idle-skip bookkeeping: republish only when traffic or focus changed.
         let mut last_pub_pkts = u64::MAX;
         let mut last_pub_focus: Option<FocusHint> = Some(FocusHint::primary("\u{0}init"));
+        let mut last_pub_search: Option<String> = None;
         let mut exhausted = false;
         loop {
             if quit_sig_raised() {
@@ -633,12 +638,14 @@ fn run_capture_loop(
                 }
                 if with_tui {
                     // Capture finished but the TUI is still open: keep the
-                    // worker alive so focus changes (Enter on a call) are
-                    // republished into the snapshot.
+                    // worker alive so focus/search changes (Enter on a call,
+                    // typing a query) are republished into the snapshot.
                     let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
-                    if cur_focus != last_pub_focus {
+                    let cur_search = shared2.search.lock().ok().and_then(|s| s.clone());
+                    if cur_focus != last_pub_focus || cur_search != last_pub_search {
                         publish(&shared2, &mut corr, true);
                         last_pub_focus = cur_focus;
+                        last_pub_search = cur_search;
                     }
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
@@ -661,11 +668,29 @@ fn run_capture_loop(
                 if with_tui {
                     let cur_pkts = corr.reg.pkts_total;
                     let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
-                    if cur_pkts != last_pub_pkts || cur_focus != last_pub_focus {
+                    let cur_search = shared2.search.lock().ok().and_then(|s| s.clone());
+                    if cur_pkts != last_pub_pkts
+                        || cur_focus != last_pub_focus
+                        || cur_search != last_pub_search
+                    {
                         publish(&shared2, &mut corr, false);
                         last_pub_pkts = cur_pkts;
                         last_pub_focus = cur_focus;
+                        last_pub_search = cur_search;
                     }
+                }
+                // Monitor-side drop accounting: packets the kernel/libpcap
+                // ring lost look like RTP seq gaps and would be booked as
+                // network loss. Surface the counter so the operator can tell
+                // monitor drops from real loss.
+                if let Some((_recv, dropped)) = source.pcap_stats()
+                    && dropped > corr.reg.pkts_dropped
+                {
+                    tracing::warn!(
+                        dropped,
+                        "monitor dropped packets (capture ring overflow): loss stats may be overstated"
+                    );
+                    corr.reg.pkts_dropped = dropped;
                 }
                 flush_recorder(&mut writer, &shared2.record);
                 last_publish = std::time::Instant::now();
@@ -728,6 +753,8 @@ fn flush_recorder(writer: &mut Option<EvlogWriter<std::fs::File>>, record: &Reco
 fn publish(shared: &Shared, corr: &mut Correlator, full: bool) {
     let focus = shared.focus.lock().ok().and_then(|f| f.clone());
     corr.set_focus(focus);
+    let search = shared.search.lock().ok().and_then(|s| s.clone());
+    corr.set_search(search);
     let snap = if full {
         corr.reg.snapshot_full()
     } else {
@@ -855,6 +882,7 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
     let handle = std::thread::spawn(move || {
         let mut corr = corr;
         let mut last_pub_focus: Option<FocusHint> = Some(FocusHint::primary("\u{0}init"));
+        let mut last_pub_search: Option<String> = None;
         let mut last_publish = Instant::now();
         let mut done = false;
         loop {
@@ -877,6 +905,11 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
                     replay_apply(&mut corr, ty, ts, payload);
                     // Keep the TUI live while ingesting a large evlog.
                     if with_tui && last_publish.elapsed() >= Duration::from_millis(200) {
+                        // Pick up calls ingested since the last publish as
+                        // search pins (replay has no periodic flush cycle).
+                        if corr.reg.search_hint.is_some() {
+                            corr.reg.refresh_search_matches();
+                        }
                         publish(&shared2, &mut corr, false);
                         last_publish = Instant::now();
                     }
@@ -890,12 +923,14 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
                     }
                     if with_tui {
                         // Replay finished but the TUI is still open: keep the
-                        // worker alive so focus changes (Enter on a call) are
-                        // republished into the snapshot.
+                        // worker alive so focus/search changes are republished
+                        // into the snapshot.
                         let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
-                        if cur_focus != last_pub_focus {
+                        let cur_search = shared2.search.lock().ok().and_then(|s| s.clone());
+                        if cur_focus != last_pub_focus || cur_search != last_pub_search {
                             publish(&shared2, &mut corr, true);
                             last_pub_focus = cur_focus;
+                            last_pub_search = cur_search;
                         }
                         std::thread::sleep(Duration::from_millis(50));
                         continue;
@@ -1236,6 +1271,7 @@ fn run_tui(shared: Arc<Shared>, local_ips: &[std::net::IpAddr]) -> Result<()> {
         shared.record.clone(),
     );
     app.local_ips = local_ips.to_vec();
+    app.search_pin = shared.search.clone();
     let r = (|| -> Result<()> {
         loop {
             terminal.draw(|f| ui::render(f, &mut app))?;

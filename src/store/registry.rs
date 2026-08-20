@@ -148,7 +148,9 @@ pub struct Snapshot {
     pub tz_offset_secs: Option<i32>,
     pub pps: f64,
     pub pkts_total: u64,
-    #[allow(dead_code)]
+    /// Packets the monitor itself dropped (kernel/libpcap ring overflow) on
+    /// live captures. Non-zero means loss figures may include monitor-side
+    /// drops, not network loss.
     pub pkts_dropped: u64,
     pub calls_total: u64,
     pub active: usize,
@@ -195,7 +197,7 @@ pub struct Registry {
     /// UTC offset (seconds) of the machine that recorded the event log
     /// (populated on replay); used to render the original local wall-clock.
     pub tz_offset_secs: Option<i32>,
-    #[allow(dead_code)]
+    /// Live-capture drop counter (kernel/libpcap stats), see Snapshot's field.
     pub pkts_dropped: u64,
     pub pkts_last_window: u64,
     pub window_start_us: Option<u64>,
@@ -209,6 +211,13 @@ pub struct Registry {
     /// UI focus hint: primary (+ optional linked b-leg) whose detail is included
     /// in snapshots.
     pub focus_hint: Option<FocusHint>,
+    /// UI search hint: the current search query. Matching calls are pinned in
+    /// snapshots (even outside the recent-calls window) and protected from TTL
+    /// / capacity eviction, so Search results don't vanish mid-analysis.
+    pub search_hint: Option<String>,
+    /// Call-ids currently matching `search_hint` (refreshed on hint change and
+    /// on periodic maintenance; bounded by [`SEARCH_PIN_MAX`]).
+    search_matches: Vec<String>,
     /// Call-ids removed by eviction since the last drain (lets the correlator
     /// prune its own per-call maps like `invite_rr` / `terminal_done`, keeping
     /// long-running sessions bounded).
@@ -233,6 +242,9 @@ pub struct Registry {
     pub max_diagnostics: usize,
 }
 
+/// Upper bound on search-pinned call-ids (protection + snapshot injection).
+pub const SEARCH_PIN_MAX: usize = 1000;
+
 impl Default for Registry {
     fn default() -> Self {
         Self {
@@ -256,6 +268,8 @@ impl Default for Registry {
             diagnostics: VecDeque::new(),
             heatmap: crate::store::heatmap::Heatmap::new(900),
             focus_hint: None,
+            search_hint: None,
+            search_matches: Vec::new(),
             stream_index: HashMap::new(),
             ssrc_index: HashMap::new(),
             ipstats: IpStatsStore::new(),
@@ -321,6 +335,59 @@ impl Registry {
         self.completed = 0;
         self.failed = 0;
         self.focus_hint = None;
+        self.search_matches.clear();
+    }
+
+    /// Update the search hint (from the TUI). Recomputes the pinned match list
+    /// only when the normalized query actually changed.
+    pub fn set_search_hint(&mut self, q: Option<&str>) {
+        let norm = q
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if norm.as_deref() == self.search_hint.as_deref() {
+            return;
+        }
+        self.search_hint = norm;
+        self.refresh_search_matches();
+    }
+
+    /// Recompute the search-pinned call-ids from the current query. Called on
+    /// hint change and on periodic maintenance (new calls / late-filled
+    /// From/To users must be picked up).
+    pub fn refresh_search_matches(&mut self) {
+        self.search_matches.clear();
+        let Some(q) = self.search_hint.as_deref() else {
+            return;
+        };
+        let q = q.to_ascii_lowercase();
+        if q.is_empty() {
+            return;
+        }
+        let mut matched: Vec<(Option<u64>, String)> = self
+            .calls
+            .values()
+            .filter(|c| call_matches(c, &q))
+            .map(|c| (c.invite_ts, c.call_id.clone()))
+            .collect();
+        matched.sort_by_key(|(ts, _)| std::cmp::Reverse(ts.unwrap_or(0)));
+        self.search_matches = matched
+            .into_iter()
+            .take(SEARCH_PIN_MAX)
+            .map(|(_, id)| id)
+            .collect();
+    }
+
+    /// True when the call-id is focus- or search-protected.
+    fn pinned_set(&self) -> HashSet<&str> {
+        let mut set: HashSet<&str> = self.search_matches.iter().map(String::as_str).collect();
+        if let Some(h) = &self.focus_hint {
+            set.insert(h.primary.as_str());
+            if let Some(l) = h.linked.as_deref() {
+                set.insert(l);
+            }
+        }
+        set
     }
 
     /// Record that `key` belongs to `call_id` (called on stream creation).
@@ -373,36 +440,37 @@ impl Registry {
 
     /// Evict oldest *terminated* calls when above `max_calls`. Falls back to
     /// evicting the oldest active call only if all are still active.
+    /// Focus- and search-pinned calls are never evicted here.
     pub fn evict_if_needed(&mut self) {
         while self.calls.len() > self.max_calls {
+            let pinned = self.pinned_set();
             // Find oldest terminated call by invite_ts.
             let target = self
                 .order
                 .iter()
-                .filter_map(|id| self.calls.get(id))
-                .filter(|c| {
+                .filter_map(|id| self.calls.get(id).map(|c| (id.as_str(), c)))
+                .filter(|(id, _)| !pinned.contains(id))
+                .filter(|(_, c)| {
                     matches!(
                         c.state,
                         CallState::Completed | CallState::Failed | CallState::Canceled
                     )
                 })
-                .min_by_key(|c| c.invite_ts.unwrap_or(u64::MAX))
-                .map(|c| c.call_id.clone());
+                .min_by_key(|(_, c)| c.invite_ts.unwrap_or(u64::MAX))
+                .map(|(id, _)| id.to_string());
 
-            let cid = target
-                .or_else(|| {
-                    // All active; evict oldest by invite_ts.
-                    self.order
-                        .iter()
-                        .filter_map(|id| self.calls.get(id))
-                        .min_by_key(|c| c.invite_ts.unwrap_or(u64::MAX))
-                        .map(|c| c.call_id.clone())
-                })
-                .unwrap_or_else(|| self.order.first().cloned().unwrap_or_default());
+            let cid = target.or_else(|| {
+                // All evictable calls are active; evict oldest by invite_ts.
+                self.order
+                    .iter()
+                    .filter_map(|id| self.calls.get(id).map(|c| (id.as_str(), c)))
+                    .filter(|(id, _)| !pinned.contains(id))
+                    .min_by_key(|(_, c)| c.invite_ts.unwrap_or(u64::MAX))
+                    .map(|(id, _)| id.to_string())
+            });
 
-            if cid.is_empty() {
-                break;
-            }
+            // Nothing evictable (all remaining calls are pinned): keep them.
+            let Some(cid) = cid else { break };
             self.remove_call(&cid);
         }
 
@@ -427,22 +495,19 @@ impl Registry {
     }
 
     /// Drop idle and terminated calls older than `ttl_secs` of capture time.
-    /// `ttl_secs == 0` disables time-based eviction (file/replay).
+    /// `ttl_secs == 0` disables time-based eviction (file/replay). Focus- and
+    /// search-pinned calls are retained.
     pub fn evict_stale(&mut self, ttl_secs: u64, now_us: u64) {
         if ttl_secs == 0 || now_us == 0 {
             return;
         }
         let cutoff = now_us.saturating_sub(ttl_secs.saturating_mul(1_000_000));
-        let focus = self.focus_hint.clone();
+        let pinned = self.pinned_set();
         let stale: Vec<String> = self
             .calls
             .iter()
-            .filter(|(id, c)| {
-                if let Some(h) = &focus {
-                    if h.primary == **id || h.linked.as_deref() == Some(id.as_str()) {
-                        return false;
-                    }
-                }
+            .filter(|(id, _)| !pinned.contains(id.as_str()))
+            .filter(|(_, c)| {
                 let terminal = matches!(
                     c.state,
                     CallState::Completed | CallState::Failed | CallState::Canceled
@@ -618,6 +683,25 @@ impl Registry {
             .map(|c| self.summarize(c))
             .collect();
 
+        // Search-pinned calls stay visible even when they have fallen out of
+        // the recent-calls window (skipped for full snapshots, which already
+        // include every call).
+        if limit != usize::MAX && !self.search_matches.is_empty() {
+            let cap = limit.saturating_add(SEARCH_PIN_MAX);
+            let in_window: HashSet<String> = summaries.iter().map(|s| s.call_id.clone()).collect();
+            for id in &self.search_matches {
+                if summaries.len() >= cap {
+                    break;
+                }
+                if in_window.contains(id.as_str()) {
+                    continue;
+                }
+                if let Some(c) = self.calls.get(id) {
+                    summaries.push(self.summarize(c));
+                }
+            }
+        }
+
         let (active_n, comp_n, fail_n) =
             summaries
                 .iter()
@@ -732,10 +816,7 @@ impl Registry {
             diagnostics: self.diagnostics.iter().cloned().collect(),
             ip_stats: self.ipstats.snapshot(),
             buckets: self.heatmap.flat(),
-            focus: self
-                .focus_hint
-                .as_ref()
-                .and_then(|h| self.focus_detail(h)),
+            focus: self.focus_hint.as_ref().and_then(|h| self.focus_detail(h)),
             paused: false,
         }
     }
@@ -877,6 +958,38 @@ fn trim_msgs(msgs: &[SipMsg]) -> Vec<SipMsg> {
     } else {
         msgs.to_vec()
     }
+}
+
+/// Registry-side search predicate over `Call`, mirroring the UI's
+/// `call_matches_query` (Call-ID / From / To / caller socket / any call IP).
+fn call_matches(c: &Call, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    if c.call_id.to_ascii_lowercase().contains(q) {
+        return true;
+    }
+    if c.from_user
+        .as_deref()
+        .is_some_and(|v| v.to_ascii_lowercase().contains(q))
+    {
+        return true;
+    }
+    if c.to_user
+        .as_deref()
+        .is_some_and(|v| v.to_ascii_lowercase().contains(q))
+    {
+        return true;
+    }
+    if c.invite_key
+        .as_deref()
+        .is_some_and(|k| k.to_ascii_lowercase().contains(q))
+    {
+        return true;
+    }
+    c.ips
+        .iter()
+        .any(|ip| ip.to_string().to_ascii_lowercase().contains(q))
 }
 
 /// Merge primary + linked call messages by timestamp; primary → leg 0, linked → leg 1.
@@ -1086,6 +1199,68 @@ mod tests {
         assert_eq!(focus.messages[1].ts_us, 1_050_000);
         assert_eq!(focus.messages[2].ts_us, 1_100_000);
         assert_eq!(focus.b2bua.as_ref().map(|b| b.legs), Some(2));
+    }
+
+    #[test]
+    fn search_pin_protects_from_ttl_and_window() {
+        let mut reg = Registry::with_source("t".into());
+        {
+            let a = reg.get_or_create_call("alice-call");
+            a.invite_ts = Some(1_000);
+            a.last_ts_us = 1_000;
+            a.end_ts = Some(2_000);
+            a.state = CallState::Completed;
+            a.from_user = Some("alice".into());
+        }
+        {
+            let b = reg.get_or_create_call("bob-call");
+            b.invite_ts = Some(3_000);
+            b.last_ts_us = 3_000;
+            b.end_ts = Some(4_000);
+            b.state = CallState::Completed;
+            b.from_user = Some("bob".into());
+        }
+        reg.set_search_hint(Some("alice"));
+
+        // TTL eviction past the cutoff: the pinned call survives.
+        reg.evict_stale(60, 120_000_000);
+        assert!(reg.calls.contains_key("alice-call"), "pin must protect");
+        assert!(!reg.calls.contains_key("bob-call"), "unpinned evicts");
+
+        // Window of 1 would only hold the newest call; pinned stays visible.
+        let snap = reg.snapshot(1);
+        assert!(snap.calls.iter().any(|c| c.call_id == "alice-call"));
+
+        // Clearing the hint lifts the protection.
+        reg.set_search_hint(None);
+        reg.evict_stale(60, 120_000_000);
+        assert!(!reg.calls.contains_key("alice-call"));
+    }
+
+    #[test]
+    fn capacity_eviction_skips_pinned_calls() {
+        let mut reg = Registry::with_source("t".into());
+        reg.set_caps(2, 10, 10);
+        {
+            let a = reg.get_or_create_call("focused");
+            a.invite_ts = Some(1_000);
+            a.last_ts_us = 1_000;
+            a.end_ts = Some(1_500);
+            a.state = CallState::Completed;
+        }
+        {
+            let b = reg.get_or_create_call("pinned-by-search");
+            b.invite_ts = Some(2_000);
+            b.last_ts_us = 2_000;
+            b.end_ts = Some(2_500);
+            b.state = CallState::Completed;
+        }
+        reg.focus_hint = Some(FocusHint::primary("focused"));
+        reg.set_search_hint(Some("pinned-by-search"));
+        reg.evict_if_needed();
+        assert_eq!(reg.calls.len(), 2, "all calls pinned: nothing evictable");
+        assert!(reg.calls.contains_key("focused"));
+        assert!(reg.calls.contains_key("pinned-by-search"));
     }
 
     #[test]
