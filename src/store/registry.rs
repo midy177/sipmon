@@ -107,6 +107,8 @@ pub struct CallSummary {
     pub to_user: Option<String>,
     /// Source IP of the initial INVITE (the caller side).
     pub caller_ip: Option<std::net::IpAddr>,
+    /// Source `ip:port` of the initial INVITE (first message).
+    pub caller_src: Option<String>,
     pub state: CallState,
     pub outcome: Outcome,
     pub invite_ts: Option<u64>,
@@ -213,9 +215,10 @@ pub struct Registry {
     /// UI focus hint: primary (+ optional linked b-leg) whose detail is included
     /// in snapshots.
     pub focus_hint: Option<FocusHint>,
-    /// UI search hint: the current search query. Matching calls are pinned in
-    /// snapshots (even outside the recent-calls window) and protected from TTL
-    /// / capacity eviction, so Search results don't vanish mid-analysis.
+    /// UI filter hint: the current filter query (rule syntax, see
+    /// `filter.rs`). Matching calls are pinned in snapshots (even outside
+    /// the recent-calls window) and protected from TTL / capacity eviction,
+    /// so filter results don't vanish mid-analysis.
     pub search_hint: Option<String>,
     /// Call-ids currently matching `search_hint` (refreshed on hint change and
     /// on periodic maintenance; bounded by [`SEARCH_PIN_MAX`]).
@@ -358,22 +361,20 @@ impl Registry {
         self.refresh_search_matches();
     }
 
-    /// Recompute the search-pinned call-ids from the current query. Called on
-    /// hint change and on periodic maintenance (new calls / late-filled
-    /// From/To users must be picked up).
+    /// Recompute the search-pinned call-ids from the current query (same rule
+    /// syntax as the TUI filter bar, see [`crate::filter`]). Called on hint
+    /// change and on periodic maintenance (new calls / late-filled From/To
+    /// users must be picked up).
     pub fn refresh_search_matches(&mut self) {
         self.search_matches.clear();
         let Some(q) = self.search_hint.as_deref() else {
             return;
         };
-        let q = q.to_ascii_lowercase();
-        if q.is_empty() {
-            return;
-        }
+        let rules = crate::filter::parse(q);
         let mut matched: Vec<(Option<u64>, String)> = self
             .calls
             .values()
-            .filter(|c| call_matches(c, &q))
+            .filter(|c| crate::filter::matches(*c, &rules))
             .map(|c| (c.invite_ts, c.call_id.clone()))
             .collect();
         matched.sort_by_key(|(ts, _)| std::cmp::Reverse(ts.unwrap_or(0)));
@@ -929,6 +930,7 @@ impl Registry {
             from_user: c.from_user.clone(),
             to_user: c.to_user.clone(),
             caller_ip: c.invite_key.as_deref().and_then(|k| k.parse().ok()),
+            caller_src: c.invite_src.clone(),
             state: c.state,
             outcome: c.outcome,
             invite_ts: c.invite_ts,
@@ -965,38 +967,6 @@ fn trim_msgs(msgs: &[SipMsg]) -> Vec<SipMsg> {
     } else {
         msgs.to_vec()
     }
-}
-
-/// Registry-side search predicate over `Call`, mirroring the UI's
-/// `call_matches_query` (Call-ID / From / To / caller socket / any call IP).
-fn call_matches(c: &Call, q: &str) -> bool {
-    if q.is_empty() {
-        return true;
-    }
-    if c.call_id.to_ascii_lowercase().contains(q) {
-        return true;
-    }
-    if c.from_user
-        .as_deref()
-        .is_some_and(|v| v.to_ascii_lowercase().contains(q))
-    {
-        return true;
-    }
-    if c.to_user
-        .as_deref()
-        .is_some_and(|v| v.to_ascii_lowercase().contains(q))
-    {
-        return true;
-    }
-    if c.invite_key
-        .as_deref()
-        .is_some_and(|k| k.to_ascii_lowercase().contains(q))
-    {
-        return true;
-    }
-    c.ips
-        .iter()
-        .any(|ip| ip.to_string().to_ascii_lowercase().contains(q))
 }
 
 /// Merge primary + linked call messages by timestamp; primary → leg 0, linked → leg 1.

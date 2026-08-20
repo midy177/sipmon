@@ -6,6 +6,7 @@ mod decode;
 mod diagnostics;
 mod error;
 mod export;
+mod filter;
 mod model;
 #[cfg(test)]
 mod selftest;
@@ -198,8 +199,9 @@ struct Shared {
     snap: Arc<Mutex<Arc<Snapshot>>>,
     pause: Arc<AtomicBool>,
     focus: Arc<Mutex<Option<FocusHint>>>,
-    /// Current UI search query: the pipeline pins matching calls so Search
-    /// results survive TTL eviction and the recent-calls snapshot window.
+    /// Current UI filter query (rule syntax, see `filter.rs`): the pipeline
+    /// pins matching calls so filter results survive TTL eviction and the
+    /// recent-calls snapshot window.
     search: Arc<Mutex<Option<String>>>,
     quit: Arc<AtomicBool>,
     clear: Arc<AtomicBool>,

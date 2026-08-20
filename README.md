@@ -6,9 +6,12 @@ on a running PBX**. Inputs may be a live capture, a pcap file, a stdin stream, o
 previously recorded event log; output is a live TUI monitor plus exportable
 analysis results (JSONL).
 
-![sipmon call list](list.jpg)
+![sipmon call detail](call_detail.png)
 
-![sipmon call detail](detail.jpg)
+![sipmon sip stats](sip_stats.png)
+
+![sipmon rtp stats](rtp_stats.png)
+
 
 ## Features
 
@@ -18,7 +21,7 @@ analysis results (JSONL).
 - **Media quality**: RFC3550 jitter/loss, RTCP RR RTT, one-way delay estimate, E-model MOS
 - **TURN detection**: auto-learns TURN servers, labels `turn-client` / `turn-peer` relay legs
 - **Diagnostics**: 20+ rules for Contact reachability, Record-Route, SDP/RTP consistency, one-way media, TURN allocation/refresh
-- **TUI**: Overview / Search / Call Detail / SIP Stats / Streams / Event Log / IP Stats pages
+- **TUI**: Overview / Call Detail / SIP Stats / Streams / Event Log / IP Stats pages
 - **Analysis**: PDD/setup/ring timing, hangup initiator (BYE, CANCEL, reject), per-IP loss over 1s…1h windows
 - **Export**: JSONL on exit or via `export`; `query` fetches a Call-ID flow for scripting
 
@@ -74,7 +77,9 @@ tcpdump -i eth0 -w - | sipmon -    # read a live tcpdump stream
 
 ## TUI
 
-Pages: **Overview** `1` · **Search** `2`/`/` · **Call Detail** `3` · **SIP Stats** `4` · **Streams** `5` · **Event Log** `6` · **IP Stats** `7`. `Tab`/`Shift-Tab` cycles pages, `Space` pauses, `e` exports JSONL, `x` clears in-memory stats, `q`/`Esc`/`Ctrl-C` quits. Search stays editable while you navigate results (`↑`/`↓` select, `Enter` opens the call); quitting a TUI session prints the full in-memory stats report (same output as `sipmon stats`, 5-minute windows).
+Pages: **Overview** `1` · **Call Detail** `2` · **SIP Stats** `3` · **Streams** `4` · **Event Log** `5` · **IP Stats** `6`. `Tab`/`Shift-Tab` cycles pages, `Space` pauses, `e` exports JSONL, `p` toggles privacy masking, `x` clears in-memory stats, `q`/`Esc`/`Ctrl-C` quits. Quitting a TUI session prints the full in-memory stats report (same output as `sipmon stats`, 5-minute windows).
+
+The Overview page carries a rule-based filter bar (`/` to edit, `c` to clear): tokens `ip:1.2.3.4[:port]`, `caller:1001`, `callee:2002`, `callid:abc` are AND-ed together (a bare word matches any field; a full IP matches exactly, a partial one as a substring). While typing, the list filters live (`↑`/`↓` select, `Enter` applies, `Esc` rolls back, `Ctrl-U` clears the input); matching calls are also pinned in the pipeline so they survive TTL/capacity eviction. The state filter `f` (all/dialing/ringing/active/success/failed/canceled) ANDs with the rule filter.
 
 Call Detail uses a fixed four-pane layout: **Flow** (sngrep-style swimlane, `↑`/`↓` selects) · **Raw** (syntax-highlighted bytes of the selected message, `PgUp`/`PgDn` scrolls) · **Diagnostics** · **Network** (traffic totals + per-stream media table). Flow headers are `ip:port` columns with a vertical bar under each party; rows are `Time | -- INVITE ->` / `<- 100 --` (short centered arrows; responses show the status code only). Same-Call-ID dual dialogs (or a manually linked b-leg via `l`) expand to three parties. `L` unlinks the b-leg.
 
@@ -107,16 +112,3 @@ Private binary append-only format. Header holds the `SMON` magic, version, and t
 - **One-way delay**: RTCP SR NTP↔RTP mapping (when both directions are visible); otherwise an indirect estimate from RTP arrival intervals (labeled "estimate")
 - **jitter/loss**: RFC3550, 64-packet reorder window; `|D| > 1s` is treated as a timestamp jump (hold/DTX/reset), not jitter. `stats` reports packet-weighted p50/p95 (SDP `a=rtpmap` clock when known)
 - **MOS**: simplified E-model (G.107): `R = 93.2 − Id − Ie`, labeled "estimate"
-
-## Limitations
-
-- TLS/SRTP encrypted payloads cannot be parsed; capture at the decryption point
-- Absolute one-way delay under one-way passive observation is an estimate; RTCP RTT is the primary metric
-- Capturing without interface permissions requires root / elevated privileges (same as tcpdump)
-
-## Tests
-
-```sh
-cargo test                       # unit + integration tests (pcap fixture)
-cargo test --test cli_integration
-```

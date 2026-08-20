@@ -206,6 +206,10 @@ pub struct Call {
     /// Remote IP key for heatmap (source IP of the first INVITE), kept on the
     /// call so it survives message-buffer trimming.
     pub invite_key: Option<String>,
+    /// Source `ip:port` of the initial INVITE (first message), kept on the
+    /// call so it survives message-buffer trimming. Powers the Overview Src
+    /// column.
+    pub invite_src: Option<String>,
     /// Distinct IPs involved in this call (SIP endpoints + media flows).
     /// Used by the per-IP network-stats drill-down.
     pub ips: Vec<std::net::IpAddr>,
@@ -250,6 +254,7 @@ impl Call {
             critical_count: 0,
             via_turn: false,
             invite_key: None,
+            invite_src: None,
             ips: Vec::new(),
             active_ips: Vec::new(),
             last_ts_us: 0,

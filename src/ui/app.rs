@@ -71,7 +71,6 @@ impl CallFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Overview,
-    Search,
     CallDetail,
     Heatmap,
     Streams,
@@ -83,7 +82,6 @@ impl Page {
     pub fn title(self) -> &'static str {
         match self {
             Page::Overview => "Overview",
-            Page::Search => "Search",
             Page::CallDetail => "Call Detail",
             Page::Heatmap => "SIP Stats",
             Page::Streams => "Streams",
@@ -91,9 +89,8 @@ impl Page {
             Page::IpStats => "IP Stats",
         }
     }
-    pub const ALL: [Page; 7] = [
+    pub const ALL: [Page; 6] = [
         Page::Overview,
-        Page::Search,
         Page::CallDetail,
         Page::Heatmap,
         Page::Streams,
@@ -173,14 +170,18 @@ pub struct App {
     pub snap: SnapLock,
     pub pause: Arc<AtomicBool>,
     pub focus_id: Arc<Mutex<Option<FocusHint>>>,
-    /// Current search query, published to the pipeline so matching calls are
-    /// pinned (eviction-proof and always included in snapshots).
+    /// Current filter query (rule syntax: `ip:`/`caller:`/`callee:`/`callid:`
+    /// tokens AND-ed together), published to the pipeline so matching calls
+    /// are pinned (eviction-proof and always included in snapshots).
     pub search_pin: Arc<Mutex<Option<String>>>,
     pub clear: Arc<AtomicBool>,
     pub page: Page,
-    pub search_query: String,
-    pub search_editing: bool,
-    pub search_state: TableState,
+    /// Overview filter query; live-applied while typing.
+    pub filter_query: String,
+    /// True while the filter bar captures keystrokes.
+    pub filter_editing: bool,
+    /// Query snapshot taken when editing started, restored by Esc.
+    pub filter_backup: String,
     pub table_state: TableState,
     /// Call-id the user just selected (Enter) but whose focus detail the worker
     /// has not republished into the snapshot yet — used to avoid a misleading
@@ -246,9 +247,9 @@ impl App {
             search_pin: Arc::new(Mutex::new(None)),
             clear,
             page: Page::Overview,
-            search_query: String::new(),
-            search_editing: false,
-            search_state: TableState::default(),
+            filter_query: String::new(),
+            filter_editing: false,
+            filter_backup: String::new(),
             table_state: TableState::default(),
             focus_pending: None,
             selected_call: None,
@@ -316,26 +317,27 @@ impl App {
         self.page = Page::ALL[next];
     }
 
-    /// Push the current search query to the pipeline (pins matching calls).
+    /// Push the current filter query to the pipeline (pins matching calls).
     /// Empty queries clear the pin.
     fn sync_search_pin(&self) {
-        let q = self.search_query.trim().to_string();
+        let q = self.filter_query.trim().to_string();
         if let Ok(mut s) = self.search_pin.lock() {
             *s = (!q.is_empty()).then_some(q);
         }
     }
 
-    /// Keep the search-table selection inside the (possibly shrunken) result
+    /// Keep the Overview selection inside the (possibly shrunken) filtered
     /// set while the query is being typed, and default to the first row so
     /// the highlight is visible right away.
-    fn clamp_search_selection(&mut self) {
+    fn clamp_overview_selection(&mut self) {
         let snap = self.snapshot();
-        let n = search_results(&snap, &self.search_query).len();
-        let idx = match self.search_state.selected() {
+        let n = self.filtered_calls(&snap).len();
+        let idx = match self.table_state.selected() {
             Some(i) if i < n => Some(i),
             _ => (n > 0).then_some(0),
         };
-        self.search_state.select(idx);
+        self.table_state.select(idx);
+        self.sync_overview_selection(&snap);
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -345,42 +347,51 @@ impl App {
             return;
         }
         // Global: quit / pause / page switching / export.
-        if self.search_editing {
-            // Results stay live while typing: ↑↓/PgUp/PgDn move the selection
-            // without leaving edit mode, Enter jumps straight into the call.
+        if self.filter_editing {
+            // The Overview list stays live while typing: ↑↓/PgUp/PgDn move
+            // the selection without leaving edit mode; Enter commits the
+            // filter, Esc rolls back to the pre-edit query.
             let snap = self.snapshot();
-            let n = search_results(&snap, &self.search_query).len();
+            let n = self.filtered_calls(&snap).len();
             match code {
-                KeyCode::Esc => {
-                    self.search_editing = false;
+                KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
+                    self.should_quit = true;
+                    return;
                 }
-                KeyCode::Down => table_nudge(&mut self.search_state, 1, n),
-                KeyCode::Up => table_nudge(&mut self.search_state, -1, n),
-                KeyCode::PageDown => table_nudge(&mut self.search_state, PAGE_ROWS, n),
-                KeyCode::PageUp => table_nudge(&mut self.search_state, -PAGE_ROWS, n),
+                KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                    self.filter_query.clear();
+                    self.clamp_overview_selection();
+                }
+                KeyCode::Esc => {
+                    self.filter_query = self.filter_backup.clone();
+                    self.filter_editing = false;
+                }
                 KeyCode::Enter => {
-                    self.search_editing = false;
-                    let results = search_results(&snap, &self.search_query);
-                    let idx = self
-                        .search_state
-                        .selected()
-                        .or_else(|| (!results.is_empty()).then_some(0));
-                    if let Some(i) = idx
-                        && let Some(c) = results.get(i)
-                    {
-                        let id = c.call_id.clone();
-                        self.sync_search_pin();
-                        self.open_detail(id);
-                        return;
-                    }
+                    self.filter_editing = false;
+                }
+                KeyCode::Down => {
+                    table_nudge(&mut self.table_state, 1, n);
+                    self.sync_overview_selection(&snap);
+                }
+                KeyCode::Up => {
+                    table_nudge(&mut self.table_state, -1, n);
+                    self.sync_overview_selection(&snap);
+                }
+                KeyCode::PageDown => {
+                    table_nudge(&mut self.table_state, PAGE_ROWS, n);
+                    self.sync_overview_selection(&snap);
+                }
+                KeyCode::PageUp => {
+                    table_nudge(&mut self.table_state, -PAGE_ROWS, n);
+                    self.sync_overview_selection(&snap);
                 }
                 KeyCode::Backspace => {
-                    self.search_query.pop();
-                    self.clamp_search_selection();
+                    self.filter_query.pop();
+                    self.clamp_overview_selection();
                 }
                 KeyCode::Char(c) => {
-                    self.search_query.push(c);
-                    self.clamp_search_selection();
+                    self.filter_query.push(c);
+                    self.clamp_overview_selection();
                 }
                 _ => {}
             }
@@ -416,16 +427,17 @@ impl App {
                 self.set_status(if paused { "paused" } else { "resumed" });
             }
             KeyCode::Char('1') => self.page = Page::Overview,
-            KeyCode::Char('2') => self.page = Page::Search,
-            KeyCode::Char('3') => self.page = Page::CallDetail,
-            KeyCode::Char('4') => self.page = Page::Heatmap,
-            KeyCode::Char('5') => self.page = Page::Streams,
-            KeyCode::Char('6') => self.page = Page::EventLog,
-            KeyCode::Char('7') => self.page = Page::IpStats,
+            KeyCode::Char('2') => self.page = Page::CallDetail,
+            KeyCode::Char('3') => self.page = Page::Heatmap,
+            KeyCode::Char('4') => self.page = Page::Streams,
+            KeyCode::Char('5') => self.page = Page::EventLog,
+            KeyCode::Char('6') => self.page = Page::IpStats,
             KeyCode::Char('/') => {
-                self.page = Page::Search;
-                self.search_editing = true;
-                self.clamp_search_selection();
+                // The filter bar lives on the Overview page.
+                self.page = Page::Overview;
+                self.filter_editing = true;
+                self.filter_backup = self.filter_query.clone();
+                self.clamp_overview_selection();
             }
             KeyCode::Char('e') => self.do_export(),
             KeyCode::Char('p') => {
@@ -596,11 +608,14 @@ impl App {
         self.flow_state.select(Some(0));
     }
 
-    /// Calls currently visible under `filter`, in display order.
-    fn filtered_calls<'a>(&self, snap: &'a Snapshot) -> Vec<&'a CallSummary> {
+    /// Calls currently visible under the state filter (`f`) AND the rule
+    /// filter bar query, in display order.
+    pub fn filtered_calls<'a>(&self, snap: &'a Snapshot) -> Vec<&'a CallSummary> {
+        let rules = crate::filter::parse(&self.filter_query);
         snap.calls
             .iter()
             .filter(|c| self.filter.matches(c.state))
+            .filter(|c| crate::filter::matches(*c, &rules))
             .collect()
     }
 
@@ -631,7 +646,6 @@ impl App {
     fn page_key(&mut self, code: KeyCode) {
         let snap = self.snapshot();
         let overview_n = self.filtered_calls(&snap).len();
-        let search_n = search_results(&snap, &self.search_query).len();
         let flow_n = snap.focus.as_ref().map(|f| f.messages.len()).unwrap_or(0);
         match self.page {
             Page::Overview => match code {
@@ -651,6 +665,17 @@ impl App {
                     table_nudge(&mut self.table_state, -PAGE_ROWS, overview_n);
                     self.sync_overview_selection(&snap);
                 }
+                KeyCode::Char('c') => {
+                    if self.filter_query.is_empty() {
+                        self.set_status("no filter to clear");
+                    } else {
+                        self.filter_query.clear();
+                        self.filter_editing = false;
+                        self.sync_search_pin();
+                        self.clamp_overview_selection();
+                        self.set_status("filter cleared");
+                    }
+                }
                 KeyCode::Enter => {
                     // Enter opens the selected call (first row when none is
                     // selected yet).
@@ -661,25 +686,6 @@ impl App {
                         .or_else(|| (!visible.is_empty()).then_some(0));
                     if let Some(i) = idx
                         && let Some(c) = visible.get(i)
-                    {
-                        self.open_detail(c.call_id.clone());
-                    }
-                }
-                _ => {}
-            },
-            Page::Search => match code {
-                KeyCode::Down => table_nudge(&mut self.search_state, 1, search_n),
-                KeyCode::Up => table_nudge(&mut self.search_state, -1, search_n),
-                KeyCode::PageDown => table_nudge(&mut self.search_state, PAGE_ROWS, search_n),
-                KeyCode::PageUp => table_nudge(&mut self.search_state, -PAGE_ROWS, search_n),
-                KeyCode::Enter => {
-                    let results = search_results(&snap, &self.search_query);
-                    let idx = self
-                        .search_state
-                        .selected()
-                        .or_else(|| (!results.is_empty()).then_some(0));
-                    if let Some(i) = idx
-                        && let Some(c) = results.get(i)
                     {
                         self.open_detail(c.call_id.clone());
                     }
@@ -873,52 +879,19 @@ fn table_nudge(state: &mut TableState, delta: i32, len: usize) {
     state.select(Some(next));
 }
 
-/// sngrep-style search: Call-ID / From / To / remote IP / SSRC substring.
-pub fn search_results<'a>(
-    snap: &'a Snapshot,
-    query: &str,
-) -> Vec<&'a crate::store::registry::CallSummary> {
-    let q = query.trim().to_ascii_lowercase();
-    snap.calls
-        .iter()
-        .filter(|c| call_matches_query(c, &q))
-        .collect()
-}
-
 /// Candidates for the b-leg picker: every call except the focused primary,
-/// filtered by the same substring rules as Search.
+/// filtered by the same rule syntax as the Overview filter bar.
 pub fn b_leg_candidates<'a>(
     snap: &'a Snapshot,
     primary: &str,
     query: &str,
 ) -> Vec<&'a CallSummary> {
-    let q = query.trim().to_ascii_lowercase();
+    let rules = crate::filter::parse(query);
     snap.calls
         .iter()
         .filter(|c| c.call_id != primary)
-        .filter(|c| call_matches_query(c, &q))
+        .filter(|c| crate::filter::matches(*c, &rules))
         .collect()
-}
-
-fn call_matches_query(c: &CallSummary, q: &str) -> bool {
-    if q.is_empty() {
-        return true;
-    }
-    c.call_id.to_ascii_lowercase().contains(q)
-        || c.from_user
-            .as_deref()
-            .map(|v| v.to_ascii_lowercase().contains(q))
-            .unwrap_or(false)
-        || c.to_user
-            .as_deref()
-            .map(|v| v.to_ascii_lowercase().contains(q))
-            .unwrap_or(false)
-        || c.caller_ip
-            .map(|ip| ip.to_string().to_ascii_lowercase().contains(q))
-            .unwrap_or(false)
-        || c.ips
-            .iter()
-            .any(|ip| ip.to_string().to_ascii_lowercase().contains(q))
 }
 
 #[cfg(test)]
@@ -938,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_all_seven_pages_including_call_detail() {
+    fn tab_cycles_all_six_pages_including_call_detail() {
         let mut a = app();
         // From Call Detail, Tab advances to the next page (not the pane).
         a.page = Page::CallDetail;
@@ -947,7 +920,7 @@ mod tests {
         // Shift-Tab goes back to the previous page.
         a.on_key(KeyCode::BackTab, KeyModifiers::NONE);
         assert_eq!(a.page, Page::CallDetail);
-        // A full wrap of 7 Tab presses lands back on the start page.
+        // A full wrap of 6 Tab presses lands back on the start page.
         a.page = Page::Overview;
         for _ in 0..Page::ALL.len() {
             a.on_key(KeyCode::Tab, KeyModifiers::NONE);
@@ -979,26 +952,28 @@ mod tests {
     }
 
     #[test]
-    fn search_edit_mode_navigates_and_enter_opens_detail() {
+    fn filter_edit_mode_navigates_and_enter_commits() {
         let mut a = app_with_calls();
-        a.page = Page::Search;
-        // `/` enters edit mode with row 0 preselected (visible highlight).
+        // `/` jumps to Overview and enters edit mode with row 0 preselected.
+        a.page = Page::IpStats;
         a.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
-        assert!(a.search_editing);
-        assert_eq!(a.search_state.selected(), Some(0), "row 0 preselected");
-        // Typing filters; ↑↓ move the selection without leaving edit mode.
+        assert_eq!(a.page, Page::Overview);
+        assert!(a.filter_editing);
+        assert_eq!(a.table_state.selected(), Some(0), "row 0 preselected");
+        // Typing filters live; ↑↓ move the selection without leaving edit mode.
         for c in "bob".chars() {
             a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
-        assert!(a.search_editing);
+        assert!(a.filter_editing);
         a.on_key(KeyCode::Down, KeyModifiers::NONE);
-        assert!(a.search_editing, "arrows stay in edit mode");
-        // Enter opens the selected call's detail directly.
+        assert!(a.filter_editing, "arrows stay in edit mode");
+        // Enter commits the filter (no page change), then opens the selected
+        // call on a second Enter.
         a.on_key(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(!a.search_editing);
+        assert!(!a.filter_editing);
+        assert_eq!(a.page, Page::Overview);
+        a.on_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(a.page, Page::CallDetail);
-        let selected = a.search_query.clone();
-        assert!(selected.contains("bob"));
         assert_eq!(
             a.selected_call.as_deref(),
             Some("call-bobby"),
@@ -1007,19 +982,39 @@ mod tests {
     }
 
     #[test]
-    fn search_selection_clamps_when_query_shrinks_results() {
+    fn filter_esc_rolls_back_and_c_clears() {
         let mut a = app_with_calls();
-        a.page = Page::Search;
+        a.filter_query = "caller:alice".into();
+        a.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        for c in "caller:zzz".chars() {
+            a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        // Esc restores the pre-edit query (backup taken at `/`).
+        a.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(a.filter_query, "caller:alice", "Esc must roll back");
+        // `c` on Overview clears the filter in one keystroke.
+        a.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(a.filter_query.is_empty());
+        let pin = a.search_pin.lock().unwrap().clone();
+        assert!(pin.is_none(), "cleared filter must drop the pin");
+        // `c` with no filter is a harmless no-op.
+        a.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(a.filter_query.is_empty());
+    }
+
+    #[test]
+    fn filter_selection_clamps_when_query_shrinks_results() {
+        let mut a = app_with_calls();
         a.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
         for c in "999".chars() {
             a.on_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
-        assert_eq!(a.search_state.selected(), None, "no results: no selection");
+        assert_eq!(a.table_state.selected(), None, "no results: no selection");
         // Removing the query restores a valid selection.
         a.on_key(KeyCode::Backspace, KeyModifiers::NONE);
         a.on_key(KeyCode::Backspace, KeyModifiers::NONE);
         a.on_key(KeyCode::Backspace, KeyModifiers::NONE);
-        assert_eq!(a.search_state.selected(), Some(0));
+        assert_eq!(a.table_state.selected(), Some(0));
     }
 
     fn app_with_calls() -> App {
@@ -1036,6 +1031,7 @@ mod tests {
                 from_user: Some(user.into()),
                 to_user: Some("x".into()),
                 caller_ip: None,
+                caller_src: None,
                 state: CallState::Completed,
                 outcome: Outcome::Answered,
                 invite_ts: Some(1_000_000),
@@ -1075,17 +1071,17 @@ mod tests {
             .collect();
         for label in [
             "1 Overview",
-            "2 Search",
-            "3 Detail",
-            "4 SIP Stats",
-            "5 Streams",
-            "6 EventLog",
-            "7 IP Stats",
+            "2 Detail",
+            "3 SIP Stats",
+            "4 Streams",
+            "5 EventLog",
+            "6 IP Stats",
         ] {
             assert!(row.contains(label), "tab bar missing {label}: {row:?}");
         }
-        // The selected page (7 IP Stats) is highlighted with the accent bg.
-        let start = row.find("7 IP Stats").unwrap();
+        // The selected page (7 IP Stats → now 6 IP Stats) is highlighted with
+        // the accent bg.
+        let start = row.find("6 IP Stats").unwrap();
         assert_eq!(
             buf[(start as u16, last_y)].bg,
             crate::ui::theme::ACCENT,

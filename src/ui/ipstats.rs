@@ -424,6 +424,7 @@ mod tests {
             from_user: Some("alice".into()),
             to_user: Some("bob".into()),
             caller_ip: Some("10.10.0.8".parse().unwrap()),
+            caller_src: Some("10.10.0.8:5060".into()),
             state: crate::model::sip::CallState::Active,
             outcome: crate::model::sip::Outcome::Answered,
             invite_ts: Some(ts),

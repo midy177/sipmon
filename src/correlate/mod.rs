@@ -76,7 +76,7 @@ impl Correlator {
         self.reg.focus_hint = hint;
     }
 
-    /// Update the UI search hint; pinned matches keep Search results stable.
+    /// Update the UI filter hint; pinned matches keep filter results stable.
     pub fn set_search(&mut self, q: Option<String>) {
         self.reg.set_search_hint(q.as_deref());
     }

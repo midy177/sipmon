@@ -53,6 +53,9 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
         if call.invite_key.is_none() {
             call.invite_key = Some(msg.flow.src.ip().to_string());
         }
+        if call.invite_src.is_none() {
+            call.invite_src = Some(msg.flow.src.to_string());
+        }
         // Track the signaling endpoints for the per-IP active-call counter.
         if call.active_ips.is_empty() {
             call.active_ips = vec![msg.flow.src.ip(), msg.flow.dst.ip()];

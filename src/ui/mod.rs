@@ -4,7 +4,6 @@ pub mod eventlog;
 pub mod heatmap;
 pub mod ipstats;
 pub mod overview;
-pub mod search;
 pub mod streams;
 pub mod theme;
 
@@ -122,12 +121,12 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
     ));
     let line1 = Line::from(spans);
     let line2 = Line::from(Span::styled(
-        " Global: [Tab] pages [1-7] jump [/] search [Space] pause [e] export [p] privacy [x] clear [Ctrl-C/q] quit",
+        " Global: [Tab] pages [1-6] jump [/] filter [Space] pause [e] export [p] privacy [x] clear [Ctrl-C/q] quit",
         Style::default().fg(theme::MUTED),
     ));
-    let line3 = if app.search_editing {
+    let line3 = if app.filter_editing {
         Line::from(Span::styled(
-            " Search: type query — [↑↓/PgUp/PgDn] select [Enter] open call [Esc] cancel",
+            " Filter rules: ip:1.2.3.4[:port] caller:1001 callee:2002 callid:abc — space = AND — [↑↓] select [Enter] apply [Esc] cancel [Ctrl-U] clear",
             Style::default().fg(theme::WARNING),
         ))
     } else {
@@ -192,8 +191,7 @@ fn record_indicator(record: &RecordState) -> Option<Span<'static>> {
 /// Page-specific key hints shown on the top bar's third line.
 fn page_keys(page: Page) -> &'static str {
     match page {
-        Page::Overview => "[↑↓/PgUp/PgDn] select [Enter] open call detail",
-        Page::Search => "[↑↓/PgUp/PgDn] select [Enter] open call detail [/] new query",
+        Page::Overview => "[↑↓/PgUp/PgDn] select [Enter] open call detail [/] filter [c] clear filter",
         Page::CallDetail => "[↑↓] msg  [l] link b-leg  [L] unlink  [PgUp/PgDn] raw  [←/Esc] back",
         Page::Heatmap => "[↑↓/PgUp/PgDn] scroll [s] sort [w] ASR bucket 1m/5m/15m",
         Page::Streams => "[↑↓/PgUp/PgDn] select stream",
@@ -213,7 +211,6 @@ pub fn render(f: &mut Frame, app: &mut App) {
     use app::Page::*;
     match app.page {
         Overview => overview::render(f, body, &snap, app),
-        Search => search::render(f, body, &snap, app),
         CallDetail => call_detail::render(f, body, &snap, app),
         Heatmap => heatmap::render(f, body, &snap, app),
         Streams => streams::render(f, body, &snap, app),
@@ -231,17 +228,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
     );
 }
 
-/// Bottom page tab bar: `1 Overview … 7 IP Stats`, with the active page
+/// Bottom page tab bar: `1 Overview … 6 IP Stats`, with the active page
 /// highlighted. `Tab`/`Shift-Tab` walk across them continuously.
 fn render_page_tabs(f: &mut Frame, area: Rect, app: &App) {
-    const TABS: [(u8, &str); 7] = [
+    const TABS: [(u8, &str); 6] = [
         (1, "Overview"),
-        (2, "Search"),
-        (3, "Detail"),
-        (4, "SIP Stats"),
-        (5, "Streams"),
-        (6, "EventLog"),
-        (7, "IP Stats"),
+        (2, "Detail"),
+        (3, "SIP Stats"),
+        (4, "Streams"),
+        (5, "EventLog"),
+        (6, "IP Stats"),
     ];
     let active = app.page.index();
     let spans: Vec<Span> = TABS
