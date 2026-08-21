@@ -1347,10 +1347,10 @@ mod tests {
             ],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        })));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1407,10 +1407,10 @@ mod tests {
             }],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        })));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1444,10 +1444,10 @@ mod tests {
             end_ts: Some(11_010_000),
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        })));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1553,10 +1553,10 @@ mod tests {
             }],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        })));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1816,10 +1816,10 @@ mod tests {
             }),
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        })));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -1878,10 +1878,10 @@ mod tests {
             }),
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        }));
+        })));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),

@@ -220,7 +220,7 @@ mod tests {
     use crate::ui::app::{App, Page, RecordState};
 
     fn render_overview(privacy: bool) -> String {
-        let snap = Arc::new(Mutex::new(Snapshot {
+        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
             calls: vec![CallSummary {
                 call_id: "c1".into(),
                 from_user: Some("13812345678".into()),
@@ -247,7 +247,7 @@ mod tests {
                 ips: vec!["10.10.0.8".parse().unwrap()],
             }],
             ..Snapshot::default()
-        }));
+        })));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),

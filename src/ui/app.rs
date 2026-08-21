@@ -135,7 +135,7 @@ pub struct RecordState {
 }
 
 pub struct App {
-    pub snap: Arc<Mutex<Snapshot>>,
+    pub snap: Arc<Mutex<Arc<Snapshot>>>,
     pub pause: Arc<AtomicBool>,
     pub focus_id: Arc<Mutex<Option<String>>>,
     pub clear: Arc<AtomicBool>,
@@ -184,7 +184,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        snap: Arc<Mutex<Snapshot>>,
+        snap: Arc<Mutex<Arc<Snapshot>>>,
         pause: Arc<AtomicBool>,
         focus: Arc<Mutex<Option<String>>>,
         clear: Arc<AtomicBool>,
@@ -225,8 +225,11 @@ impl App {
         }
     }
 
-    pub fn snapshot(&self) -> Snapshot {
-        self.snap.lock().map(|s| s.clone()).unwrap_or_default()
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.snap
+            .lock()
+            .map(|s| Arc::clone(&s))
+            .unwrap_or_else(|_| Arc::new(Snapshot::default()))
     }
 
     pub fn set_status(&mut self, s: impl Into<String>) {
@@ -603,7 +606,7 @@ mod tests {
 
     fn app() -> App {
         App::new(
-            Arc::new(Mutex::new(Snapshot::default())),
+            Arc::new(Mutex::new(Arc::new(Snapshot::default()))),
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             Arc::new(AtomicBool::new(false)),

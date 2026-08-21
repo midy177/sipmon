@@ -170,7 +170,7 @@ enum Cmd {
 }
 
 struct Shared {
-    snap: Arc<Mutex<Snapshot>>,
+    snap: Arc<Mutex<Arc<Snapshot>>>,
     pause: Arc<AtomicBool>,
     focus: Arc<Mutex<Option<String>>>,
     quit: Arc<AtomicBool>,
@@ -182,7 +182,7 @@ struct Shared {
 impl Shared {
     fn new() -> Self {
         Self {
-            snap: Arc::new(Mutex::new(Snapshot::default())),
+            snap: Arc::new(Mutex::new(Arc::new(Snapshot::default()))),
             pause: Arc::new(AtomicBool::new(false)),
             focus: Arc::new(Mutex::new(None)),
             quit: Arc::new(AtomicBool::new(false)),
@@ -523,6 +523,9 @@ fn run_capture_loop(
     let handle = std::thread::spawn(move || {
         let mut corr = corr;
         let mut writer = writer;
+        // Reused event buffer for the hot drain (Correlator::drain_events_into
+        // keeps its capacity across frames instead of regrowing a Vec).
+        let mut evbuf: Vec<store::evlog::Event> = Vec::new();
         // Shutdown signal: unblocks capture and lets the loop exit.
         source.set_stop(shared2.quit.clone());
         // Idle-skip bookkeeping: republish only when traffic or focus changed.
@@ -551,9 +554,10 @@ fn run_capture_loop(
                     // UI/export sees the complete capture.
                     exhausted = true;
                     corr.maybe_periodic_flush(corr.reg.last_us.unwrap_or(0));
-                    for ev in corr.take_events() {
+                    corr.drain_events_into(&mut evbuf);
+                    for ev in &evbuf {
                         if let Some(w) = writer.as_mut() {
-                            let _ = w.write(&ev);
+                            let _ = w.write(ev);
                         }
                     }
                     flush_recorder(&mut writer, &shared2.record);
@@ -578,12 +582,13 @@ fn run_capture_loop(
             corr.maybe_periodic_flush(ts);
 
             // Drain evlog events.
-            for ev in corr.take_events() {
+            corr.drain_events_into(&mut evbuf);
+            for ev in &evbuf {
                 if print_events {
-                    print_event(&ev);
+                    print_event(ev);
                 }
                 if let Some(w) = writer.as_mut() {
-                    let _ = w.write(&ev);
+                    let _ = w.write(ev);
                 }
             }
 
@@ -600,9 +605,10 @@ fn run_capture_loop(
             }
         }
         corr.maybe_periodic_flush(corr.reg.last_us.unwrap_or(0));
-        for ev in corr.take_events() {
+        corr.drain_events_into(&mut evbuf);
+        for ev in &evbuf {
             if let Some(w) = writer.as_mut() {
-                let _ = w.write(&ev);
+                let _ = w.write(ev);
             }
         }
         flush_recorder(&mut writer, &shared2.record);
@@ -683,7 +689,7 @@ fn publish(shared: &Shared, corr: &mut Correlator, full: bool) {
         corr.reg.snapshot(500)
     };
     if let Ok(mut s) = shared.snap.lock() {
-        *s = snap;
+        *s = Arc::new(snap);
     }
 }
 
@@ -857,7 +863,7 @@ fn run_replay(cfg: &Config, evlog: &str, with_tui: bool) -> Result<()> {
 fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Result<()> {
     let base = export::jsonl::import_snapshot(path)?;
     let shared = Arc::new(Shared::new());
-    *shared.snap.lock().unwrap() = base.clone();
+    *shared.snap.lock().unwrap() = Arc::new(base.clone());
 
     let shared2 = shared.clone();
     let handle = std::thread::spawn(move || {
@@ -873,7 +879,7 @@ fn run_jsonl_view(cfg: &Config, path: &std::path::Path, with_tui: bool) -> Resul
             if shared2.clear.swap(false, Ordering::Relaxed)
                 && let Ok(mut s) = shared2.snap.lock()
             {
-                *s = store::registry::Snapshot::default();
+                *s = Arc::new(store::registry::Snapshot::default());
             }
             let cur_focus = shared2.focus.lock().ok().and_then(|f| f.clone());
             if cur_focus != last_pub_focus {
@@ -914,7 +920,7 @@ fn publish_jsonl(shared: &Shared, base: &store::registry::Snapshot, focus: Optio
     let mut snap = base.clone();
     snap.focus = focus.and_then(|id| build_jsonl_focus(base, id));
     if let Ok(mut s) = shared.snap.lock() {
-        *s = snap;
+        *s = Arc::new(snap);
     }
 }
 

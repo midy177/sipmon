@@ -2,7 +2,7 @@ pub mod call;
 pub mod stream;
 pub mod turn;
 
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::analyze::rtcp_rtt;
 use crate::capture::RawFrame;
@@ -18,11 +18,11 @@ use turn::{Encap, Leg};
 pub struct Correlator {
     pub reg: Registry,
     tcp_reasm: crate::decode::tcp_reasm::TcpReassembler,
-    invite_rr: HashMap<String, bool>,
-    terminal_done: std::collections::HashSet<String>,
+    invite_rr: FxHashMap<String, bool>,
+    terminal_done: FxHashSet<String>,
     /// Per-stream last-known lost count, for attributing loss deltas to the
     /// per-IP network stats during the periodic flush.
-    last_lost: HashMap<StreamKey, u64>,
+    last_lost: FxHashMap<StreamKey, u64>,
     min_severity: Severity,
     raw_truncate: Option<usize>,
     no_media: bool,
@@ -46,9 +46,9 @@ impl Correlator {
         Self {
             reg,
             tcp_reasm: crate::decode::tcp_reasm::TcpReassembler::new(),
-            invite_rr: HashMap::new(),
-            terminal_done: std::collections::HashSet::new(),
-            last_lost: HashMap::new(),
+            invite_rr: FxHashMap::default(),
+            terminal_done: FxHashSet::default(),
+            last_lost: FxHashMap::default(),
             min_severity: Severity::from_level(&config.diag_level),
             raw_truncate: config.raw_truncate,
             no_media: config.no_media,
@@ -77,6 +77,14 @@ impl Correlator {
     /// Drain buffered evlog events (consumed by the pipeline's writer thread).
     pub fn take_events(&mut self) -> Vec<crate::store::evlog::Event> {
         std::mem::take(&mut self.pending_events)
+    }
+
+    /// Drain pending events into `out` (cleared first). Unlike `take_events`
+    /// both vectors keep their capacity across calls, so the per-frame hot
+    /// drain stops regrowing a Vec from zero after the first batch.
+    pub fn drain_events_into(&mut self, out: &mut Vec<crate::store::evlog::Event>) {
+        out.clear();
+        out.append(&mut self.pending_events);
     }
 
     /// Every ~5s of capture time: emit StreamSnap events for active streams.
@@ -306,8 +314,25 @@ impl Correlator {
         // Apply state machine.
         let call = self.reg.get_or_create_call(&call_id);
         crate::correlate::call::apply_sip(call, &msg);
-        // Bound per-call message retention (a pathological long-lived call must
-        // not grow without limit; focus detail already caps at 1000 for display).
+        // Assemble the evlog event from &msg first. flow/bools/method are Copy,
+        // so this only clones the string/raw fields and leaves msg whole for the
+        // move below — the full-SipMsg clone that used to live in apply_sip is gone.
+        let evt = crate::store::evlog::Event::SipMsg(crate::store::evlog::SipMsgEvt {
+            ts_us: ts,
+            flow: msg.flow,
+            is_request: msg.is_request,
+            method: msg.method.map(|m| m.name().to_string()),
+            status: msg.status,
+            call_id: msg.call_id.clone(),
+            cseq: msg.cseq,
+            branch: msg.branch.clone(),
+            from_tag: msg.from_tag.clone(),
+            to_tag: msg.to_tag.clone(),
+            raw: msg.raw.to_vec(),
+        });
+        // Store the message by move; bound per-call retention (a pathological
+        // long-lived call must not grow without limit; focus detail caps at 1000).
+        call.messages.push(msg);
         const MAX_MSGS_PER_CALL: usize = 2000;
         if call.messages.len() > MAX_MSGS_PER_CALL {
             let excess = call.messages.len() - MAX_MSGS_PER_CALL;
@@ -334,29 +359,18 @@ impl Correlator {
             }
         }
 
-        // Register SDP endpoints for RTP association.
+        // Register SDP endpoints for RTP association. Build the Arc once and
+        // bump the refcount per endpoint (cheap) instead of cloning a String
+        // per endpoint.
         if let Some(n) = &learned {
+            let cid: std::sync::Arc<str> = std::sync::Arc::from(call_id.as_str());
             for ep in &n.endpoints {
-                self.reg.endpoint_call.insert(*ep, call_id.clone());
+                self.reg.endpoint_call.insert(*ep, std::sync::Arc::clone(&cid));
             }
         }
 
-        // Evlog: record the SIP message (raw optionally truncated upstream).
-        self.pending_events.push(crate::store::evlog::Event::SipMsg(
-            crate::store::evlog::SipMsgEvt {
-                ts_us: ts,
-                flow: msg.flow,
-                is_request: msg.is_request,
-                method: msg.method.map(|m| m.name().to_string()),
-                status: msg.status,
-                call_id: msg.call_id.clone(),
-                cseq: msg.cseq,
-                branch: msg.branch.clone(),
-                from_tag: msg.from_tag.clone(),
-                to_tag: msg.to_tag.clone(),
-                raw: msg.raw.to_vec(),
-            },
-        ));
+        // Evlog: record the pre-assembled SIP message event.
+        self.pending_events.push(evt);
 
         // Apply diagnostics (counts + ring).
         for d in new_diags {
@@ -398,8 +412,10 @@ impl Correlator {
         self.reg
             .ipstats
             .observe_packet(flow.dst.ip(), ts, len, crate::store::ipstats::Dir::Rx);
-        // Resolve call via SDP endpoints (two O(1) lookups).
-        let Some(call_id) = self
+        // Resolve call via SDP endpoints (two O(1) lookups). The value is an
+        // `Arc<str>` in the index, so the per-packet lookup is a cheap
+        // refcount bump rather than a String allocation.
+        let Some(cid) = self
             .reg
             .endpoint_call
             .get(&flow.src)
@@ -411,6 +427,7 @@ impl Correlator {
             }
             return;
         };
+        let call_id: &str = &cid;
         if debug_enabled() {
             eprintln!(
                 "DEBUG rtp call={} flow={} ssrc={:#x} pt={}",
@@ -428,7 +445,7 @@ impl Correlator {
         let reverse_exists = self
             .reg
             .stream_index
-            .get(&call_id)
+            .get(call_id)
             .is_some_and(|keys| keys.iter().any(|k| k.flow == reverse_flow));
 
         // TURN relay classification for this media leg.
@@ -437,7 +454,7 @@ impl Correlator {
         // Negotiated media is only needed for new streams (creation-time
         // diagnostics + codec resolution); skip the clone on the hot path.
         let neg_for_new = if is_new {
-            self.reg.calls.get(&call_id).map(|c| c.negotiated.clone())
+            self.reg.calls.get(call_id).map(|c| c.negotiated.clone())
         } else {
             None
         };
@@ -445,7 +462,7 @@ impl Correlator {
         let mut diags: Vec<Diagnostic> = Vec::new();
         {
             let stream = self.reg.streams.entry(key).or_insert_with(|| {
-                crate::correlate::stream::RtpStream::new(flow, header.ssrc, call_id.clone())
+                crate::correlate::stream::RtpStream::new(flow, header.ssrc, call_id.to_string())
             });
             let prev_pt = stream.last_pt;
             if is_new {
@@ -471,7 +488,7 @@ impl Correlator {
                 stream.reverse_seen = true;
             }
             if let Some(d) =
-                rules::check_pt_change(ts, &call_id, header.ssrc, header.payload_type, prev_pt)
+                rules::check_pt_change(ts, call_id, header.ssrc, header.payload_type, prev_pt)
             {
                 diags.push(d);
             }
@@ -479,10 +496,10 @@ impl Correlator {
 
         if is_new {
             // New stream: register in indices and run creation-time diagnostics.
-            self.reg.note_stream(&call_id, key);
+            self.reg.note_stream(call_id, key);
             // Remember this stream's endpoint IPs on the owning call (used by
             // the per-IP network-stats drill-down).
-            if let Some(c) = self.reg.calls.get_mut(&call_id) {
+            if let Some(c) = self.reg.calls.get_mut(call_id) {
                 for ip in [flow.src.ip(), flow.dst.ip()] {
                     if !c.ips.contains(&ip) {
                         c.ips.push(ip);
@@ -491,11 +508,11 @@ impl Correlator {
             }
             if let Some(neg) = &neg_for_new {
                 if let Some(d) =
-                    rules::check_rtp_pt(ts, &call_id, header.ssrc, header.payload_type, neg)
+                    rules::check_rtp_pt(ts, call_id, header.ssrc, header.payload_type, neg)
                 {
                     diags.push(d);
                 }
-                if let Some(d) = rules::check_rtp_flow(ts, &call_id, &flow, neg) {
+                if let Some(d) = rules::check_rtp_flow(ts, call_id, &flow, neg) {
                     diags.push(d);
                 }
             }
@@ -503,7 +520,7 @@ impl Correlator {
             if encap == Encap::ChannelData {
                 diags.push(Diagnostic {
                     ts_us: ts,
-                    call_id: call_id.clone(),
+                    call_id: call_id.to_string(),
                     severity: Severity::Info,
                     code: crate::diagnostics::TURN_CHANNEL_MEDIA,
                     message: format!(
@@ -514,7 +531,7 @@ impl Correlator {
             } else if encap == Encap::SendIndication {
                 diags.push(Diagnostic {
                     ts_us: ts,
-                    call_id: call_id.clone(),
+                    call_id: call_id.to_string(),
                     severity: Severity::Info,
                     code: crate::diagnostics::TURN_SEND_IND_MEDIA,
                     message: format!(
@@ -526,7 +543,7 @@ impl Correlator {
             if let Some(l) = leg {
                 diags.push(Diagnostic {
                     ts_us: ts,
-                    call_id: call_id.clone(),
+                    call_id: call_id.to_string(),
                     severity: Severity::Info,
                     code: crate::diagnostics::TURN_RELAY_MEDIA,
                     message: format!("media relayed via TURN ({}-leg) on {}", l.label(), flow),
@@ -534,7 +551,7 @@ impl Correlator {
             }
             // Mark the owning call as TURN-relayed.
             if (leg.is_some() || encap != Encap::Direct)
-                && let Some(c) = self.reg.calls.get_mut(&call_id)
+                && let Some(c) = self.reg.calls.get_mut(call_id)
             {
                 c.via_turn = true;
             }
@@ -554,7 +571,7 @@ impl Correlator {
         }
 
         // Update call counters.
-        if let Some(c) = self.reg.calls.get_mut(&call_id) {
+        if let Some(c) = self.reg.calls.get_mut(call_id) {
             c.pkts_rtp += 1;
         }
     }
@@ -594,15 +611,21 @@ impl Correlator {
             rtcpc::RtcpMessage::Sr(sr) => sr.ssrc,
             _ => 0,
         };
-        if ssrc != 0
-            && let Some(c) = self
+        if ssrc != 0 {
+            // O(1) lookup via the SSRC index (no full-stream scan); the
+            // owning call gets the RTCP packet count. Mirrors the sample
+            // attachment path below.
+            let owner = self
                 .reg
-                .streams
-                .values()
-                .find(|s| s.ssrc == ssrc)
-                .and_then(|s| self.reg.calls.get_mut(&s.call_id))
-        {
-            c.pkts_rtcp += 1;
+                .ssrc_index
+                .get(&ssrc)
+                .and_then(|keys| keys.first().copied())
+                .and_then(|key| self.reg.streams.get(&key).map(|s| s.call_id.clone()));
+            if let Some(cid) = owner
+                && let Some(c) = self.reg.calls.get_mut(&cid)
+            {
+                c.pkts_rtcp += 1;
+            }
         }
         let arrival_ntp = rtcp_rtt::unix_us_to_ntp_secs(ts);
         if debug_enabled() {
@@ -653,7 +676,7 @@ impl Correlator {
         }
         for (ssrc, rtt, oneway) in samples {
             // O(1) attachment via the SSRC index (no full-stream scan).
-            let keys: Vec<StreamKey> = self.reg.ssrc_index.get(&ssrc).cloned().unwrap_or_default();
+            let keys = self.reg.ssrc_index.get(&ssrc).cloned().unwrap_or_default();
             let mut call_id = None;
             for key in &keys {
                 if let Some(s) = self.reg.streams.get_mut(key) {

@@ -7,3 +7,5 @@ __pycache__/
 # local marketing drafts (not tracked)
 docs/zhihu.md
 docs/rustcc.md
+CLAUDE.md
+docs

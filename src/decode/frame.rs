@@ -33,21 +33,22 @@ fn ip_from_v6(b: [u8; 16]) -> IpAddr {
 ///
 /// `linktype` is the pcap DLT of the source. Supports Ethernet (incl. VLAN),
 /// Linux cooked v1/v2, and raw IP. Returns None for non-IP or non-UDP/TCP.
-pub fn decode(linktype: u32, data: &[u8]) -> Option<Decoded> {
+pub fn decode(linktype: u32, data: &Bytes) -> Option<Decoded> {
+    let buf: &[u8] = data.as_ref();
     let sliced: SlicedPacket<'_> = match linktype {
-        DLT_EN10MB => SlicedPacket::from_ethernet(data).ok()?,
-        DLT_RAW => SlicedPacket::from_ip(data).ok()?,
+        DLT_EN10MB => SlicedPacket::from_ethernet(buf).ok()?,
+        DLT_RAW => SlicedPacket::from_ip(buf).ok()?,
         DLT_LINUX_SLL => {
             // SLL: 16-byte header, then IP. protocol field @ offset 14 (big-endian).
-            let ip = data.get(16..)?;
+            let ip = buf.get(16..)?;
             SlicedPacket::from_ip(ip).ok()?
         }
         DLT_LINUX_SLL2 => {
             // SLL2: 20-byte header, then IP.
-            let ip = data.get(20..)?;
+            let ip = buf.get(20..)?;
             SlicedPacket::from_ip(ip).ok()?
         }
-        _ => SlicedPacket::from_ethernet(data).ok()?,
+        _ => SlicedPacket::from_ethernet(buf).ok()?,
     };
 
     let net = sliced.net?;
@@ -87,9 +88,14 @@ pub fn decode(linktype: u32, data: &[u8]) -> Option<Decoded> {
         dst: SocketAddr::new(dst_ip, dst_port),
     };
 
+    // Zero-copy: `payload` is a sub-slice of `buf` (which views `data`), so its
+    // byte range is in bounds. Slice the shared `data` allocation instead of
+    // copying the L4 payload into a fresh Bytes (refcount bump, no memcpy).
+    let off = payload.as_ptr() as usize - buf.as_ptr() as usize;
+    let end = off + payload.len();
     let l4 = match proto {
-        Proto::Udp => L4::Udp(Bytes::copy_from_slice(payload)),
-        Proto::Tcp => L4::Tcp(Bytes::copy_from_slice(payload)),
+        Proto::Udp => L4::Udp(data.slice(off..end)),
+        Proto::Tcp => L4::Tcp(data.slice(off..end)),
     };
 
     Some(Decoded { flow, l4 })

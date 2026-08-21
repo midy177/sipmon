@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn ip_page_renders_without_panic() {
-        let snap = Arc::new(Mutex::new(sample_snapshot()));
+        let snap = Arc::new(Mutex::new(Arc::new(sample_snapshot())));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn ip_loss_only_renders() {
-        let snap = Arc::new(Mutex::new(sample_snapshot()));
+        let snap = Arc::new(Mutex::new(Arc::new(sample_snapshot())));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn ip_drill_renders_calls() {
-        let snap = Arc::new(Mutex::new(sample_snapshot()));
+        let snap = Arc::new(Mutex::new(Arc::new(sample_snapshot())));
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
