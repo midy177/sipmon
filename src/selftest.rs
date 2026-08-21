@@ -4,7 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::capture::RawFrame;
     use crate::config::Config;
     use crate::correlate::Correlator;
     use bytes::Bytes;
@@ -54,11 +53,7 @@ mod tests {
                     pkt[pos] = rng.byte();
                 }
                 let ts = rng.below(4_000_000_000_000);
-                corr.ingest_frame(RawFrame {
-                    ts_us: ts,
-                    linktype: 1,
-                    data: Bytes::from(pkt),
-                });
+                corr.ingest_frame(ts, 1, &pkt);
                 fed += 1;
             }
             off = end;
@@ -73,11 +68,7 @@ mod tests {
             let len = rng.below(1600) as usize;
             let buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
             let lt = [1u32, 12, 113, 276, 999][(rng.below(5)) as usize];
-            corr.ingest_frame(RawFrame {
-                ts_us: rng.below(4_000_000_000_000),
-                linktype: lt,
-                data: Bytes::from(buf),
-            });
+            corr.ingest_frame(rng.below(4_000_000_000_000), lt, &buf);
         }
 
         // Sanity: the pipeline survived and produced some state.
@@ -143,10 +134,10 @@ mod tests {
         // Endless garbage after a header claiming a huge Content-Length must
         // not grow the buffer beyond the cap.
         let hdr = b"INVITE sip:x SIP/2.0\r\nContent-Length: 2000000000\r\n\r\n";
-        reasm.feed(flow, hdr);
+        reasm.feed(flow, hdr, 0);
         let chunk = vec![0x41u8; 8192];
         for _ in 0..1024 {
-            reasm.feed(flow, &chunk);
+            reasm.feed(flow, &chunk, 0);
         }
         assert!(
             reasm.buffered_bytes() <= crate::decode::tcp_reasm::MAX_STREAM_BUF,
@@ -316,6 +307,97 @@ mod tests {
             terminal_done <= 200 + 16,
             "terminal_done grew to {terminal_done} (50k calls)"
         );
+    }
+
+    /// Headless record drops a call from RAM as soon as it tears down (the
+    /// evlog already has SipMsg + Call teardown).
+    #[test]
+    fn headless_drops_call_on_terminal() {
+        let cfg = Config {
+            keep_terminated: false,
+            ..Config::default()
+        };
+        let mut corr = Correlator::new(&cfg, "headless".into());
+        complete_call(&mut corr, 1_000_000, 1);
+        assert!(
+            corr.reg.calls.is_empty(),
+            "terminated call retained: {}",
+            corr.reg.calls.len()
+        );
+        let (invite_rr, terminal_done) = corr.test_bookkeeping_lens();
+        assert_eq!(invite_rr, 0);
+        assert_eq!(terminal_done, 0);
+        assert_eq!(corr.reg.completed + corr.reg.failed, 1);
+    }
+
+    /// Terminated and idle calls older than the TTL are evicted on flush.
+    #[test]
+    fn terminated_calls_evicted_by_ttl() {
+        let cfg = Config {
+            call_ttl_secs: 60,
+            max_calls: 100_000,
+            ..Config::default()
+        };
+        let mut corr = Correlator::new(&cfg, "ttl".into());
+        complete_call(&mut corr, 1_000_000, 1);
+        assert_eq!(corr.reg.calls.len(), 1);
+        // Prime the flush clock, then jump past the 60s TTL.
+        corr.maybe_periodic_flush(1_000_000);
+        corr.maybe_periodic_flush(70_000_000);
+        assert!(
+            corr.reg.calls.is_empty(),
+            "TTL did not drop terminated call: {}",
+            corr.reg.calls.len()
+        );
+        let (invite_rr, terminal_done) = corr.test_bookkeeping_lens();
+        assert_eq!(invite_rr, 0);
+        assert_eq!(terminal_done, 0);
+    }
+
+    /// last_lost must not outlive the streams it tracks.
+    #[test]
+    fn last_lost_pruned_after_stream_evict() {
+        use crate::correlate::turn::Encap;
+        use crate::decode::rtp::RtpHeader;
+        let cfg = Config {
+            keep_terminated: false,
+            ..Config::default()
+        };
+        let mut corr = Correlator::new(&cfg, "lostmap".into());
+        let id = "lost-prune";
+        corr.ingest_sip(sdp_msg(
+            1_000_000,
+            id,
+            true,
+            Method::Invite,
+            None,
+            "10.10.0.1:5060",
+            "10.20.0.1:5060",
+            "10.10.0.1",
+            20000,
+            false,
+        ));
+        let hdr = RtpHeader {
+            version: 2,
+            payload_type: 0,
+            sequence_number: 1,
+            timestamp: 0,
+            ssrc: 0x1111,
+        };
+        let flow = Flow5Tuple {
+            proto: Proto::Udp,
+            src: "10.10.0.1:20000".parse().unwrap(),
+            dst: "10.20.0.1:20000".parse().unwrap(),
+        };
+        corr.ingest_rtp(2_000_000, flow, hdr, 172, Encap::Direct);
+        corr.maybe_periodic_flush(2_000_000);
+        corr.maybe_periodic_flush(8_000_000);
+        assert!(corr.test_last_lost_len() > 0);
+        corr.ingest_sip(sip(9_000_000, id, Method::Bye, true));
+        corr.ingest_sip(sip_resp(9_100_000, id, 200, "BYE"));
+        corr.maybe_periodic_flush(15_000_000);
+        assert_eq!(corr.test_last_lost_len(), 0);
+        assert!(corr.reg.streams.is_empty());
     }
 
     /// A single pathological call (thousands of messages) must not grow the
@@ -556,5 +638,75 @@ mod tests {
         assert_eq!(corr.reg.ipstats.snapshot().len(), 0);
         assert_eq!(corr.reg.completed, 0);
         assert_eq!(corr.reg.failed, 0);
+    }
+
+    /// Live-exit stats are built from correlator events (same report as
+    /// `sipmon stats`), not from the possibly TTL-trimmed call table.
+    #[test]
+    fn live_session_stats_from_memory() {
+        use crate::correlate::turn::Encap;
+        use crate::decode::rtp::RtpHeader;
+        let mut corr = Correlator::new(&Config::default(), "live-stats".into());
+        corr.enable_session_stats();
+        let id = "live-stats-call";
+        corr.ingest_sip(sdp_msg(
+            1_000_000,
+            id,
+            true,
+            Method::Invite,
+            None,
+            "10.10.0.1:5060",
+            "10.20.0.1:5060",
+            "10.10.0.1",
+            20000,
+            false,
+        ));
+        corr.ingest_sip(sdp_msg(
+            1_010_000,
+            id,
+            false,
+            Method::Invite,
+            Some(200),
+            "10.20.0.1:5060",
+            "10.10.0.1:5060",
+            "10.20.0.1",
+            30000,
+            true,
+        ));
+        let flow = Flow5Tuple {
+            proto: Proto::Udp,
+            src: "10.10.0.1:20000".parse().unwrap(),
+            dst: "10.20.0.1:30000".parse().unwrap(),
+        };
+        for i in 0..20u16 {
+            corr.ingest_rtp(
+                1_100_000 + i as u64 * 20_000,
+                flow,
+                RtpHeader {
+                    version: 2,
+                    payload_type: 0,
+                    sequence_number: 1000 + i,
+                    timestamp: 16_000 + i as u32 * 160,
+                    ssrc: 0x1000,
+                },
+                160,
+                Encap::Direct,
+            );
+        }
+        corr.maybe_periodic_flush(1_100_000);
+        corr.maybe_periodic_flush(7_000_000);
+        corr.ingest_sip(sip(8_000_000, id, Method::Bye, true));
+        corr.ingest_sip(sip_resp(8_100_000, id, 200, "BYE"));
+        let acc = corr.take_session_stats().expect("stats enabled");
+        let s = acc.finish("live:test".into(), 0, None, 10);
+        assert_eq!(s.reliability.seizures, 1);
+        assert!(s.calls.invite >= 1);
+        assert_eq!(s.calls.bye, 1);
+        assert!(s.traffic.sip_msgs >= 3);
+        assert!(s.traffic.rtp_pkts > 0, "stream snaps should count RTP");
+        let text = s.render_text();
+        assert!(text.contains("in-memory"), "{text}");
+        assert!(text.contains("Reliability"), "{text}");
+        assert!(text.contains("live:test"), "{text}");
     }
 }

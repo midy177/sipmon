@@ -6,9 +6,12 @@ on a running PBX**. Inputs may be a live capture, a pcap file, a stdin stream, o
 previously recorded event log; output is a live TUI monitor plus exportable
 analysis results (JSONL).
 
-![sipmon call list](list.jpg)
+![sipmon call detail](call_detail.png)
 
-![sipmon call detail](detail.jpg)
+![sipmon sip stats](sip_stats.png)
+
+![sipmon rtp stats](rtp_stats.png)
+
 
 ## Features
 
@@ -18,18 +21,19 @@ analysis results (JSONL).
 - **Media quality**: RFC3550 jitter/loss, RTCP RR RTT, one-way delay estimate, E-model MOS
 - **TURN detection**: auto-learns TURN servers, labels `turn-client` / `turn-peer` relay legs
 - **Diagnostics**: 20+ rules for Contact reachability, Record-Route, SDP/RTP consistency, one-way media, TURN allocation/refresh
-- **TUI**: Overview / Search / Call Detail / Heatmap / Streams / Event Log / IP Stats pages
+- **TUI**: Overview / Call Detail / SIP Stats / Streams / Event Log / IP Stats pages
 - **Analysis**: PDD/setup/ring timing, hangup initiator (BYE, CANCEL, reject), per-IP loss over 1s…1h windows
 - **Export**: JSONL on exit or via `export`; `query` fetches a Call-ID flow for scripting
 
 ## Quick start
 
 ```sh
-sipmon live -i any                 # live monitoring (TUI)
+sipmon live -i any                 # live monitoring (TUI); quit prints a stats report
 sipmon live -i eth0 -f "udp port 5060"   # with a BPF filter
 sipmon record -i any -w cap.evlog --headless   # record to an event log
 sipmon record -i any -w cap.evlog -d --pidfile /run/sipmon.pid --logfile /var/log/sipmon.log
-sipmon replay -l cap.evlog         # replay a recording (TUI)
+sipmon replay cap.evlog            # replay a recording (TUI)
+sipmon stats cap.evlog             # ASR, traffic, 5-minute call-availability + network tables
 sipmon file -r capture.pcap        # offline pcap analysis
 sipmon capture.pcap                # default mode: dispatch by extension
 sipmon cap.evlog                   #   *.pcap/.pcapng → file, *.evlog → replay, *.jsonl → snapshot view
@@ -89,12 +93,13 @@ SSRC per leg, so quality views split per leg (expected for a transcoder).
 | Command | Description |
 |---|---|
 | `(none)` | Default mode: positional `FILE` dispatched by extension (`.pcap/.pcapng` → `file`, `.evlog` → `replay`, `.jsonl` → snapshot view); no FILE starts a live capture. `--no-tui` for headless output |
-| `live` | Live capture + TUI. `-i` interface, `-f` BPF filter, `--no-media` disables RTP/RTCP analysis, `-w` also writes an event log |
-| `record` | Live capture → event log (`-w` required). Live TUI on a tty; `--headless` disables it. `-d` daemonizes, `--pidfile`/`--logfile` for daemon runs. Flushes gracefully on SIGTERM/SIGINT |
+| `live` | Live capture + TUI. `-i` interface, `-f` BPF filter, `--no-media` disables RTP/RTCP analysis, `-w` also writes an event log. On quit, prints the same ASR/traffic/5-minute report as `stats` (from in-memory events, not the TTL-trimmed call table) |
+| `record` | Live capture → event log (`-w` required). Live TUI on a tty; `--headless` disables it. `-d` daemonizes, `--pidfile`/`--logfile` for daemon runs. Flushes gracefully on SIGTERM/SIGINT. Headless/`-d` drops completed calls from RAM immediately (they are already in the evlog); live TUI keeps them for `--call-ttl-mins` |
 | `-` | Read a pcap byte stream from stdin |
 | `file` | Offline pcap/pcapng. `--rate 1x` replay speed multiplier, `--no-tui`, `--print-events` |
-| `replay` | Replay an event log (TUI / `--no-tui`) |
+| `replay` | Replay an event log (`sipmon replay FILE`; `-l/--evlog` still works). TUI / `--no-tui` |
 | `query` | No TUI; exports flow + stream stats + RTT + diagnostics for a Call-ID (script friendly) |
+| `stats` | No TUI; ASR / CCR / NER / PDD / ACD, fail split (NF/REJ/BUSY/TMO/FAIL), RTP+SIP traffic, MOS/jitter/RTT, top-50 IP loss table, and 5-minute call-availability + network windows (`sipmon stats FILE`, `--json`, `--top N`) |
 | `export` | Rebuild a snapshot from an event log → JSONL, with `--from/--to` time filtering |
 
 ### Common options
@@ -102,6 +107,8 @@ SSRC per leg, so quality views split per leg (expected for a transcoder).
 ```
 --dry-run            In-memory analysis only, writes no files
 --max-calls N        Max calls retained in memory (default 100000)
+--call-ttl-mins N    Drop idle/terminated calls after N minutes (default 15;
+                     0 = keep until --max-calls). File/replay ignore this.
 --max-streams N      RTP stream ring cap (default 50000)
 --max-diagnostics N  Diagnostics ring cap (default 50000)
 --diag-level X       info|warn|critical (default warn)
@@ -117,11 +124,15 @@ SSRC per leg, so quality views split per leg (expected for a transcoder).
 
 ## TUI
 
-Pages: **Overview** `1` · **Search** `2`/`/` · **Call Detail** `3` · **Heatmap** `4` · **Streams** `5` · **Event Log** `6` · **IP Stats** `7`. `Tab`/`Shift-Tab` cycles pages, `Space` pauses, `e` exports JSONL, `x` clears in-memory stats, `q`/`Esc`/`Ctrl-C` quits.
+Pages: **Overview** `1` · **Call Detail** `2` · **SIP Stats** `3` · **Streams** `4` · **Event Log** `5` · **IP Stats** `6`. `Tab`/`Shift-Tab` cycles pages, `Space` pauses, `e` exports JSONL, `p` toggles privacy masking, `x` clears in-memory stats, `q`/`Esc`/`Ctrl-C` quits. Quitting a TUI session prints the full in-memory stats report (same output as `sipmon stats`, 5-minute windows).
 
-Call Detail uses a fixed four-pane layout: **Flow** (chronological SIP messages, `↑`/`↓` selects) · **Raw** (syntax-highlighted bytes of the selected message, `PgUp`/`PgDn` scrolls) · **Diagnostics** · **Network** (traffic totals + per-stream media table). With a known local IP (`--local-ips`) the local endpoint is pinned to the right and arrows show the direction — `remote -> local` is inbound, `remote <- local` outbound. When two dialogs share one Call-ID (the current machine is a B2BUA/SBC in the middle) the Flow switches to a two-lane layout — `Time | A-Leg | PBX | B-Leg` — where the a-leg is the ingress dialog and the b-leg the egress one (`←` = the PBX receives, `→` = the PBX sends), and the title gains a `⇄ B2BUA <ip>` marker. If the legs can't be told apart (no local IP), it falls back to the plain flow.
+The Overview page carries a rule-based filter bar (`/` to edit, `c` to clear): tokens `ip:1.2.3.4[:port]`, `caller:1001`, `callee:2002`, `callid:abc` are AND-ed together (a bare word matches any field; a full IP matches exactly, a partial one as a substring). While typing, the list filters live (`↑`/`↓` select, `Enter` applies, `Esc` rolls back, `Ctrl-U` clears the input); matching calls are also pinned in the pipeline so they survive TTL/capacity eviction. The state filter `f` (all/dialing/ringing/active/success/failed/canceled) ANDs with the rule filter.
+
+Call Detail uses a fixed four-pane layout: **Flow** (sngrep-style swimlane, `↑`/`↓` selects) · **Raw** (syntax-highlighted bytes of the selected message, `PgUp`/`PgDn` scrolls) · **Diagnostics** · **Network** (traffic totals + per-stream media table). Flow headers are `ip:port` columns with a vertical bar under each party; rows are `Time | -- INVITE ->` / `<- 100 --` (short centered arrows; responses show the status code only). Same-Call-ID dual dialogs (or a manually linked b-leg via `l`) expand to three parties. `L` unlinks the b-leg.
 
 IP Stats aggregates per-IP conditions, split by direction (**TX** = sent by the IP, **RX** = received): `c` collapses to a loss-only summary, `w` cycles the time window, `s` sorts, `Enter` drills down to the calls involving an IP.
+
+SIP Stats shows the signaling health per endpoint IP: a request/response distribution table (`INVITE ACK BYE CANCEL OPTION INFO REGISTER MESSAGE oth | 100 180 183 200 486 404 403 408 480 487 3xx 4xx 5xx 6xx oth`) and an INVITE answer-rate heatmap (1m/5m/15m buckets via `w`, `s` sorts). Heatmap colors are relative to the window's global ASR baseline — cyan within ±10pp, green ≥ +10pp, orange −25pp, red below — so a naturally low-ASR route (e.g. 40% outbound) stays neutral and only real degradation turns red; cells with fewer than 3 invites are dimmed.
 
 ## Event log format
 
@@ -146,18 +157,5 @@ Private binary append-only format. Header holds the `SMON` magic, version, and t
 
 - **RTT**: `RTT = arrival_NTP − LSR − DLSR` from the RTCP RR
 - **One-way delay**: RTCP SR NTP↔RTP mapping (when both directions are visible); otherwise an indirect estimate from RTP arrival intervals (labeled "estimate")
-- **jitter/loss**: RFC3550, 64-packet reorder window
+- **jitter/loss**: RFC3550, 64-packet reorder window; `|D| > 1s` is treated as a timestamp jump (hold/DTX/reset), not jitter. `stats` reports packet-weighted p50/p95 (SDP `a=rtpmap` clock when known)
 - **MOS**: simplified E-model (G.107): `R = 93.2 − Id − Ie`, labeled "estimate"
-
-## Limitations
-
-- TLS/SRTP encrypted payloads cannot be parsed; capture at the decryption point
-- Absolute one-way delay under one-way passive observation is an estimate; RTCP RTT is the primary metric
-- Capturing without interface permissions requires root / elevated privileges (same as tcpdump)
-
-## Tests
-
-```sh
-cargo test                       # unit + integration tests (pcap fixture)
-cargo test --test cli_integration
-```

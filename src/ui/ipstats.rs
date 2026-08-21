@@ -213,7 +213,7 @@ fn render_table(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
             ),
         )
         .block(Block::default().borders(Borders::ALL).title(title))
-        .row_highlight_style(Style::default().bg(theme::MUTED));
+        .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, area, &mut app.ip_table_state);
 }
 
@@ -281,12 +281,12 @@ fn render_drill(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         "Calls for {ip} ({} — Enter=detail, Esc=back)",
         calls.len()
     )))
-    .row_highlight_style(Style::default().bg(theme::MUTED));
+    .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, area, &mut app.ip_drill_state);
 }
 
 /// Per-IP loss heatmap: rows = IPs, columns = time buckets, color = loss%.
-/// Shared between the IP Stats page and the dedicated Heatmap page.
+/// Rendered at the bottom of the IP Stats page.
 pub fn render_loss_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let window = app.ip_window_secs;
     let col_secs = if window <= 600 {
@@ -307,7 +307,8 @@ pub fn render_loss_heatmap(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut
     let rows = ordered_rows(snap, app);
     let privacy = app.privacy;
     let height = (area.height as usize).saturating_sub(2);
-    let visible: Vec<&IpStats> = rows.into_iter().take(height).collect();
+    let start = app.ip_table_state.selected().unwrap_or(0);
+    let visible: Vec<&IpStats> = rows.into_iter().skip(start).take(height).collect();
 
     // Header: time labels at 0/25/50/75/100%.
     let mut head_cells = vec![Cell::from("IP"), Cell::from("Loss% ▁▂▃▄▅▆▇█")];
@@ -390,7 +391,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
-    use crate::ui::app::{App, Page, RecordState};
+    use crate::ui::app::{App, Page, RecordState, wrap_snap};
 
     fn sample_snapshot() -> Snapshot {
         let mut st = crate::store::ipstats::IpStatsStore::new();
@@ -423,6 +424,7 @@ mod tests {
             from_user: Some("alice".into()),
             to_user: Some("bob".into()),
             caller_ip: Some("10.10.0.8".parse().unwrap()),
+            caller_src: Some("10.10.0.8:5060".into()),
             state: crate::model::sip::CallState::Active,
             outcome: crate::model::sip::Outcome::Answered,
             invite_ts: Some(ts),
@@ -448,7 +450,7 @@ mod tests {
 
     #[test]
     fn ip_page_renders_without_panic() {
-        let snap = Arc::new(Mutex::new(Arc::new(sample_snapshot())));
+        let snap = wrap_snap(sample_snapshot());
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -479,7 +481,7 @@ mod tests {
 
     #[test]
     fn ip_loss_only_renders() {
-        let snap = Arc::new(Mutex::new(Arc::new(sample_snapshot())));
+        let snap = wrap_snap(sample_snapshot());
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
@@ -511,7 +513,7 @@ mod tests {
 
     #[test]
     fn ip_drill_renders_calls() {
-        let snap = Arc::new(Mutex::new(Arc::new(sample_snapshot())));
+        let snap = wrap_snap(sample_snapshot());
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),

@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
 use crate::model::media::StreamSummary;
 use crate::model::sip::{Method, SipMsg};
@@ -47,13 +47,19 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         }
         None => String::new(),
     };
+    let linked_suffix = app
+        .linked_call_id
+        .as_ref()
+        .map(|id| format!("  ⇄ b-leg {id}"))
+        .unwrap_or_default();
     let title = format!(
-        "Call {} ({} → {}) [{}]{}{}",
+        "Call {} ({} → {}) [{}]{}{}{}",
         focus.call_id,
         from,
         to,
         focus.state.map(|s| s.label()).unwrap_or("?"),
         b2bua_suffix,
+        linked_suffix,
         if focus.streams.iter().any(|s| s.via_turn) {
             "  ⚙ via-TURN"
         } else {
@@ -138,6 +144,10 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let right = Layout::vertical([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)]).split(cols[1]);
     render_raw(f, right[0], &focus.messages, app);
     render_network(f, right[1], focus, privacy, &app.local_ips);
+
+    if app.b_leg_picker {
+        render_b_leg_picker(f, area, snap, app);
+    }
 }
 
 fn display_user(v: Option<&str>, privacy: bool, fallback: &str) -> String {
@@ -146,6 +156,73 @@ fn display_user(v: Option<&str>, privacy: bool, fallback: &str) -> String {
         Some(v) => v.to_string(),
         None => fallback.to_string(),
     }
+}
+
+/// Centered searchable overlay to pick another call as the swimlane b-leg.
+fn render_b_leg_picker(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
+    let primary = snap
+        .focus
+        .as_ref()
+        .map(|f| f.call_id.as_str())
+        .or(app.focus_pending.as_deref())
+        .unwrap_or("");
+    let cands = crate::ui::app::b_leg_candidates(snap, primary, &app.b_leg_query);
+    let width = area.width.saturating_mul(70) / 100;
+    let height = area.height.saturating_mul(60) / 100;
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(popup);
+    let title = format!(
+        "Link b-leg  filter: {}{}  [{}]",
+        app.b_leg_query,
+        if app.b_leg_query.is_empty() {
+            "(type to search)"
+        } else {
+            ""
+        },
+        cands.len()
+    );
+    let filter = Paragraph::new(app.b_leg_query.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(theme::INFO)),
+    );
+    f.render_widget(filter, chunks[0]);
+
+    let privacy = app.privacy;
+    let rows = cands.iter().map(|c| {
+        let from = display_user(c.from_user.as_deref(), privacy, "?");
+        let to = display_user(c.to_user.as_deref(), privacy, "?");
+        Row::new(vec![
+            Cell::from(c.call_id.clone()),
+            Cell::from(format!("{from} → {to}")),
+            Cell::from(c.state.label()),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(16),
+            Constraint::Min(20),
+            Constraint::Length(10),
+        ],
+    )
+    .header(Row::new(["Call-ID", "From → To", "State"].iter().map(
+        |h| Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)),
+    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("[↑↓] select  [Enter] link  [Esc] cancel"),
+    )
+    .row_highlight_style(theme::selected());
+    f.render_stateful_widget(table, chunks[1], &mut app.b_leg_state);
 }
 
 fn display_socket(a: std::net::SocketAddr, privacy: bool) -> String {
@@ -162,30 +239,7 @@ fn label_of(m: &SipMsg) -> String {
             .map(|x| x.name().to_string())
             .unwrap_or_else(|| "?".into())
     } else {
-        format!(
-            "{} {}",
-            m.status.unwrap_or(0),
-            short_reason(m.status.unwrap_or(0))
-        )
-    }
-}
-
-fn short_reason(code: u16) -> &'static str {
-    match code {
-        100 => "Trying",
-        180 => "Ringing",
-        183 => "Session Progress",
-        200 => "OK",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        407 => "Proxy Auth Required",
-        408 => "Request Timeout",
-        486 => "Busy Here",
-        487 => "Request Terminated",
-        488 => "Not Acceptable",
-        503 => "Service Unavailable",
-        _ => "",
+        m.status.unwrap_or(0).to_string()
     }
 }
 
@@ -197,151 +251,218 @@ fn render_flow(
     legs: &[u8],
     app: &mut App,
 ) {
-    let first_ts = messages.first().map(|m| m.ts_us).unwrap_or(0);
-    let start = snap.start_us.unwrap_or(first_ts);
-    let tz = snap.tz_offset_secs;
-    let privacy = app.privacy;
     let local = &app.local_ips;
-
-    // Same-Call-ID B2BUA: when the two dialogs can be told apart (the current
-    // machine is the PBX in the middle), show the two-lane layout; otherwise
-    // fall back to the normal single-flow view.
-    if let Some(ln) = classify_lanes(messages, legs, local) {
-        render_lane_flow(f, area, messages, legs, snap, &ln, app);
-        return;
-    }
-
-    let flow_w = messages
-        .iter()
-        .map(|m| {
-            short_ip(m.flow.src, privacy)
-                .len()
-                .max(short_ip(m.flow.dst, privacy).len())
-        })
-        .max()
-        .unwrap_or(9)
-        .max(9);
-    let rows = messages.iter().map(|m| {
-        let label = label_of(m);
-        let style = msg_style(m);
-        Row::new(vec![
-            Cell::from(fmt_time_delta(m.ts_us, start, tz)),
-            Cell::from(dir_flow(
-                m.flow.src.ip(),
-                m.flow.dst.ip(),
-                &short_ip(m.flow.src, privacy),
-                &short_ip(m.flow.dst, privacy),
-                local,
-                flow_w,
-            )),
-            Cell::from(label).style(style),
-        ])
-    });
-    let flow_col = flow_w * 2 + 4;
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(17),
-            Constraint::Length(flow_col as u16),
-            Constraint::Min(20),
-        ],
-    )
-    .header(Row::new(
-        ["Time (+recorded)", "Flow", "Msg"]
-            .iter()
-            .map(|h| Cell::from(*h)),
-    ))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(if local.is_empty() {
-                format!("Flow ({} msgs)", messages.len())
-            } else {
-                format!("Flow ({} msgs · right=local ->in <-out)", messages.len())
-            }),
-    )
-    .row_highlight_style(Style::default().bg(theme::MUTED));
-    f.render_stateful_widget(table, area, &mut app.flow_state);
+    let parties = if let Some(ln) = classify_lanes(messages, legs, local) {
+        let mid = mid_socket(ln.pbx, messages);
+        vec![ln.a_remote, mid, ln.b_remote]
+    } else {
+        let (left, right) = two_parties(messages).unwrap_or_else(|| {
+            let z: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+            (z, z)
+        });
+        vec![left, right]
+    };
+    render_swimlane(f, area, messages, legs, &parties, snap, app);
 }
 
-/// Two-lane B2BUA flow: `Time | A-Leg | PBX | B-Leg`. Every message is placed in
-/// the lane of its dialog (`←` = the PBX receives it, `→` = the PBX sends it),
-/// with the middle-box IP shown in the PBX column.
-fn render_lane_flow(
+/// sngrep-style swimlane: time | vertical bars under each `ip:port`, with
+/// `-- INVITE ->` / `<- 100 --` painted between the endpoints of each message.
+fn render_swimlane(
     f: &mut Frame,
     area: Rect,
     messages: &[SipMsg],
     legs: &[u8],
+    parties: &[std::net::SocketAddr],
     snap: &Snapshot,
-    ln: &Lanes,
     app: &mut App,
 ) {
     let first_ts = messages.first().map(|m| m.ts_us).unwrap_or(0);
-    let start = snap.start_us.unwrap_or(first_ts);
+    // Relative times count from the dialog's first message, not the capture
+    // start, so mid-capture dialogs begin at +0.00s.
+    let start = first_ts;
     let tz = snap.tz_offset_secs;
     let privacy = app.privacy;
-    let local = &app.local_ips;
-    let pbx_s = if privacy {
-        mask_ip(ln.pbx)
-    } else {
-        ln.pbx.to_string()
-    };
-    let a_remote_s = display_socket(ln.a_remote, privacy);
-    let b_remote_s = display_socket(ln.b_remote, privacy);
-    let pbx_w = pbx_s.len().max(9);
-    let lane_w = 12usize;
+    let labels: Vec<String> = parties
+        .iter()
+        .copied()
+        .map(|p| display_socket(p, privacy))
+        .collect();
+    // Time column + borders/spacing leave the rest for the swim canvas.
+    let swim_w = (area.width as usize)
+        .saturating_sub(2)
+        .saturating_sub(17)
+        .saturating_sub(1)
+        .max(16);
+    let header_swim = swim_header(&labels, swim_w);
+    let title_parties = labels.join(" | ");
 
-    let rows = messages.iter().zip(legs).map(|(m, &l)| {
+    let rows = messages.iter().enumerate().map(|(i, m)| {
         let label = label_of(m);
         let style = msg_style(m);
-        let arrow = lane_arrow(m, local);
-        let cell = |arrow: &str, label: &str| {
-            let text = if arrow.is_empty() {
-                label.to_string()
-            } else {
-                format!("{arrow} {label}")
-            };
-            Cell::from(text).style(style)
-        };
-        if l == ln.a_leg {
-            Row::new(vec![
-                Cell::from(fmt_time_delta(m.ts_us, start, tz)),
-                cell(arrow, &label),
-                Cell::from(pbx_s.clone()),
-                Cell::from(""),
-            ])
-        } else {
-            debug_assert_eq!(l, ln.b_leg, "message must belong to one of the two lanes");
-            Row::new(vec![
-                Cell::from(fmt_time_delta(m.ts_us, start, tz)),
-                Cell::from(""),
-                Cell::from(pbx_s.clone()),
-                cell(arrow, &label),
-            ])
-        }
+        let (from, to) = resolve_party_pair(m, parties, legs.get(i).copied());
+        let canvas = swim_row(parties.len(), from, to, &label, swim_w);
+        Row::new(vec![
+            Cell::from(fmt_time_delta(m.ts_us, start, tz)),
+            Cell::from(canvas).style(style),
+        ])
     });
 
     let table = Table::new(
         rows,
-        [
-            Constraint::Length(17),
-            Constraint::Min(lane_w as u16),
-            Constraint::Length(pbx_w as u16),
-            Constraint::Min(lane_w as u16),
-        ],
+        [Constraint::Length(17), Constraint::Min(swim_w as u16)],
     )
     .column_spacing(1)
-    .header(Row::new(
-        ["Time (+recorded)", "A-Leg", "PBX", "B-Leg"]
-            .iter()
-            .map(|h| Cell::from(*h)),
-    ))
-    .block(Block::default().borders(Borders::ALL).title(format!(
-        "Flow · A {a_remote_s} ⇄ PBX {pbx_s} ⇄ B {b_remote_s} ({} msgs)",
-        messages.len()
-    )))
-    .row_highlight_style(Style::default().bg(theme::MUTED));
+    .header(Row::new([
+        Cell::from("Time"),
+        Cell::from(header_swim).style(Style::default().add_modifier(Modifier::BOLD)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Flow · {title_parties} ({} msgs)", messages.len())),
+    )
+    .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, area, &mut app.flow_state);
+}
+
+/// Party column centers across a swim canvas of `width`.
+fn party_centers(n: usize, width: usize) -> Vec<usize> {
+    if n == 0 || width == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![width / 2];
+    }
+    let col_w = width / n;
+    (0..n)
+        .map(|i| {
+            let start = i * col_w;
+            let end = if i + 1 == n { width } else { start + col_w };
+            start + (end - start) / 2
+        })
+        .collect()
+}
+
+/// Header: each `ip:port` centered above its vertical bar.
+fn swim_header(labels: &[String], width: usize) -> String {
+    let centers = party_centers(labels.len(), width);
+    let mut buf = vec![b' '; width];
+    for (label, &c) in labels.iter().zip(&centers) {
+        let bytes = label.as_bytes();
+        let start = c
+            .saturating_sub(bytes.len() / 2)
+            .min(width.saturating_sub(1));
+        for (i, &b) in bytes.iter().enumerate() {
+            if start + i < width {
+                buf[start + i] = b;
+            }
+        }
+    }
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+/// One message row: `|` under every party, short centered `-- INVITE ->` /
+/// `<- 100 --` between src/dst.
+fn swim_row(n: usize, from: usize, to: usize, label: &str, width: usize) -> String {
+    let centers = party_centers(n, width);
+    let mut buf = vec![b' '; width];
+    for &c in &centers {
+        if c < width {
+            buf[c] = b'|';
+        }
+    }
+    if from >= centers.len() || to >= centers.len() || from == to {
+        return String::from_utf8(buf).unwrap_or_default();
+    }
+    let left = centers[from.min(to)];
+    let right = centers[from.max(to)];
+    if right <= left + 1 {
+        return String::from_utf8(buf).unwrap_or_default();
+    }
+    let rightward = from < to;
+    // Short, centered glyph: `-- INVITE ->` / `<- 100 --`
+    let glyph = if rightward {
+        format!("-- {label} ->")
+    } else {
+        format!("<- {label} --")
+    };
+    let gap = right - left - 1;
+    let bytes = glyph.as_bytes();
+    let take = bytes.len().min(gap);
+    let start = left + 1 + (gap.saturating_sub(take) / 2);
+    for (i, &b) in bytes.iter().take(take).enumerate() {
+        buf[start + i] = b;
+    }
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+fn party_index(parties: &[std::net::SocketAddr], addr: std::net::SocketAddr) -> Option<usize> {
+    parties
+        .iter()
+        .position(|p| *p == addr)
+        .or_else(|| parties.iter().position(|p| p.ip() == addr.ip()))
+}
+
+/// Map a message onto two party column indices (src → dst).
+fn resolve_party_pair(
+    m: &SipMsg,
+    parties: &[std::net::SocketAddr],
+    leg: Option<u8>,
+) -> (usize, usize) {
+    if let (Some(s), Some(d)) = (
+        party_index(parties, m.flow.src),
+        party_index(parties, m.flow.dst),
+    ) {
+        return (s, d);
+    }
+    // 3-party fallback by dialog leg: a-leg spans 0↔1, b-leg spans 1↔2.
+    if parties.len() == 3 {
+        let dst_mid =
+            party_index(parties, m.flow.dst) == Some(1) || m.flow.dst.ip() == parties[1].ip();
+        match leg {
+            Some(0) => {
+                if dst_mid {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                }
+            }
+            Some(1) => {
+                if dst_mid {
+                    (2, 1)
+                } else {
+                    (1, 2)
+                }
+            }
+            _ => (0, 1),
+        }
+    } else if parties.len() >= 2 {
+        (0, 1)
+    } else {
+        (0, 0)
+    }
+}
+
+/// PBX mid-column socket: reuse a real port seen on the shared IP.
+fn mid_socket(pbx: std::net::IpAddr, messages: &[SipMsg]) -> std::net::SocketAddr {
+    for m in messages {
+        if m.flow.src.ip() == pbx {
+            return m.flow.src;
+        }
+        if m.flow.dst.ip() == pbx {
+            return m.flow.dst;
+        }
+    }
+    std::net::SocketAddr::new(pbx, 5060)
+}
+
+/// Endpoints for a single-dialog swimlane: initial INVITE src/dst, else first msg.
+fn two_parties(messages: &[SipMsg]) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+    let invite = messages
+        .iter()
+        .find(|m| m.is_request && matches!(m.method, Some(Method::Invite)) && m.to_tag.is_none());
+    let m = invite.or_else(|| messages.first())?;
+    Some((m.flow.src, m.flow.dst))
 }
 
 /// Method/status color for a message label.
@@ -361,22 +482,12 @@ fn msg_style(m: &SipMsg) -> Style {
     }
 }
 
-/// Direction of a message relative to the PBX (local IPs): `←` = the PBX
-/// receives it, `→` = the PBX sends it. Empty when no local anchor is known.
-fn lane_arrow(m: &SipMsg, local: &[std::net::IpAddr]) -> &'static str {
-    if local.contains(&m.flow.dst.ip()) {
-        "←"
-    } else if local.contains(&m.flow.src.ip()) {
-        "→"
-    } else {
-        ""
-    }
-}
-
 /// A same-Call-ID dual-dialog split classified into an ingress a-leg and an
 /// egress b-leg, with the shared PBX endpoint and both remote parties.
 struct Lanes {
+    #[allow(dead_code)]
     a_leg: u8,
+    #[allow(dead_code)]
     b_leg: u8,
     a_remote: std::net::SocketAddr,
     b_remote: std::net::SocketAddr,
@@ -389,6 +500,9 @@ struct Lanes {
 /// Returns None when the call isn't a two-dialog split or the legs can't be
 /// told apart (no local anchor, or both INVITEs go the same way) — the caller
 /// then falls back to the normal flow view.
+///
+/// When `local` is empty but the two legs still share exactly one IP, treat that
+/// IP as the mid-box so linked b-leg merges can still render three columns.
 fn classify_lanes(messages: &[SipMsg], legs: &[u8], local: &[std::net::IpAddr]) -> Option<Lanes> {
     let leg_count = legs.iter().max()? + 1;
     if leg_count != 2 {
@@ -410,48 +524,82 @@ fn classify_lanes(messages: &[SipMsg], legs: &[u8], local: &[std::net::IpAddr]) 
     }
     let inv0 = first[0]?;
     let inv1 = first[1]?;
-    // a-leg = inbound INVITE (dst is the PBX), b-leg = outbound (src is the PBX).
-    let inbound0 = local.contains(&inv0.flow.dst.ip());
-    let inbound1 = local.contains(&inv1.flow.dst.ip());
-    let (a_leg, b_leg, a_inv, b_inv) = if inbound0 && !inbound1 {
-        (0u8, 1u8, inv0, inv1)
-    } else if inbound1 && !inbound0 {
-        (1u8, 0u8, inv1, inv0)
-    } else {
-        return None;
-    };
-    let other = |inv: &SipMsg| {
-        if local.contains(&inv.flow.dst.ip()) {
+
+    let other = |inv: &SipMsg, mid: std::net::IpAddr| {
+        if inv.flow.dst.ip() == mid {
             inv.flow.src
         } else {
             inv.flow.dst
         }
     };
-    let a_remote = other(a_inv);
-    let b_remote = other(b_inv);
-    // The PBX = a local IP common to both legs' INVITEs.
-    let a_ips = [a_inv.flow.src.ip(), a_inv.flow.dst.ip()];
-    let b_ips = [b_inv.flow.src.ip(), b_inv.flow.dst.ip()];
-    let pbx = local
-        .iter()
-        .copied()
-        .find(|ip| a_ips.contains(ip) && b_ips.contains(ip))?;
+
+    if !local.is_empty() {
+        let inbound0 = local.contains(&inv0.flow.dst.ip());
+        let inbound1 = local.contains(&inv1.flow.dst.ip());
+        let (a_leg, b_leg, a_inv, b_inv) = if inbound0 && !inbound1 {
+            (0u8, 1u8, inv0, inv1)
+        } else if inbound1 && !inbound0 {
+            (1u8, 0u8, inv1, inv0)
+        } else {
+            return None;
+        };
+        let a_ips = [a_inv.flow.src.ip(), a_inv.flow.dst.ip()];
+        let b_ips = [b_inv.flow.src.ip(), b_inv.flow.dst.ip()];
+        let pbx = local
+            .iter()
+            .copied()
+            .find(|ip| a_ips.contains(ip) && b_ips.contains(ip))?;
+        return Some(Lanes {
+            a_leg,
+            b_leg,
+            a_remote: other(a_inv, pbx),
+            b_remote: other(b_inv, pbx),
+            pbx,
+        });
+    }
+
+    // No local anchor: use the single shared flow IP as the mid-box when unique.
+    let pbx = common_flow_ip_for_lanes(messages, legs)?;
+    let inbound0 = inv0.flow.dst.ip() == pbx;
+    let inbound1 = inv1.flow.dst.ip() == pbx;
+    let (a_leg, b_leg, a_inv, b_inv) = if inbound0 && !inbound1 {
+        (0u8, 1u8, inv0, inv1)
+    } else if inbound1 && !inbound0 {
+        (1u8, 0u8, inv1, inv0)
+    } else if inbound0 && inbound1 {
+        // Both inbound to mid — order by time.
+        if inv0.ts_us <= inv1.ts_us {
+            (0u8, 1u8, inv0, inv1)
+        } else {
+            (1u8, 0u8, inv1, inv0)
+        }
+    } else {
+        return None;
+    };
     Some(Lanes {
         a_leg,
         b_leg,
-        a_remote,
-        b_remote,
+        a_remote: other(a_inv, pbx),
+        b_remote: other(b_inv, pbx),
         pbx,
     })
 }
 
-/// IP-only form of a socket endpoint (port stripped), masked under privacy.
-fn short_ip(a: std::net::SocketAddr, privacy: bool) -> String {
-    if privacy {
-        mask_ip(a.ip())
-    } else {
-        a.ip().to_string()
+fn common_flow_ip_for_lanes(msgs: &[SipMsg], legs: &[u8]) -> Option<std::net::IpAddr> {
+    let mut by_leg: [Vec<std::net::IpAddr>; 2] = [Vec::new(), Vec::new()];
+    for (m, &l) in msgs.iter().zip(legs) {
+        if l <= 1 {
+            by_leg[l as usize].extend([m.flow.src.ip(), m.flow.dst.ip()]);
+        }
     }
+    let shared: Vec<std::net::IpAddr> = by_leg[0]
+        .iter()
+        .copied()
+        .filter(|ip| by_leg[1].contains(ip))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    (shared.len() == 1).then(|| shared[0])
 }
 
 /// Directional flow cell: the local (monitored) machine is pinned to the right
@@ -1294,7 +1442,7 @@ mod tests {
 
     use crate::model::packet::{Flow5Tuple, Proto};
     use crate::store::registry::{Focus, Snapshot};
-    use crate::ui::app::{Page, RecordState};
+    use crate::ui::app::{Page, RecordState, wrap_snap};
 
     /// The Network tab's media table must fit inside the right pane at typical
     /// widths without the header wrapping onto a second line. Regression test
@@ -1347,14 +1495,16 @@ mod tests {
             ],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        })));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -1407,14 +1557,16 @@ mod tests {
             }],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        })));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -1444,14 +1596,16 @@ mod tests {
             end_ts: Some(11_010_000),
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        })));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -1553,14 +1707,16 @@ mod tests {
             }],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        })));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -1794,8 +1950,15 @@ mod tests {
             mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"),
             mk_msg(1_100_000, "2.2.2.2:5060", "3.3.3.3:5060", "t2"),
         ];
-        // No local anchor → can't tell which leg is the egress b-leg.
-        assert!(classify_lanes(&msgs, &[0, 1], &[]).is_none());
+        // No local anchor but a unique shared mid IP → still classify (linked b-leg).
+        let shared = classify_lanes(&msgs, &[0, 1], &[]).expect("shared mid IP");
+        assert_eq!(shared.pbx, "2.2.2.2".parse::<std::net::IpAddr>().unwrap());
+        // No shared IP between legs → cannot classify.
+        let disjoint = vec![
+            mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"),
+            mk_msg(1_100_000, "3.3.3.3:5060", "4.4.4.4:5060", "t2"),
+        ];
+        assert!(classify_lanes(&disjoint, &[0, 1], &[]).is_none());
         // Single dialog → never a lane layout.
         assert!(classify_lanes(&msgs, &[0, 0], &["2.2.2.2".parse().unwrap()]).is_none());
     }
@@ -1816,14 +1979,16 @@ mod tests {
             }),
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        })));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -1844,52 +2009,56 @@ mod tests {
         assert!(text.contains("B2BUA"), "title must show B2BUA marker");
         let header_row = text
             .lines()
-            .find(|l| l.contains("A-Leg") && l.contains("B-Leg"))
-            .expect("lane header row present: {text}");
-        assert!(header_row.contains("PBX"), "header must include PBX");
+            .find(|l| l.contains("1.1.1.1:5060") && l.contains("3.3.3.3:5060"))
+            .expect("swimlane header with party sockets: {text}");
+        assert!(
+            header_row.contains("2.2.2.2"),
+            "header must include mid/PBX IP: {header_row}"
+        );
         assert!(
             !header_row.contains("Msg"),
-            "lane layout drops the redundant Msg column"
+            "swimlane drops the redundant Msg column"
         );
-        // Direction arrows relative to the PBX: a-leg receives, b-leg sends.
+        // Directional arrows between vertical party bars.
         assert!(
-            text.contains("← INVITE"),
-            "a-leg inbound INVITE must show ←: {text}"
+            text.contains("-- INVITE ->") || (text.contains("INVITE") && text.contains("->")),
+            "inbound INVITE must show short centered arrow: {text}"
         );
         assert!(
-            text.contains("→ INVITE"),
-            "b-leg outbound INVITE must show →: {text}"
+            text.contains('|'),
+            "swimlane must draw vertical bars under parties: {text}"
         );
     }
 
     #[test]
-    fn lane_flow_falls_back_to_normal_when_b_leg_unidentifiable() {
+    fn swimlane_two_party_when_legs_not_classifiable() {
+        // Single dialog → 2-party swimlane with SRC|DST headers.
         let focus = Focus {
             call_id: "c1".into(),
             state: Some(crate::model::sip::CallState::Active),
-            messages: vec![
-                mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"),
-                mk_msg(1_100_000, "2.2.2.2:5060", "3.3.3.3:5060", "t2"),
-            ],
-            legs: vec![0, 1],
-            b2bua: Some(crate::model::sip::B2buaInfo {
-                addr: Some("2.2.2.2".parse().unwrap()),
-                legs: 2,
-            }),
+            messages: vec![mk_msg(1_000_000, "1.1.1.1:5060", "2.2.2.2:5060", "t1"), {
+                let mut m = mk_msg(1_100_000, "2.2.2.2:5060", "1.1.1.1:5060", "t1");
+                m.is_request = false;
+                m.method = None;
+                m.status = Some(100);
+                m
+            }],
+            legs: vec![0, 0],
             ..Focus::default()
         };
-        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             focus: Some(focus),
             ..Snapshot::default()
-        })));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
-        // No local IPs → the PBX is unknown, lanes can't be told apart.
         app.page = Page::CallDetail;
 
         let mut terminal = Terminal::new(TestBackend::new(150, 44)).unwrap();
@@ -1903,13 +2072,37 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let header_row = text
-            .lines()
-            .find(|l| l.contains("Time") && l.contains("Msg"))
-            .expect("normal flow header must still render");
         assert!(
-            !header_row.contains("A-Leg"),
-            "must fall back to the normal flow without a PBX anchor"
+            text.contains("1.1.1.1:5060") && text.contains("2.2.2.2:5060"),
+            "2-party headers must show ip:port: {text}"
         );
+        assert!(
+            text.contains("-- INVITE ->") || (text.contains("INVITE") && text.contains("->")),
+            "request must show short centered arrow: {text}"
+        );
+        assert!(
+            text.contains("<- 100 --") || (text.contains("<-") && text.contains("100")),
+            "response must show <- code -- (no reason): {text}"
+        );
+        assert!(
+            !text.contains("Trying"),
+            "response must not include reason phrase"
+        );
+        assert!(
+            !text.contains("A-Leg"),
+            "must not use the old A-Leg/B-Leg labels"
+        );
+    }
+
+    #[test]
+    fn swim_row_paints_bars_and_arrows() {
+        let right = swim_row(2, 0, 1, "INVITE", 40);
+        assert!(right.contains('|'), "{right}");
+        assert!(right.contains("-- INVITE ->"), "{right}");
+        // Centered: leading/trailing spaces around the glyph inside the bars.
+        let inner = right.trim_matches(|c| c == '|' || c == ' ');
+        assert_eq!(inner, "-- INVITE ->", "{right}");
+        let left = swim_row(2, 1, 0, "100", 40);
+        assert!(left.contains("<- 100 --"), "{left}");
     }
 }

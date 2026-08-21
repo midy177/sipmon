@@ -1,11 +1,34 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::diagnostics::Diagnostic;
 use crate::model::media::StreamSummary;
 use crate::model::sip::{B2buaInfo, Call, CallState, HangupBy, Method, Outcome, SipMsg};
-use crate::store::ipstats::{IpStats, IpStatsStore};
+use crate::store::ipstats::{Dir, IpStats, IpStatsStore};
+
+/// UI focus request: primary Call-ID plus an optional linked b-leg Call-ID.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FocusHint {
+    pub primary: String,
+    pub linked: Option<String>,
+}
+
+impl FocusHint {
+    pub fn primary(id: impl Into<String>) -> Self {
+        Self {
+            primary: id.into(),
+            linked: None,
+        }
+    }
+
+    pub fn with_linked(primary: impl Into<String>, linked: impl Into<String>) -> Self {
+        Self {
+            primary: primary.into(),
+            linked: Some(linked.into()),
+        }
+    }
+}
 
 /// Focused-call detail payload for the Call Detail page.
 #[derive(Debug, Clone, Default)]
@@ -61,6 +84,23 @@ pub struct StreamKey {
     pub ssrc: u32,
 }
 
+/// Identity of an imported (replay) stream. `flow` is None for older/partial
+/// summaries that didn't carry a 5-tuple.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ImportKey {
+    call_id: String,
+    ssrc: u32,
+    flow: Option<crate::model::packet::Flow5Tuple>,
+}
+
+fn import_key(s: &StreamSummary) -> ImportKey {
+    ImportKey {
+        call_id: s.call_id.clone().unwrap_or_default(),
+        ssrc: s.ssrc,
+        flow: s.flow,
+    }
+}
+
 /// Recent-activity ordering helper.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CallSummary {
@@ -69,6 +109,8 @@ pub struct CallSummary {
     pub to_user: Option<String>,
     /// Source IP of the initial INVITE (the caller side).
     pub caller_ip: Option<std::net::IpAddr>,
+    /// Source `ip:port` of the initial INVITE (first message).
+    pub caller_src: Option<String>,
     pub state: CallState,
     pub outcome: Outcome,
     pub invite_ts: Option<u64>,
@@ -110,7 +152,9 @@ pub struct Snapshot {
     pub tz_offset_secs: Option<i32>,
     pub pps: f64,
     pub pkts_total: u64,
-    #[allow(dead_code)]
+    /// Packets the monitor itself dropped (kernel/libpcap ring overflow) on
+    /// live captures. Non-zero means loss figures may include monitor-side
+    /// drops, not network loss.
     pub pkts_dropped: u64,
     pub calls_total: u64,
     pub active: usize,
@@ -130,6 +174,8 @@ pub struct Snapshot {
     pub diagnostics: Vec<Diagnostic>,
     /// Per-IP network stats (IP page).
     pub ip_stats: Vec<IpStats>,
+    /// Per-IP SIP signaling stats (SIP Stats page): global ALL row first.
+    pub sip_stats: Vec<crate::store::sipstats::SipIpRow>,
     /// Heatmap cells: (bucket_us, key, metrics).
     pub buckets: Vec<(u64, String, crate::model::stats::MetricSet)>,
     /// Focused call detail (set by the UI via Correlator focus hint).
@@ -147,10 +193,10 @@ pub struct Registry {
     pub streams: FxHashMap<StreamKey, crate::correlate::stream::RtpStream>,
     /// call_id per stream (reverse lookup).
     pub stream_call: FxHashMap<StreamKey, String>,
-    /// SDP-advertised media endpoint -> call_id (for RTP association). Held as
-    /// `Arc<str>` so the per-RTP-packet lookup is a refcount bump, not a String
-    /// allocation.
-    pub endpoint_call: FxHashMap<std::net::SocketAddr, std::sync::Arc<str>>,
+    /// SDP-advertised media endpoint -> call_id (for RTP association). Looked
+    /// up only on the new-stream slow path (`observe_existing_rtp` handles
+    /// known streams without it), so a plain String value is fine.
+    pub endpoint_call: FxHashMap<std::net::SocketAddr, String>,
     pub events: VecDeque<String>,
     pub source: String,
     pub start_us: Option<u64>,
@@ -159,7 +205,7 @@ pub struct Registry {
     /// UTC offset (seconds) of the machine that recorded the event log
     /// (populated on replay); used to render the original local wall-clock.
     pub tz_offset_secs: Option<i32>,
-    #[allow(dead_code)]
+    /// Live-capture drop counter (kernel/libpcap stats), see Snapshot's field.
     pub pkts_dropped: u64,
     pub pkts_last_window: u64,
     pub window_start_us: Option<u64>,
@@ -170,8 +216,17 @@ pub struct Registry {
     pub diagnostics: VecDeque<Diagnostic>,
     /// Heatmap aggregation buckets.
     pub heatmap: crate::store::heatmap::Heatmap,
-    /// UI focus hint: call id whose detail should be included in snapshots.
-    pub focus_hint: Option<String>,
+    /// UI focus hint: primary (+ optional linked b-leg) whose detail is included
+    /// in snapshots.
+    pub focus_hint: Option<FocusHint>,
+    /// UI filter hint: the current filter query (rule syntax, see
+    /// `filter.rs`). Matching calls are pinned in snapshots (even outside
+    /// the recent-calls window) and protected from TTL / capacity eviction,
+    /// so filter results don't vanish mid-analysis.
+    pub search_hint: Option<String>,
+    /// Call-ids currently matching `search_hint` (refreshed on hint change and
+    /// on periodic maintenance; bounded by [`SEARCH_PIN_MAX`]).
+    search_matches: Vec<String>,
     /// Call-ids removed by eviction since the last drain (lets the correlator
     /// prune its own per-call maps like `invite_rr` / `terminal_done`, keeping
     /// long-running sessions bounded).
@@ -187,13 +242,21 @@ pub struct Registry {
     pub ssrc_index: FxHashMap<u32, SmallVec<[StreamKey; 2]>>,
     /// Per-IP packet/loss statistics (updated on the RTP hot path + 5s flush).
     pub ipstats: IpStatsStore,
-    /// Stream summaries reconstructed from a replay/import (no RTP packets are
-    /// re-fed then, so they come straight from the evlog's StreamSnap records).
-    pub imported_streams: Vec<StreamSummary>,
+    /// Per-IP SIP signaling statistics (SIP Stats page).
+    pub sipstats: crate::store::sipstats::SipStatsStore,
+    /// Stream summaries reconstructed from a replay/import, keyed for O(1)
+    /// upsert (StreamSnap is emitted every 5s; a Vec + linear scan was O(n²)
+    /// on multi-hour recordings).
+    imported_streams: HashMap<ImportKey, StreamSummary>,
+    /// call_id → import keys, so summarize/focus don't scan every imported stream.
+    imported_by_call: HashMap<String, Vec<ImportKey>>,
     pub max_calls: usize,
     pub max_streams: usize,
     pub max_diagnostics: usize,
 }
+
+/// Upper bound on search-pinned call-ids (protection + snapshot injection).
+pub const SEARCH_PIN_MAX: usize = 1000;
 
 impl Default for Registry {
     fn default() -> Self {
@@ -218,10 +281,14 @@ impl Default for Registry {
             diagnostics: VecDeque::new(),
             heatmap: crate::store::heatmap::Heatmap::new(900),
             focus_hint: None,
+            search_hint: None,
+            search_matches: Vec::new(),
             stream_index: FxHashMap::default(),
             ssrc_index: FxHashMap::default(),
             ipstats: IpStatsStore::new(),
-            imported_streams: Vec::new(),
+            sipstats: crate::store::sipstats::SipStatsStore::new(),
+            imported_streams: HashMap::new(),
+            imported_by_call: HashMap::new(),
             removed: VecDeque::new(),
             heatmap_retain_us: 24 * 3600 * 1_000_000,
             max_calls: 100_000,
@@ -271,7 +338,9 @@ impl Registry {
         self.diagnostics.clear();
         self.heatmap = crate::store::heatmap::Heatmap::new(self.heatmap.bucket_secs());
         self.ipstats.clear();
+        self.sipstats.clear();
         self.imported_streams.clear();
+        self.imported_by_call.clear();
         self.pkts_total = 0;
         self.pkts_last_window = 0;
         self.window_start_us = None;
@@ -281,6 +350,57 @@ impl Registry {
         self.completed = 0;
         self.failed = 0;
         self.focus_hint = None;
+        self.search_matches.clear();
+    }
+
+    /// Update the search hint (from the TUI). Recomputes the pinned match list
+    /// only when the normalized query actually changed.
+    pub fn set_search_hint(&mut self, q: Option<&str>) {
+        let norm = q
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if norm.as_deref() == self.search_hint.as_deref() {
+            return;
+        }
+        self.search_hint = norm;
+        self.refresh_search_matches();
+    }
+
+    /// Recompute the search-pinned call-ids from the current query (same rule
+    /// syntax as the TUI filter bar, see [`crate::filter`]). Called on hint
+    /// change and on periodic maintenance (new calls / late-filled From/To
+    /// users must be picked up).
+    pub fn refresh_search_matches(&mut self) {
+        self.search_matches.clear();
+        let Some(q) = self.search_hint.as_deref() else {
+            return;
+        };
+        let rules = crate::filter::parse(q);
+        let mut matched: Vec<(Option<u64>, String)> = self
+            .calls
+            .values()
+            .filter(|c| crate::filter::matches(*c, &rules))
+            .map(|c| (c.invite_ts, c.call_id.clone()))
+            .collect();
+        matched.sort_by_key(|(ts, _)| std::cmp::Reverse(ts.unwrap_or(0)));
+        self.search_matches = matched
+            .into_iter()
+            .take(SEARCH_PIN_MAX)
+            .map(|(_, id)| id)
+            .collect();
+    }
+
+    /// True when the call-id is focus- or search-protected.
+    fn pinned_set(&self) -> HashSet<&str> {
+        let mut set: HashSet<&str> = self.search_matches.iter().map(String::as_str).collect();
+        if let Some(h) = &self.focus_hint {
+            set.insert(h.primary.as_str());
+            if let Some(l) = h.linked.as_deref() {
+                set.insert(l);
+            }
+        }
+        set
     }
 
     /// Record that `key` belongs to `call_id` (called on stream creation).
@@ -333,36 +453,37 @@ impl Registry {
 
     /// Evict oldest *terminated* calls when above `max_calls`. Falls back to
     /// evicting the oldest active call only if all are still active.
+    /// Focus- and search-pinned calls are never evicted here.
     pub fn evict_if_needed(&mut self) {
         while self.calls.len() > self.max_calls {
+            let pinned = self.pinned_set();
             // Find oldest terminated call by invite_ts.
             let target = self
                 .order
                 .iter()
-                .filter_map(|id| self.calls.get(id))
-                .filter(|c| {
+                .filter_map(|id| self.calls.get(id).map(|c| (id.as_str(), c)))
+                .filter(|(id, _)| !pinned.contains(id))
+                .filter(|(_, c)| {
                     matches!(
                         c.state,
                         CallState::Completed | CallState::Failed | CallState::Canceled
                     )
                 })
-                .min_by_key(|c| c.invite_ts.unwrap_or(u64::MAX))
-                .map(|c| c.call_id.clone());
+                .min_by_key(|(_, c)| c.invite_ts.unwrap_or(u64::MAX))
+                .map(|(id, _)| id.to_string());
 
-            let cid = target
-                .or_else(|| {
-                    // All active; evict oldest by invite_ts.
-                    self.order
-                        .iter()
-                        .filter_map(|id| self.calls.get(id))
-                        .min_by_key(|c| c.invite_ts.unwrap_or(u64::MAX))
-                        .map(|c| c.call_id.clone())
-                })
-                .unwrap_or_else(|| self.order.first().cloned().unwrap_or_default());
+            let cid = target.or_else(|| {
+                // All evictable calls are active; evict oldest by invite_ts.
+                self.order
+                    .iter()
+                    .filter_map(|id| self.calls.get(id).map(|c| (id.as_str(), c)))
+                    .filter(|(id, _)| !pinned.contains(id))
+                    .min_by_key(|(_, c)| c.invite_ts.unwrap_or(u64::MAX))
+                    .map(|(id, _)| id.to_string())
+            });
 
-            if cid.is_empty() {
-                break;
-            }
+            // Nothing evictable (all remaining calls are pinned): keep them.
+            let Some(cid) = cid else { break };
             self.remove_call(&cid);
         }
 
@@ -386,24 +507,63 @@ impl Registry {
         }
     }
 
-    fn remove_call(&mut self, call_id: &str) {
-        self.calls.remove(call_id);
-        self.order.retain(|id| id != call_id);
-        self.removed.push_back(call_id.to_string());
-        // Clean endpoint + stream indices (stream keys come from the index,
-        // no full scan).
-        self.endpoint_call.retain(|_, v| v.as_ref() != call_id);
-        let stream_keys: Vec<StreamKey> = self.stream_index.remove(call_id).unwrap_or_default();
-        for k in stream_keys {
-            self.streams.remove(&k);
-            self.stream_call.remove(&k);
-            if let Some(v) = self.ssrc_index.get_mut(&k.ssrc) {
-                v.retain(|k2| k2 != &k);
-                if v.is_empty() {
-                    self.ssrc_index.remove(&k.ssrc);
+    /// Drop idle and terminated calls older than `ttl_secs` of capture time.
+    /// `ttl_secs == 0` disables time-based eviction (file/replay). Focus- and
+    /// search-pinned calls are retained.
+    pub fn evict_stale(&mut self, ttl_secs: u64, now_us: u64) {
+        if ttl_secs == 0 || now_us == 0 {
+            return;
+        }
+        let cutoff = now_us.saturating_sub(ttl_secs.saturating_mul(1_000_000));
+        let pinned = self.pinned_set();
+        let stale: Vec<String> = self
+            .calls
+            .iter()
+            .filter(|(id, _)| !pinned.contains(id.as_str()))
+            .filter(|(_, c)| {
+                let terminal = matches!(
+                    c.state,
+                    CallState::Completed | CallState::Failed | CallState::Canceled
+                );
+                let t = if terminal {
+                    c.end_ts.or(c.bye_ts).unwrap_or(c.last_ts_us)
+                } else {
+                    c.last_ts_us
+                };
+                t != 0 && t < cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.remove_calls(&stale);
+    }
+
+    /// Remove a call and its streams from in-memory indexes.
+    pub(crate) fn remove_call(&mut self, call_id: &str) {
+        self.remove_calls(&[call_id.to_string()]);
+    }
+
+    fn remove_calls(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let drop: HashSet<String> = ids.iter().cloned().collect();
+        for id in ids {
+            self.calls.remove(id);
+            self.removed.push_back(id.clone());
+            let stream_keys: Vec<StreamKey> = self.stream_index.remove(id).unwrap_or_default();
+            for k in stream_keys {
+                self.streams.remove(&k);
+                self.stream_call.remove(&k);
+                if let Some(v) = self.ssrc_index.get_mut(&k.ssrc) {
+                    v.retain(|k2| k2 != &k);
+                    if v.is_empty() {
+                        self.ssrc_index.remove(&k.ssrc);
+                    }
                 }
             }
         }
+        self.order.retain(|id| !drop.contains(id));
+        self.endpoint_call.retain(|_, v| !drop.contains(v));
     }
 
     pub fn touch_time(&mut self, ts_us: u64) {
@@ -452,12 +612,67 @@ impl Registry {
     }
 
     /// Register a stream summary reconstructed from an evlog record (replay
-    /// path). These appear in snapshots and call-detail alongside live streams.
+    /// path). Consecutive snaps of the same (call, ssrc, flow) replace the
+    /// previous row so the Streams page doesn't accumulate one row per 5s flush.
     pub fn add_imported_stream(&mut self, s: StreamSummary) {
-        if self.imported_streams.len() >= self.max_streams {
-            self.imported_streams.remove(0);
+        let key = import_key(&s);
+        if let Some(slot) = self.imported_streams.get_mut(&key) {
+            *slot = s;
+            return;
         }
-        self.imported_streams.push(s);
+        if self.imported_streams.len() >= self.max_streams {
+            return;
+        }
+        if !key.call_id.is_empty() {
+            self.imported_by_call
+                .entry(key.call_id.clone())
+                .or_default()
+                .push(key.clone());
+        }
+        self.imported_streams.insert(key, s);
+    }
+
+    /// Import a StreamSnap from an evlog (replay). Upserts the stream summary
+    /// and attributes the packet/loss *delta* since the previous snap of the
+    /// same stream onto per-IP stats.
+    pub fn import_stream_snap(&mut self, ts_us: u64, s: StreamSummary) {
+        if ts_us > self.last_us.unwrap_or(0) {
+            self.last_us = Some(ts_us);
+        }
+        let key = import_key(&s);
+        let (prev_pkts, prev_lost, prev_bytes) = self
+            .imported_streams
+            .get(&key)
+            .map(|p| (p.packets, p.lost, p.bytes))
+            .unwrap_or((0, 0, 0));
+        let pkts_delta = s.packets.saturating_sub(prev_pkts);
+        let lost_delta = s.lost.saturating_sub(prev_lost);
+        let bytes_delta = s.bytes.saturating_sub(prev_bytes);
+        let flow = s.flow;
+        self.add_imported_stream(s);
+        let Some(flow) = flow else {
+            return;
+        };
+        if pkts_delta > 0 || bytes_delta > 0 {
+            self.ipstats
+                .observe_packets(flow.src.ip(), ts_us, pkts_delta, bytes_delta, Dir::Tx);
+            self.ipstats
+                .observe_packets(flow.dst.ip(), ts_us, pkts_delta, bytes_delta, Dir::Rx);
+        }
+        if lost_delta > 0 {
+            self.ipstats
+                .observe_lost(flow.src.ip(), ts_us, lost_delta, Dir::Tx);
+            self.ipstats
+                .observe_lost(flow.dst.ip(), ts_us, lost_delta, Dir::Rx);
+        }
+    }
+
+    fn imported_for_call(&self, call_id: &str) -> impl Iterator<Item = &StreamSummary> {
+        self.imported_by_call
+            .get(call_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|k| self.imported_streams.get(k))
     }
 
     /// Build a UI snapshot: recent calls capped to `limit`, streams capped to
@@ -492,10 +707,8 @@ impl Registry {
         // Imported (replay/jsonl) summaries grouped once per publish instead
         // of a linear scan per call (O(calls × imported) -> O(imported)).
         let mut imported_by_call: FxHashMap<&str, Vec<&StreamSummary>> = FxHashMap::default();
-        for s in &self.imported_streams {
-            if let Some(cid) = s.call_id.as_deref() {
-                imported_by_call.entry(cid).or_default().push(s);
-            }
+        for (k, s) in &self.imported_streams {
+            imported_by_call.entry(k.call_id.as_str()).or_default().push(s);
         }
         let mut summaries: Vec<CallSummary> = self
             .order
@@ -513,6 +726,29 @@ impl Registry {
                 )
             })
             .collect();
+
+        // Search-pinned calls stay visible even when they have fallen out of
+        // the recent-calls window (skipped for full snapshots, which already
+        // include every call).
+        if limit != usize::MAX && !self.search_matches.is_empty() {
+            let cap = limit.saturating_add(SEARCH_PIN_MAX);
+            let in_window: HashSet<String> = summaries.iter().map(|s| s.call_id.clone()).collect();
+            for id in &self.search_matches {
+                if summaries.len() >= cap {
+                    break;
+                }
+                if in_window.contains(id.as_str()) {
+                    continue;
+                }
+                if let Some(c) = self.calls.get(id) {
+                    summaries.push(self.summarize(
+                        c,
+                        live_by_call.get(c.call_id.as_str()),
+                        imported_by_call.get(c.call_id.as_str()).map(|v| v.as_slice()),
+                    ));
+                }
+            }
+        }
 
         let (active_n, comp_n, fail_n) =
             summaries
@@ -563,6 +799,22 @@ impl Registry {
                 rtt_n += 1;
             }
         }
+        for s in self.imported_streams.values() {
+            if let Some(j) = s.jitter_ms {
+                jit += j;
+                jit_n += 1;
+            }
+            loss += s.loss_pct;
+            loss_n += 1;
+            if let Some(m) = s.mos {
+                mos += m;
+                mos_n += 1;
+            }
+            if let Some(r) = s.rtt_avg_ms {
+                rtt += r;
+                rtt_n += 1;
+            }
+        }
         let avg = |sum: f64, n: u64| if n == 0 { 0.0 } else { sum / n as f64 };
         let calls_total = self.completed + self.failed + active_n as u64;
         let answered = self.completed;
@@ -603,28 +855,36 @@ impl Registry {
                     .take(stream_limit)
                     .collect();
                 let remaining = stream_limit.saturating_sub(s.len());
-                s.extend(self.imported_streams.iter().take(remaining).cloned());
+                s.extend(self.imported_streams.values().take(remaining).cloned());
                 s
             },
             events: self.events.clone(),
             diagnostics: self.diagnostics.iter().cloned().collect(),
             ip_stats: self.ipstats.snapshot(),
+            sip_stats: self.sipstats.snapshot(),
             buckets: self.heatmap.flat(),
-            focus: self
-                .focus_hint
-                .as_ref()
-                .and_then(|id| self.focus_detail(id)),
+            focus: self.focus_hint.as_ref().and_then(|h| self.focus_detail(h)),
             paused: false,
         }
     }
 
     /// Build the focus payload for the Call Detail page.
-    fn focus_detail(&self, call_id: &str) -> Option<Focus> {
-        let call = self.calls.get(call_id)?;
-        let msgs = if call.messages.len() > 1000 {
-            call.messages[call.messages.len() - 1000..].to_vec()
+    fn focus_detail(&self, hint: &FocusHint) -> Option<Focus> {
+        let call = self.calls.get(&hint.primary)?;
+        let primary_msgs = trim_msgs(&call.messages);
+        // Linked b-leg (different Call-ID): merge chronologically and force
+        // legs 0/1 so the swimlane can draw a 3-column A|mid|B view. Linked
+        // overrides same-Call-ID dual-dialog classification.
+        let (msgs, legs, leg_count) = if let Some(linked_id) = hint.linked.as_deref() {
+            let linked_msgs = self
+                .calls
+                .get(linked_id)
+                .map(|c| trim_msgs(&c.messages))
+                .unwrap_or_default();
+            merge_leg_msgs(primary_msgs, linked_msgs)
         } else {
-            call.messages.clone()
+            let (legs, leg_count) = dialog_legs(&primary_msgs);
+            (primary_msgs, legs, leg_count)
         };
         // Party identities from the SIP messages: the initial INVITE identifies
         // the caller, the first response identifies the callee.
@@ -643,33 +903,24 @@ impl Registry {
             .map(|m| m.flow.src.ip())
             .or_else(|| call.invite_key.as_deref().and_then(|k| k.parse().ok()));
         let mut streams: Vec<_> = self
-            .call_stream_keys(call_id)
+            .call_stream_keys(&hint.primary)
             .iter()
             .filter_map(|k| self.streams.get(k))
             .map(|s| s.summary())
             .collect();
-        streams.extend(
-            self.imported_streams
-                .iter()
-                .filter(|s| s.call_id.as_deref() == Some(call_id))
-                .cloned(),
-        );
+        streams.extend(self.imported_for_call(&hint.primary).cloned());
         let diagnostics = self
             .diagnostics
             .iter()
-            .filter(|d| d.call_id == call_id)
+            .filter(|d| d.call_id == hint.primary)
             .cloned()
             .collect();
-        // Dialog (leg) derivation: every message of a dialog shares the same
-        // From tag (fallback: branch). ≥2 distinct legs inside one Call-ID is a
-        // same-Call-ID B2BUA split.
-        let (legs, leg_count) = dialog_legs(&msgs);
         let b2bua = (leg_count >= 2).then(|| B2buaInfo {
             addr: common_flow_ip(&msgs, &legs),
             legs: leg_count,
         });
         Some(Focus {
-            call_id: call_id.to_string(),
+            call_id: hint.primary.clone(),
             state: Some(call.state),
             from_user: call.from_user.clone(),
             to_user: call.to_user.clone(),
@@ -727,6 +978,7 @@ impl Registry {
             from_user: c.from_user.clone(),
             to_user: c.to_user.clone(),
             caller_ip: c.invite_key.as_deref().and_then(|k| k.parse().ok()),
+            caller_src: c.invite_src.clone(),
             state: c.state,
             outcome: c.outcome,
             invite_ts: c.invite_ts,
@@ -754,6 +1006,29 @@ impl Registry {
     pub fn call_messages(&self, call_id: &str) -> Option<&[crate::model::sip::SipMsg]> {
         self.calls.get(call_id).map(|c| c.messages.as_slice())
     }
+}
+
+/// Cap stored messages for the focus payload (keeps the TUI responsive).
+fn trim_msgs(msgs: &[SipMsg]) -> Vec<SipMsg> {
+    if msgs.len() > 1000 {
+        msgs[msgs.len() - 1000..].to_vec()
+    } else {
+        msgs.to_vec()
+    }
+}
+
+/// Merge primary + linked call messages by timestamp; primary → leg 0, linked → leg 1.
+fn merge_leg_msgs(primary: Vec<SipMsg>, linked: Vec<SipMsg>) -> (Vec<SipMsg>, Vec<u8>, u8) {
+    let mut merged: Vec<(SipMsg, u8)> = primary
+        .into_iter()
+        .map(|m| (m, 0u8))
+        .chain(linked.into_iter().map(|m| (m, 1u8)))
+        .collect();
+    merged.sort_by_key(|(m, _)| m.ts_us);
+    let legs: Vec<u8> = merged.iter().map(|(_, l)| *l).collect();
+    let msgs: Vec<SipMsg> = merged.into_iter().map(|(m, _)| m).collect();
+    let leg_count = if msgs.is_empty() { 0 } else { 2 };
+    (msgs, legs, leg_count)
 }
 
 /// Extract the value of a single-line SIP header from raw message bytes.
@@ -895,7 +1170,7 @@ mod tests {
             mk_sip(Some("t2"), "2.2.2.2:5060", "3.3.3.3:5060"),
         ];
         call.messages = msgs;
-        reg.focus_hint = Some("c1".into());
+        reg.focus_hint = Some(FocusHint::primary("c1"));
         let focus = reg.snapshot_full().focus.expect("focus detail present");
         assert_eq!(focus.legs, vec![0, 1]);
         let b2bua = focus.b2bua.expect("same Call-ID split must be detected");
@@ -914,10 +1189,103 @@ mod tests {
             mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060"),
             mk_sip(Some("t1"), "2.2.2.2:5060", "1.1.1.1:5060"),
         ];
-        reg.focus_hint = Some("c1".into());
+        reg.focus_hint = Some(FocusHint::primary("c1"));
         let focus = reg.snapshot_full().focus.expect("focus detail present");
         assert_eq!(focus.legs, vec![0, 0]);
         assert!(focus.b2bua.is_none(), "single dialog must not be a B2BUA");
+    }
+
+    #[test]
+    fn focus_detail_merges_linked_b_leg_by_timestamp() {
+        let mut reg = Registry::with_source("t".into());
+        {
+            let a = reg.get_or_create_call("a-leg");
+            let mut m0 = mk_sip(Some("t1"), "1.1.1.1:5060", "2.2.2.2:5060");
+            m0.ts_us = 1_000_000;
+            let mut m2 = mk_sip(Some("t1"), "2.2.2.2:5060", "1.1.1.1:5060");
+            m2.ts_us = 1_100_000;
+            m2.is_request = false;
+            m2.method = None;
+            m2.status = Some(100);
+            a.messages = vec![m0, m2];
+        }
+        {
+            let b = reg.get_or_create_call("b-leg");
+            let mut m1 = mk_sip(Some("t2"), "2.2.2.2:5060", "3.3.3.3:5060");
+            m1.ts_us = 1_050_000;
+            b.messages = vec![m1];
+        }
+        reg.focus_hint = Some(FocusHint::with_linked("a-leg", "b-leg"));
+        let focus = reg.snapshot_full().focus.expect("focus detail present");
+        assert_eq!(focus.call_id, "a-leg");
+        assert_eq!(focus.messages.len(), 3);
+        assert_eq!(focus.legs, vec![0, 1, 0]);
+        assert_eq!(focus.messages[0].ts_us, 1_000_000);
+        assert_eq!(focus.messages[1].ts_us, 1_050_000);
+        assert_eq!(focus.messages[2].ts_us, 1_100_000);
+        assert_eq!(focus.b2bua.as_ref().map(|b| b.legs), Some(2));
+    }
+
+    #[test]
+    fn search_pin_protects_from_ttl_and_window() {
+        let mut reg = Registry::with_source("t".into());
+        {
+            let a = reg.get_or_create_call("alice-call");
+            a.invite_ts = Some(1_000);
+            a.last_ts_us = 1_000;
+            a.end_ts = Some(2_000);
+            a.state = CallState::Completed;
+            a.from_user = Some("alice".into());
+        }
+        {
+            let b = reg.get_or_create_call("bob-call");
+            b.invite_ts = Some(3_000);
+            b.last_ts_us = 3_000;
+            b.end_ts = Some(4_000);
+            b.state = CallState::Completed;
+            b.from_user = Some("bob".into());
+        }
+        reg.set_search_hint(Some("alice"));
+
+        // TTL eviction past the cutoff: the pinned call survives.
+        reg.evict_stale(60, 120_000_000);
+        assert!(reg.calls.contains_key("alice-call"), "pin must protect");
+        assert!(!reg.calls.contains_key("bob-call"), "unpinned evicts");
+
+        // Window of 1 would only hold the newest call; pinned stays visible.
+        let snap = reg.snapshot(1);
+        assert!(snap.calls.iter().any(|c| c.call_id == "alice-call"));
+
+        // Clearing the hint lifts the protection.
+        reg.set_search_hint(None);
+        reg.evict_stale(60, 120_000_000);
+        assert!(!reg.calls.contains_key("alice-call"));
+    }
+
+    #[test]
+    fn capacity_eviction_skips_pinned_calls() {
+        let mut reg = Registry::with_source("t".into());
+        reg.set_caps(2, 10, 10);
+        {
+            let a = reg.get_or_create_call("focused");
+            a.invite_ts = Some(1_000);
+            a.last_ts_us = 1_000;
+            a.end_ts = Some(1_500);
+            a.state = CallState::Completed;
+        }
+        {
+            let b = reg.get_or_create_call("pinned-by-search");
+            b.invite_ts = Some(2_000);
+            b.last_ts_us = 2_000;
+            b.end_ts = Some(2_500);
+            b.state = CallState::Completed;
+        }
+        reg.focus_hint = Some(FocusHint::primary("focused"));
+        reg.set_search_hint(Some("pinned-by-search"));
+        reg.evict_if_needed();
+        assert_eq!(reg.calls.len(), 2, "all calls pinned: nothing evictable");
+        assert!(reg.calls.contains_key("focused"));
+        assert!(reg.calls.contains_key("pinned-by-search"));
     }
 
     #[test]
@@ -942,7 +1310,7 @@ mod tests {
         assert_eq!(snap.streams[0].ssrc, 0x1000);
 
         // Focus detail (Call Detail media table) includes it with flow/pkts.
-        reg.focus_hint = Some("c1".into());
+        reg.focus_hint = Some(FocusHint::primary("c1"));
         let snap = reg.snapshot_full();
         let focus = snap.focus.expect("focus detail present");
         assert_eq!(focus.streams.len(), 1, "media table must show the stream");
@@ -954,5 +1322,87 @@ mod tests {
         assert_eq!(call.pkts_rtp, 500);
         assert_eq!(call.best_mos, Some(4.3));
         assert_eq!(call.stream_count, 1);
+    }
+
+    #[test]
+    fn import_stream_snap_feeds_ip_stats_and_upserts() {
+        let mut reg = Registry::with_source("replay".into());
+        let flow = Flow5Tuple {
+            proto: Proto::Udp,
+            src: "10.10.0.8:4000".parse().unwrap(),
+            dst: "10.20.0.8:4000".parse().unwrap(),
+        };
+        let mut snap = StreamSummary {
+            ssrc: 0xabc,
+            packets: 100,
+            lost: 2,
+            bytes: 16000,
+            loss_pct: 2.0,
+            ..StreamSummary::default()
+        };
+        snap.call_id = Some("c1".into());
+        snap.flow = Some(flow);
+
+        // First 5s snap: 100 pkts / 2 lost.
+        reg.import_stream_snap(1_000_000, snap.clone());
+        // Second snap of the same stream: cumulative 250 pkts / 5 lost.
+        snap.packets = 250;
+        snap.lost = 5;
+        snap.bytes = 40000;
+        reg.import_stream_snap(6_000_000, snap);
+
+        let ip_stats = reg.snapshot_full().ip_stats;
+        assert_eq!(ip_stats.len(), 2, "both endpoints must appear");
+        let src = ip_stats
+            .iter()
+            .find(|s| s.ip.to_string() == "10.10.0.8")
+            .unwrap();
+        let dst = ip_stats
+            .iter()
+            .find(|s| s.ip.to_string() == "10.20.0.8")
+            .unwrap();
+        assert_eq!(src.pkts_tx, 250);
+        assert_eq!(src.lost_tx, 5);
+        assert_eq!(dst.pkts_rx, 250);
+        assert_eq!(dst.lost_rx, 5);
+        let src_loss = src.loss_pct(0, Dir::Tx).unwrap();
+        assert!((src_loss - 2.0).abs() < 1e-9, "all-time TX loss {src_loss}");
+
+        // Consecutive snaps of the same stream replace, not accumulate, the row.
+        assert_eq!(reg.snapshot_full().streams.len(), 1);
+        assert_eq!(reg.snapshot_full().streams[0].packets, 250);
+    }
+
+    #[test]
+    fn import_many_stream_snaps_stays_fast() {
+        let mut reg = Registry::with_source("replay".into());
+        let flow = Flow5Tuple {
+            proto: Proto::Udp,
+            src: "10.10.0.8:4000".parse().unwrap(),
+            dst: "10.20.0.8:4000".parse().unwrap(),
+        };
+        let t0 = std::time::Instant::now();
+        for i in 0..20_000u64 {
+            let mut s = StreamSummary {
+                ssrc: (i % 200) as u32,
+                packets: 100 + i,
+                lost: i / 40,
+                bytes: (100 + i) * 160,
+                loss_pct: 1.0,
+                ..StreamSummary::default()
+            };
+            s.call_id = Some("c1".into());
+            s.flow = Some(flow);
+            reg.import_stream_snap(1_000_000 + i * 5_000_000, s);
+        }
+        let snap = reg.snapshot_full();
+        assert!(
+            t0.elapsed().as_millis() < 1_000,
+            "20k stream snaps must stay O(n), took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(snap.streams.len(), 200, "upsert keeps one row per ssrc");
+        assert_eq!(snap.ip_stats.len(), 2);
+        assert!(snap.calls.is_empty()); // snaps don't create calls
     }
 }

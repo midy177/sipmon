@@ -7,12 +7,13 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use crate::model::sip::HangupBy;
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
-use crate::ui::{fmt_dur, fmt_ms, fmt_secs, fmt_time_delta, mask_user, theme};
+use crate::ui::{fmt_dur, fmt_ms, fmt_secs, fmt_time_tz, mask_socket, mask_user, theme};
 
 pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(4),
+        Constraint::Length(3),
         Constraint::Min(0),
     ])
     .split(area);
@@ -54,14 +55,58 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     .block(Block::default().borders(Borders::ALL).title("Summary"));
     f.render_widget(cards, chunks[1]);
 
-    // Call table. The SrcIP column was dropped to give the (wider) local-time +
-    // recorded-duration Time column room.
+    // Filter bar: rule-based call filtering (`ip:` / `caller:` / `callee:` /
+    // `callid:` tokens AND-ed together; bare words match any field).
+    let (content, title) = if app.filter_editing {
+        (
+            Line::from(vec![
+                Span::styled("> ", Style::default().fg(theme::WARNING)),
+                Span::raw(app.filter_query.clone()),
+                Span::styled(
+                    "▏",
+                    Style::default()
+                        .fg(theme::WARNING)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            "Filter — [Enter] apply [Esc] cancel [Ctrl-U] clear",
+        )
+    } else if app.filter_query.trim().is_empty() {
+        (
+            Line::from(Span::styled(
+                " press / to filter — ip:1.2.3.4[:port] caller:1001 callee:2002 callid:abc  (space = AND)",
+                Style::default().fg(theme::MUTED),
+            )),
+            "Filter",
+        )
+    } else {
+        (
+            Line::from(vec![
+                Span::styled("● ", Style::default().fg(theme::WARNING)),
+                Span::raw(app.filter_query.clone()),
+                Span::styled(
+                    "   [c] clear  [/] edit",
+                    Style::default().fg(theme::MUTED),
+                ),
+            ]),
+            "Filter (active)",
+        )
+    };
+    let bar = Paragraph::new(content).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(title, Style::default().fg(theme::WARNING))),
+    );
+    f.render_widget(bar, chunks[2]);
+
+    // Call table. Time is the absolute local wall-clock; Src is the source
+    // ip:port of the initial INVITE (first message).
     let header = [
         "Time",
         "From",
         "To",
         "State",
-        "PDD",
+        "Src",
         "Setup",
         "Ring",
         "Dur",
@@ -73,14 +118,16 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         "Call-ID",
     ];
     // Keep the highlight anchored to the same call as new calls arrive, then
-    // apply the state filter (`f` cycles all/pending/success/failed/canceled).
+    // apply the state filter (`f` cycles all/pending/success/failed/canceled)
+    // AND the rule filter bar query.
     app.anchor_overview_selection(snap);
     let privacy = app.privacy;
-    let visible: Vec<&crate::store::registry::CallSummary> = snap
+    let visible = app.filtered_calls(snap);
+    let state_n = snap
         .calls
         .iter()
         .filter(|c| app.filter.matches(c.state))
-        .collect();
+        .count();
     let rows = visible.iter().map(|c| {
         let diag_cell = if c.critical_count > 0 {
             Cell::from(format!("{}C/{}W", c.critical_count, c.warn_count)).style(
@@ -113,16 +160,21 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
         } else {
             Cell::from("·").style(Style::default().fg(theme::MUTED))
         };
+        let src = match c.caller_src.as_deref() {
+            Some(v) if privacy => mask_socket(v),
+            Some(v) => v.to_string(),
+            None => String::new(),
+        };
         Row::new(vec![
             Cell::from(
                 c.invite_ts
-                    .map(|t| fmt_time_delta(t, snap.start_us.unwrap_or(t), snap.tz_offset_secs))
+                    .map(|t| fmt_time_tz(t, snap.tz_offset_secs))
                     .unwrap_or_else(|| "-".into()),
             ),
             Cell::from(format!("{from}{turn_mark}")),
             Cell::from(to),
             Cell::from(c.state.label()).style(state_color(c.state)),
-            Cell::from(fmt_secs(c.pdd_ms.map(|m| m as u64))),
+            Cell::from(src),
             Cell::from(fmt_secs(c.setup_ms.map(|m| m as u64))),
             Cell::from(fmt_secs(c.ring_ms.map(|m| m as u64))).style(ring_style(c.ring_code)),
             Cell::from(fmt_dur(c.duration_ms)),
@@ -138,33 +190,34 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(17),
-            Constraint::Length(16),
-            Constraint::Length(14),
             Constraint::Length(10),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(10),
+            Constraint::Length(13),
+            Constraint::Length(12),
             Constraint::Length(9),
+            Constraint::Length(21),
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Length(5),
             Constraint::Length(7),
+            Constraint::Length(7),
             Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Min(10),
+            Constraint::Min(8),
         ],
     )
     .header(
         Row::new(header.iter().map(|h| Cell::from(*h))).style(Style::default().fg(theme::WARNING)),
     )
     .block(Block::default().borders(Borders::ALL).title(format!(
-        "Calls ({}/{}) — Enter=detail, f=filter:{}  [PDD=INV→try/ring, Setup=INV→200, Ring=dur, EarlyMedia=183+media]",
+        "Calls ({}/{}/{}) — Enter=detail, f=state:{}, /=rule filter, c=clear  [Setup=INV→200, Ring=dur, EarlyMedia=183+media]",
         visible.len(),
+        state_n,
         snap.calls.len(),
         app.filter.label()
     )))
-    .row_highlight_style(Style::default().bg(theme::MUTED));
-    f.render_stateful_widget(table, chunks[2], &mut app.table_state);
+    .row_highlight_style(theme::selected());
+    f.render_stateful_widget(table, chunks[3], &mut app.table_state);
 }
 
 pub fn state_color(state: crate::model::sip::CallState) -> Style {
@@ -217,15 +270,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::store::registry::CallSummary;
-    use crate::ui::app::{App, Page, RecordState};
+    use crate::ui::app::{App, Page, RecordState, wrap_snap};
 
     fn render_overview(privacy: bool) -> String {
-        let snap = Arc::new(Mutex::new(Arc::new(Snapshot {
+        let snap = wrap_snap(Snapshot {
             calls: vec![CallSummary {
                 call_id: "c1".into(),
                 from_user: Some("13812345678".into()),
                 to_user: Some("bob".into()),
                 caller_ip: Some("10.10.0.8".parse().unwrap()),
+                caller_src: Some("10.10.0.8:5060".into()),
                 state: crate::model::sip::CallState::Active,
                 outcome: crate::model::sip::Outcome::Answered,
                 invite_ts: Some(1_000_000),
@@ -247,11 +301,13 @@ mod tests {
                 ips: vec!["10.10.0.8".parse().unwrap()],
             }],
             ..Snapshot::default()
-        })));
+        });
         let mut app = App::new(
             snap,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(Mutex::new(Some("c1".to_string()))),
+            Arc::new(Mutex::new(Some(
+                crate::store::registry::FocusHint::primary("c1"),
+            ))),
             Arc::new(AtomicBool::new(false)),
             RecordState::default(),
         );
@@ -271,16 +327,23 @@ mod tests {
     }
 
     #[test]
-    fn overview_merges_local_time_and_recorded_duration() {
+    fn overview_time_is_absolute_and_src_column_present() {
         let text = render_overview(false);
+        // The table header row (carries "Call-ID"); the Summary card above
+        // legitimately keeps the avg PDD stat.
+        let header = text
+            .lines()
+            .find(|l| l.contains("Call-ID"))
+            .expect("table header row");
+        assert!(!header.contains("PDD"), "PDD column must be removed");
+        assert!(header.contains("Src"), "Src column header missing: {header}");
         assert!(
-            !text.contains("SrcIP"),
-            "SrcIP column must be removed to make room for the time display"
+            !text.contains("(+"),
+            "time column must be absolute, no recorded delta: {text}"
         );
-        // The Time cell carries the local wall-clock plus the recorded delta.
         assert!(
-            text.contains("(+"),
-            "time column must include the recorded duration: {text}"
+            text.contains("10.10.0.8:5060"),
+            "Src cell must show the INVITE source ip:port: {text}"
         );
     }
 
@@ -292,5 +355,8 @@ mod tests {
             "caller number leaked in privacy"
         );
         assert!(text.contains("138…5678"), "masked caller number missing");
+        // The Src ip:port is masked too (port preserved).
+        assert!(!text.contains("10.10.0.8"), "src IP leaked in privacy");
+        assert!(text.contains("10.*.*.8:5060"), "masked src missing");
     }
 }

@@ -61,6 +61,16 @@ impl SdpSession {
         // Static payload type fallback.
         Some(static_codec_name(pt)?).map(|s| s.to_string())
     }
+
+    /// `a=rtpmap` clock rate for `pt`, if advertised.
+    pub fn clock_rate_for_pt(&self, pt: u8) -> Option<u32> {
+        for m in &self.media {
+            if let Some(c) = m.codecs.iter().find(|c| c.pt == pt) {
+                return Some(c.clock_rate);
+            }
+        }
+        None
+    }
 }
 
 pub fn static_codec_name(pt: u8) -> Option<&'static str> {
@@ -182,5 +192,8 @@ mod tests {
         assert!(pts.contains(&0) && pts.contains(&8) && pts.contains(&101));
         assert_eq!(s.codec_name_for_pt(0), Some("PCMU".into()));
         assert_eq!(s.codec_name_for_pt(101), Some("telephone-event".into()));
+        assert_eq!(s.clock_rate_for_pt(0), Some(8000));
+        assert_eq!(s.clock_rate_for_pt(101), Some(8000));
+        assert_eq!(s.clock_rate_for_pt(8), None);
     }
 }

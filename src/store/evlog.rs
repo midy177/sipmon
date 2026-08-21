@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Offset;
 
+use crate::model::media::StreamSummary;
 use crate::model::packet::{Flow5Tuple, Proto};
 use crate::model::stats::{HealthBucket, MetricSet};
 
@@ -641,7 +642,7 @@ fn read_metric_set<R: Read>(r: &mut R) -> Result<MetricSet> {
     })
 }
 
-fn decode_payload(ty: u8, ts_us: u64, mut rd: &[u8]) -> Result<Event> {
+pub(crate) fn decode_payload(ty: u8, ts_us: u64, mut rd: &[u8]) -> Result<Event> {
     let ev = match ty {
         1 => {
             let flow = read_flow(&mut rd)?;
@@ -867,9 +868,379 @@ fn decode_payload(ty: u8, ts_us: u64, mut rd: &[u8]) -> Result<Event> {
     Ok(ev)
 }
 
+/// Zero-copy walk of an evlog image (file header optional). Avoids allocating
+/// a payload `Vec` per record — the callback receives a borrow of `data`.
+#[cfg(test)]
+pub(crate) fn walk_records(
+    data: &[u8],
+    mut f: impl FnMut(u8, u64, &[u8]) -> Result<()>,
+) -> Result<Option<i32>> {
+    let mut tz_offset_secs = None;
+    let mut cur = data;
+    if cur.len() >= 12 && cur[..4] == *MAGIC {
+        let version = u16::from_be_bytes([cur[4], cur[5]]);
+        if version >= 2 {
+            tz_offset_secs = Some(i32::from_be_bytes([cur[8], cur[9], cur[10], cur[11]]));
+        }
+        cur = &cur[12..];
+    }
+    let mut last_ts = 0u64;
+    while !cur.is_empty() {
+        let delta = match slice_varint(&mut cur) {
+            Some(v) => v,
+            None => break,
+        };
+        if cur.is_empty() {
+            break;
+        }
+        let ty = cur[0];
+        cur = &cur[1..];
+        let Some(len) = slice_varint(&mut cur) else {
+            break;
+        };
+        let len = len as usize;
+        if len > MAX_RECORD_LEN || cur.len() < len {
+            // Truncated tail (kill mid-write) or hostile length: stop, keep
+            // whatever was already walked.
+            break;
+        }
+        let (payload, rest) = cur.split_at(len);
+        cur = rest;
+        let ts_us = last_ts.saturating_add(delta);
+        last_ts = ts_us;
+        f(ty, ts_us, payload)?;
+    }
+    Ok(tz_offset_secs)
+}
+
+fn slice_varint(rd: &mut &[u8]) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    for _ in 0..10 {
+        if rd.is_empty() {
+            return None;
+        }
+        let b = rd[0];
+        *rd = &rd[1..];
+        result |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
+}
+
+fn slice_str<'a>(rd: &mut &'a [u8]) -> Result<&'a str> {
+    let Some(len) = slice_varint(rd) else {
+        anyhow::bail!("truncated string length");
+    };
+    let len = len as usize;
+    if rd.len() < len {
+        anyhow::bail!("truncated string");
+    }
+    let (head, rest) = rd.split_at(len);
+    *rd = rest;
+    Ok(std::str::from_utf8(head).unwrap_or(""))
+}
+
+fn skip_opt_string(rd: &mut &[u8]) -> Result<()> {
+    let Some(len) = slice_varint(rd) else {
+        anyhow::bail!("truncated optional string");
+    };
+    if len == 0 {
+        return Ok(());
+    }
+    let n = (len as usize).saturating_sub(1);
+    if rd.len() < n {
+        anyhow::bail!("truncated optional string body");
+    }
+    *rd = &rd[n..];
+    Ok(())
+}
+
+fn skip_opt_tagged(rd: &mut &[u8], body: usize) -> Result<()> {
+    if rd.is_empty() {
+        anyhow::bail!("truncated optional flag");
+    }
+    let flag = rd[0];
+    *rd = &rd[1..];
+    if flag == 0 {
+        return Ok(());
+    }
+    if rd.len() < body {
+        anyhow::bail!("truncated optional body");
+    }
+    *rd = &rd[body..];
+    Ok(())
+}
+
+fn skip_opt_varint(rd: &mut &[u8]) -> Result<()> {
+    if rd.is_empty() {
+        anyhow::bail!("truncated optional varint flag");
+    }
+    let flag = rd[0];
+    *rd = &rd[1..];
+    if flag == 0 {
+        return Ok(());
+    }
+    if slice_varint(rd).is_none() {
+        anyhow::bail!("truncated optional varint");
+    }
+    Ok(())
+}
+
+fn need<'a>(rd: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    if rd.len() < n {
+        anyhow::bail!("truncated evlog field ({n} bytes)");
+    }
+    let (head, rest) = rd.split_at(n);
+    *rd = rest;
+    Ok(head)
+}
+
+fn slice_flow(rd: &mut &[u8]) -> Result<Flow5Tuple> {
+    let proto = if need(rd, 1)?[0] == 1 {
+        Proto::Tcp
+    } else {
+        Proto::Udp
+    };
+    let src = slice_sockaddr(rd)?;
+    let dst = slice_sockaddr(rd)?;
+    Ok(Flow5Tuple { proto, src, dst })
+}
+
+fn slice_sockaddr(rd: &mut &[u8]) -> Result<SocketAddr> {
+    let tag = need(rd, 1)?[0];
+    let ip = match tag {
+        4 => {
+            let b = need(rd, 4)?;
+            IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+        }
+        _ => {
+            let b = need(rd, 16)?;
+            let mut oct = [0u8; 16];
+            oct.copy_from_slice(b);
+            IpAddr::V6(Ipv6Addr::from(oct))
+        }
+    };
+    let p = need(rd, 2)?;
+    Ok(SocketAddr::new(ip, u16::from_be_bytes([p[0], p[1]])))
+}
+
+fn slice_opt_f64(rd: &mut &[u8]) -> Result<Option<f64>> {
+    let flag = need(rd, 1)?[0];
+    if flag == 0 {
+        return Ok(None);
+    }
+    Ok(Some(slice_f64(rd)?))
+}
+
+fn slice_f64(rd: &mut &[u8]) -> Result<f64> {
+    let b = need(rd, 8)?;
+    Ok(f64::from_be_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
+}
+
+fn slice_opt_u8(rd: &mut &[u8]) -> Result<Option<u8>> {
+    let flag = need(rd, 1)?[0];
+    if flag == 0 {
+        return Ok(None);
+    }
+    Ok(Some(need(rd, 1)?[0]))
+}
+
+fn slice_opt_u64(rd: &mut &[u8]) -> Result<Option<u64>> {
+    let flag = need(rd, 1)?[0];
+    if flag == 0 {
+        return Ok(None);
+    }
+    slice_u64_field(rd).map(Some)
+}
+
+fn slice_opt_owned_string(rd: &mut &[u8]) -> Result<Option<String>> {
+    let Some(len) = slice_varint(rd) else {
+        anyhow::bail!("truncated optional string");
+    };
+    if len == 0 {
+        return Ok(None);
+    }
+    let n = (len as usize).saturating_sub(1);
+    let head = need(rd, n)?;
+    Ok(Some(String::from_utf8_lossy(head).into_owned()))
+}
+
+fn slice_u64_field(rd: &mut &[u8]) -> Result<u64> {
+    slice_varint(rd).ok_or_else(|| anyhow::anyhow!("truncated varint"))
+}
+
+/// Fields `stats` needs from a StreamSnap payload, with `call_id` borrowed.
+pub(crate) struct StreamSnapLite<'a> {
+    pub call_id: &'a str,
+    pub ssrc: u32,
+    /// None for summaries that predate 5-tuple logging.
+    pub flow: Option<Flow5Tuple>,
+    pub packets: u64,
+    pub lost: u64,
+    pub bytes: u64,
+    pub jitter_ms: Option<f64>,
+    pub mos: Option<f64>,
+    pub rtt_avg_ms: Option<f64>,
+}
+
+pub(crate) fn parse_stream_snap_lite(mut rd: &[u8]) -> Result<StreamSnapLite<'_>> {
+    let call_id = slice_str(&mut rd)?;
+    let ssrc_b = need(&mut rd, 4)?;
+    let ssrc = u32::from_be_bytes([ssrc_b[0], ssrc_b[1], ssrc_b[2], ssrc_b[3]]);
+    let flow = slice_flow(&mut rd)?;
+    skip_opt_string(&mut rd)?; // codec
+    skip_opt_tagged(&mut rd, 1)?; // payload_type
+    let packets = slice_u64_field(&mut rd)?;
+    let lost = slice_u64_field(&mut rd)?;
+    let _expected = slice_u64_field(&mut rd)?;
+    let _loss_pct = need(&mut rd, 8)?;
+    let jitter_ms = slice_opt_f64(&mut rd)?;
+    let mos = slice_opt_f64(&mut rd)?;
+    skip_opt_string(&mut rd)?; // direction
+    if rd.is_empty() {
+        return Ok(StreamSnapLite {
+            call_id,
+            ssrc,
+            flow: Some(flow),
+            packets,
+            lost,
+            bytes: 0,
+            jitter_ms,
+            mos,
+            rtt_avg_ms: None,
+        });
+    }
+    let bytes = slice_u64_field(&mut rd)?;
+    skip_opt_varint(&mut rd)?; // first_ts_us
+    skip_opt_varint(&mut rd)?; // last_ts_us
+    skip_opt_tagged(&mut rd, 8)?; // rtt_min_ms
+    let rtt_avg_ms = slice_opt_f64(&mut rd)?;
+    Ok(StreamSnapLite {
+        call_id,
+        ssrc,
+        flow: Some(flow),
+        packets,
+        lost,
+        bytes,
+        jitter_ms,
+        mos,
+        rtt_avg_ms,
+    })
+}
+
+/// Full StreamSnap → `StreamSummary` for replay (one string alloc pass, no `Event`).
+pub(crate) fn parse_stream_summary(mut rd: &[u8]) -> Result<StreamSummary> {
+    let call_id = slice_str(&mut rd)?.to_owned();
+    let ssrc_b = need(&mut rd, 4)?;
+    let ssrc = u32::from_be_bytes([ssrc_b[0], ssrc_b[1], ssrc_b[2], ssrc_b[3]]);
+    let flow = slice_flow(&mut rd)?;
+    let codec = slice_opt_owned_string(&mut rd)?;
+    let payload_type = slice_opt_u8(&mut rd)?;
+    let packets = slice_u64_field(&mut rd)?;
+    let lost = slice_u64_field(&mut rd)?;
+    let expected = slice_u64_field(&mut rd)?;
+    let loss_pct = slice_f64(&mut rd)?;
+    let jitter_ms = slice_opt_f64(&mut rd)?;
+    let mos = slice_opt_f64(&mut rd)?;
+    let direction = slice_opt_owned_string(&mut rd)?;
+    let (
+        bytes,
+        first_ts_us,
+        last_ts_us,
+        rtt_min_ms,
+        rtt_avg_ms,
+        rtt_max_ms,
+        oneway_ms,
+        leg,
+        via_turn,
+    ) = if rd.is_empty() {
+        (0, None, None, None, None, None, None, None, false)
+    } else {
+        let bytes = slice_u64_field(&mut rd)?;
+        let first_ts_us = slice_opt_u64(&mut rd)?;
+        let last_ts_us = slice_opt_u64(&mut rd)?;
+        let rtt_min_ms = slice_opt_f64(&mut rd)?;
+        let rtt_avg_ms = slice_opt_f64(&mut rd)?;
+        let rtt_max_ms = slice_opt_f64(&mut rd)?;
+        let oneway_ms = slice_opt_f64(&mut rd)?;
+        let leg = if rd.is_empty() {
+            None
+        } else {
+            slice_opt_owned_string(&mut rd)?
+        };
+        let via_turn = if rd.is_empty() {
+            false
+        } else {
+            need(&mut rd, 1)?[0] != 0
+        };
+        (
+            bytes,
+            first_ts_us,
+            last_ts_us,
+            rtt_min_ms,
+            rtt_avg_ms,
+            rtt_max_ms,
+            oneway_ms,
+            leg,
+            via_turn,
+        )
+    };
+    Ok(StreamSummary {
+        call_id: Some(call_id),
+        ssrc,
+        flow: Some(flow),
+        codec,
+        payload_type,
+        packets,
+        lost,
+        expected,
+        loss_pct,
+        jitter_ms,
+        first_ts_us,
+        last_ts_us,
+        rtt_min_ms,
+        rtt_avg_ms,
+        rtt_max_ms,
+        oneway_ms,
+        mos,
+        direction,
+        leg,
+        via_turn,
+        bytes,
+        history: Vec::new(),
+    })
+}
+
+/// RTCP RTT sample only (skips call_id / ssrc).
+pub(crate) fn parse_rtcp_rtt_ms(mut rd: &[u8]) -> Result<f64> {
+    let _ = slice_str(&mut rd)?; // call_id
+    if rd.len() < 4 + 8 {
+        anyhow::bail!("truncated rtcp rtt");
+    }
+    rd = &rd[4..]; // ssrc
+    Ok(f64::from_be_bytes([
+        rd[0], rd[1], rd[2], rd[3], rd[4], rd[5], rd[6], rd[7],
+    ]))
+}
+
+/// Sequential read buffer: large enough to cut syscalls on GB-scale logs,
+/// small enough that `sipmon stats` cannot OOM from the file image itself.
+const EVLOG_READ_BUF: usize = 1024 * 1024;
+
 pub struct EvlogReader {
     r: BufReader<Box<dyn Read + Send>>,
     last_ts: u64,
+    /// Reused across records so `stats` does not allocate a payload `Vec` per event.
+    buf: Vec<u8>,
     /// UTC offset (seconds) of the machine that recorded the log. `None` for
     /// v1 files (offset was never stored) or unreadable headers.
     tz_offset_secs: Option<i32>,
@@ -906,8 +1277,9 @@ impl EvlogReader {
             Box::new(std::io::Cursor::new(head[..n].to_vec()).chain(r))
         };
         Ok(Self {
-            r: BufReader::new(inner),
+            r: BufReader::with_capacity(EVLOG_READ_BUF, inner),
             last_ts: 0,
+            buf: Vec::new(),
             tz_offset_secs,
         })
     }
@@ -917,7 +1289,9 @@ impl EvlogReader {
         self.tz_offset_secs
     }
 
-    pub fn next_event(&mut self) -> Result<Option<Event>> {
+    /// Next record as `(type, ts_us, payload)`, borrowing a reused buffer.
+    /// `None` at a clean EOF **or** a truncated last record (kill mid-write).
+    pub(crate) fn next_raw(&mut self) -> Result<Option<(u8, u64, &[u8])>> {
         let delta = match read_varint(&mut self.r) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -931,14 +1305,36 @@ impl EvlogReader {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         }
-        let len = read_varint(&mut self.r)? as usize;
+        let len = match read_varint(&mut self.r) {
+            Ok(v) => v as usize,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         if len > MAX_RECORD_LEN {
             anyhow::bail!("evlog record length {len} exceeds cap {MAX_RECORD_LEN} — corrupt file?");
         }
-        let mut payload = vec![0u8; len];
-        self.r.read_exact(&mut payload)?;
-        let ev = decode_payload(ty[0], ts_us, &payload)?;
-        Ok(Some(ev))
+        self.buf.resize(len, 0);
+        match self.r.read_exact(&mut self.buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        Ok(Some((ty[0], ts_us, &self.buf)))
+    }
+
+    pub fn next_event(&mut self) -> Result<Option<Event>> {
+        loop {
+            let Some((ty, ts_us, payload)) = self.next_raw()? else {
+                return Ok(None);
+            };
+            match decode_payload(ty, ts_us, payload) {
+                Ok(ev) => return Ok(Some(ev)),
+                // Framed record whose body does not decode (truncated fields,
+                // partial write). Skip and keep going so one bad record does
+                // not abort replay/query/stats.
+                Err(_) => continue,
+            }
+        }
     }
 }
 
@@ -998,5 +1394,131 @@ mod tests {
         assert_eq!(e1.ts_us(), 1_000_000);
         assert_eq!(e2.ts_us(), 1_500_000);
         assert!(r.next_event().unwrap().is_none());
+
+        let mut seen_rtt = false;
+        walk_records(&buf, |ty, _ts, payload| {
+            if ty == 5 {
+                assert!((parse_rtcp_rtt_ms(payload)? - 23.5).abs() < 1e-9);
+                seen_rtt = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(seen_rtt);
+    }
+
+    #[test]
+    fn stream_snap_lite_matches_full_decode() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w = EvlogWriter::new(&mut buf).unwrap();
+        w.write(&Event::StreamSnap(StreamSnapEvt {
+            ts_us: 2_000_000,
+            call_id: "cid-lite".into(),
+            ssrc: 0xabcdef,
+            flow: Flow5Tuple {
+                proto: Proto::Udp,
+                src: "10.0.0.1:4000".parse().unwrap(),
+                dst: "10.0.0.2:4000".parse().unwrap(),
+            },
+            codec: Some("PCMU".into()),
+            payload_type: Some(0),
+            packets: 1234,
+            lost: 5,
+            expected: 1239,
+            loss_pct: 0.4,
+            jitter_ms: Some(1.5),
+            mos: Some(4.2),
+            direction: Some("up".into()),
+            bytes: 99_000,
+            first_ts_us: Some(1_000_000),
+            last_ts_us: Some(2_000_000),
+            rtt_min_ms: Some(10.0),
+            rtt_avg_ms: Some(18.5),
+            rtt_max_ms: Some(30.0),
+            oneway_ms: Some(9.0),
+            leg: Some("leg-a".into()),
+            via_turn: true,
+        }))
+        .unwrap();
+        w.flush().unwrap();
+        drop(w);
+
+        let mut n = 0;
+        walk_records(&buf, |ty, ts, payload| {
+            if ty != 4 {
+                return Ok(());
+            }
+            n += 1;
+            let lite = parse_stream_snap_lite(payload)?;
+            match decode_payload(ty, ts, payload)? {
+                Event::StreamSnap(e) => {
+                    assert_eq!(lite.call_id, e.call_id);
+                    assert_eq!(lite.ssrc, e.ssrc);
+                    assert_eq!(lite.flow, Some(e.flow));
+                    assert_eq!(lite.packets, e.packets);
+                    assert_eq!(lite.lost, e.lost);
+                    assert_eq!(lite.bytes, e.bytes);
+                    assert_eq!(lite.jitter_ms, e.jitter_ms);
+                    assert_eq!(lite.mos, e.mos);
+                    assert_eq!(lite.rtt_avg_ms, e.rtt_avg_ms);
+                    let sum = parse_stream_summary(payload)?;
+                    assert_eq!(sum.call_id.as_deref(), Some(e.call_id.as_str()));
+                    assert_eq!(sum.ssrc, e.ssrc);
+                    assert_eq!(sum.flow, Some(e.flow));
+                    assert_eq!(sum.codec, e.codec);
+                    assert_eq!(sum.payload_type, e.payload_type);
+                    assert_eq!(sum.packets, e.packets);
+                    assert_eq!(sum.lost, e.lost);
+                    assert_eq!(sum.expected, e.expected);
+                    assert_eq!(sum.bytes, e.bytes);
+                    assert_eq!(sum.direction, e.direction);
+                    assert_eq!(sum.leg, e.leg);
+                    assert_eq!(sum.via_turn, e.via_turn);
+                    assert_eq!(sum.rtt_avg_ms, e.rtt_avg_ms);
+                }
+                other => panic!("expected StreamSnap, got {other:?}"),
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn truncated_tail_is_eof_not_error() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w = EvlogWriter::new(&mut buf).unwrap();
+        w.write(&Event::RtcpRtt(RtcpRttEvt {
+            ts_us: 1_000_000,
+            call_id: "abc@host".into(),
+            ssrc: 42,
+            rtt_ms: 23.5,
+            oneway_ms: None,
+        }))
+        .unwrap();
+        w.write(&Event::RtcpRtt(RtcpRttEvt {
+            ts_us: 2_000_000,
+            call_id: "abc@host".into(),
+            ssrc: 42,
+            rtt_ms: 24.0,
+            oneway_ms: None,
+        }))
+        .unwrap();
+        w.flush().unwrap();
+        drop(w);
+
+        let mut r = EvlogReader::new(std::io::Cursor::new(buf.clone())).unwrap();
+        assert!(r.next_event().unwrap().is_some());
+        assert!(r.next_event().unwrap().is_some());
+        assert!(r.next_event().unwrap().is_none());
+
+        let cut = buf.len().saturating_sub(9);
+        let mut r = EvlogReader::new(std::io::Cursor::new(buf[..cut].to_vec())).unwrap();
+        let first = r.next_event().unwrap();
+        assert!(first.is_some(), "first complete record must survive");
+        assert!(
+            r.next_event().unwrap().is_none(),
+            "truncated last record must be ignored, not Err"
+        );
     }
 }

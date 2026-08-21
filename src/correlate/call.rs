@@ -28,6 +28,8 @@ pub fn user_of(value: &str) -> Option<String> {
 pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
     call.pkts_sip += 1;
     call.bytes += msg.raw.len() as u64;
+    // Eviction key (bounded-memory): newest activity across SIP + RTP.
+    call.last_ts_us = msg.ts_us;
     // The message itself is stored by the caller (`ingest_sip`) via a move, so
     // the full-SipMsg clone that used to happen here is gone.
 
@@ -52,6 +54,9 @@ pub fn apply_sip(call: &mut Call, msg: &SipMsg) {
         }
         if call.invite_key.is_none() {
             call.invite_key = Some(msg.flow.src.ip().to_string());
+        }
+        if call.invite_src.is_none() {
+            call.invite_src = Some(msg.flow.src.to_string());
         }
         // Track the signaling endpoints for the per-IP active-call counter.
         if call.active_ips.is_empty() {

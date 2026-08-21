@@ -1,6 +1,7 @@
 target/
 *.log
 *.pcap
+*.evlog
 __pycache__/
 .opencode/
 

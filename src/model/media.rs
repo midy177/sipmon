@@ -20,6 +20,20 @@ pub struct NegotiatedMedia {
     pub pts: Vec<u8>,
     /// Codec names (parallel-ish to pts).
     pub codecs: Vec<String>,
+    /// RTP clock rates from `a=rtpmap`, parallel to `pts`.
+    pub clock_rates: Vec<u32>,
+}
+
+impl NegotiatedMedia {
+    /// SDP clock for `pt`, else the static/dynamic PT default.
+    pub fn clock_rate_for_pt(&self, pt: u8) -> u32 {
+        self.pts
+            .iter()
+            .position(|p| *p == pt)
+            .and_then(|i| self.clock_rates.get(i).copied())
+            .filter(|&r| r > 0)
+            .unwrap_or_else(|| crate::decode::rtp::rtp_clock_rate_for_payload_type(pt))
+    }
 }
 
 /// One periodic (5s) throughput/quality sample for a stream.
