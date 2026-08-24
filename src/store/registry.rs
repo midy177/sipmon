@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -169,15 +170,18 @@ pub struct Snapshot {
     pub asr: f64,
     pub calls: Vec<CallSummary>,
     pub streams: Vec<StreamSummary>,
-    pub events: VecDeque<String>,
+    /// Heavy snapshot payloads are Arc-shared: the publisher rebuilds them
+    /// only when the underlying store changed, and every reader clones a
+    /// refcount instead of the data.
+    pub events: Arc<VecDeque<String>>,
     /// Diagnostics for the focused call (filtered by the UI).
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Arc<Vec<Diagnostic>>,
     /// Per-IP network stats (IP page).
-    pub ip_stats: Vec<IpStats>,
+    pub ip_stats: Arc<Vec<IpStats>>,
     /// Per-IP SIP signaling stats (SIP Stats page): global ALL row first.
     pub sip_stats: Vec<crate::store::sipstats::SipIpRow>,
     /// Heatmap cells: (bucket_us, key, metrics).
-    pub buckets: Vec<(u64, String, crate::model::stats::MetricSet)>,
+    pub buckets: Arc<Vec<(u64, String, crate::model::stats::MetricSet)>>,
     /// Focused call detail (set by the UI via Correlator focus hint).
     pub focus: Option<Focus>,
     #[allow(dead_code)]
@@ -191,8 +195,6 @@ pub struct Registry {
     /// Insertion order for stable recent-first listing.
     pub order: Vec<String>,
     pub streams: FxHashMap<StreamKey, crate::correlate::stream::RtpStream>,
-    /// call_id per stream (reverse lookup).
-    pub stream_call: FxHashMap<StreamKey, String>,
     /// SDP-advertised media endpoint -> call_id (for RTP association). Looked
     /// up only on the new-stream slow path (`observe_existing_rtp` handles
     /// known streams without it), so a plain String value is fine.
@@ -253,6 +255,18 @@ pub struct Registry {
     pub max_calls: usize,
     pub max_streams: usize,
     pub max_diagnostics: usize,
+    /// Build-side snapshot caches: heavy Vec clones are rebuilt only when the
+    /// underlying store changed since the last publish (version counters are
+    /// bumped at the single choke points that mutate each store).
+    events_ver: u64,
+    events_cache: Option<(u64, Arc<VecDeque<String>>)>,
+    diag_ver: u64,
+    diag_cache: Option<(u64, Arc<Vec<Diagnostic>>)>,
+    heat_ver: u64,
+    buckets_cache: Option<(u64, Arc<Vec<(u64, String, crate::model::stats::MetricSet)>>)>,
+    /// Per-IP stats change continuously; this cache refreshes at 1s capture
+    /// granularity (the finest resolution the UI displays anyway).
+    ip_stats_cache: Option<(u64, Arc<Vec<IpStats>>)>,
 }
 
 /// Upper bound on search-pinned call-ids (protection + snapshot injection).
@@ -264,7 +278,6 @@ impl Default for Registry {
             calls: FxHashMap::default(),
             order: Vec::new(),
             streams: FxHashMap::default(),
-            stream_call: FxHashMap::default(),
             endpoint_call: FxHashMap::default(),
             events: VecDeque::with_capacity(512),
             source: String::new(),
@@ -294,6 +307,13 @@ impl Default for Registry {
             max_calls: 100_000,
             max_streams: 50_000,
             max_diagnostics: 50_000,
+            events_ver: 0,
+            events_cache: None,
+            diag_ver: 0,
+            diag_cache: None,
+            heat_ver: 0,
+            buckets_cache: None,
+            ip_stats_cache: None,
         }
     }
 }
@@ -330,7 +350,6 @@ impl Registry {
         self.calls.clear();
         self.order.clear();
         self.streams.clear();
-        self.stream_call.clear();
         self.endpoint_call.clear();
         self.stream_index.clear();
         self.ssrc_index.clear();
@@ -351,6 +370,14 @@ impl Registry {
         self.failed = 0;
         self.focus_hint = None;
         self.search_matches.clear();
+        // Drop (and logically invalidate) the snapshot caches.
+        self.events_ver += 1;
+        self.diag_ver += 1;
+        self.heat_ver += 1;
+        self.events_cache = None;
+        self.diag_cache = None;
+        self.buckets_cache = None;
+        self.ip_stats_cache = None;
     }
 
     /// Update the search hint (from the TUI). Recomputes the pinned match list
@@ -412,9 +439,12 @@ impl Registry {
         self.ssrc_index.entry(key.ssrc).or_default().push(key);
     }
 
-    /// Remove a stream key from the per-call index (and reverse maps).
+    /// Remove a stream key from the per-call / SSRC indexes. Must be called
+    /// while the stream is still in `streams` (the owning call-id is read
+    /// from the stream itself — no parallel reverse map to consult).
     fn forget_stream(&mut self, key: &StreamKey) {
-        if let Some(cid) = self.stream_call.remove(key)
+        let cid = self.streams.get(key).map(|s| s.call_id.clone());
+        if let Some(cid) = cid
             && let Some(v) = self.stream_index.get_mut(&cid)
         {
             v.retain(|k| k != key);
@@ -455,36 +485,34 @@ impl Registry {
     /// evicting the oldest active call only if all are still active.
     /// Focus- and search-pinned calls are never evicted here.
     pub fn evict_if_needed(&mut self) {
-        while self.calls.len() > self.max_calls {
+        if self.calls.len() > self.max_calls {
+            // Pinned calls stay pinned regardless of what else is removed, so
+            // the set is built once for the whole batch.
             let pinned = self.pinned_set();
-            // Find oldest terminated call by invite_ts.
-            let target = self
-                .order
+            let excess = self.calls.len() - self.max_calls;
+            // One pass + sort replaces the former per-eviction full scan
+            // (O(k·N) at the cap). Rank: terminated calls evict first, then
+            // oldest invite_ts (None sorts last, matching min_by_key's MAX).
+            let mut evictable: Vec<(u8, u64, String)> = self
+                .calls
                 .iter()
-                .filter_map(|id| self.calls.get(id).map(|c| (id.as_str(), c)))
-                .filter(|(id, _)| !pinned.contains(id))
-                .filter(|(_, c)| {
-                    matches!(
+                .filter(|(id, _)| !pinned.contains(id.as_str()))
+                .map(|(id, c)| {
+                    let terminated = matches!(
                         c.state,
                         CallState::Completed | CallState::Failed | CallState::Canceled
-                    )
+                    );
+                    (terminated as u8, c.invite_ts.unwrap_or(u64::MAX), id.clone())
                 })
-                .min_by_key(|(_, c)| c.invite_ts.unwrap_or(u64::MAX))
-                .map(|(id, _)| id.to_string());
-
-            let cid = target.or_else(|| {
-                // All evictable calls are active; evict oldest by invite_ts.
-                self.order
-                    .iter()
-                    .filter_map(|id| self.calls.get(id).map(|c| (id.as_str(), c)))
-                    .filter(|(id, _)| !pinned.contains(id))
-                    .min_by_key(|(_, c)| c.invite_ts.unwrap_or(u64::MAX))
-                    .map(|(id, _)| id.to_string())
-            });
-
-            // Nothing evictable (all remaining calls are pinned): keep them.
-            let Some(cid) = cid else { break };
-            self.remove_call(&cid);
+                .collect();
+            evictable.sort_unstable();
+            let ids: Vec<String> = evictable
+                .into_iter()
+                .take(excess)
+                .map(|(_, _, id)| id)
+                .collect();
+            // Nothing evictable (all excess calls are pinned): keeps them.
+            self.remove_calls(&ids);
         }
 
         // Stream eviction.
@@ -501,8 +529,8 @@ impl Registry {
                 .map(|(k, _)| k)
                 .collect();
             for k in to_remove {
-                self.streams.remove(&k);
                 self.forget_stream(&k);
+                self.streams.remove(&k);
             }
         }
     }
@@ -542,6 +570,43 @@ impl Registry {
         self.remove_calls(&[call_id.to_string()]);
     }
 
+    /// Fold one stream's un-attributed packet/byte/loss delta into the
+    /// per-IP stats (TX at the source, RX at the destination, 1s buckets
+    /// timestamped at the stream's last packet). Used by the correlator's 1s
+    /// attribution ticker and by stream removal, so an evicted stream never
+    /// silently drops its tail.
+    pub(crate) fn flush_stream_ipattr(&mut self, key: &StreamKey) {
+        let Some((src_ip, dst_ip, ts, pkts_d, bytes_d, lost_d)) =
+            self.streams.get_mut(key).map(|s| {
+                let st = s.snapshot_stats();
+                let d = (
+                    s.flow.src.ip(),
+                    s.flow.dst.ip(),
+                    s.last_ts_us.unwrap_or(0),
+                    st.packet_count.saturating_sub(s.ipattr_pkts),
+                    s.bytes.saturating_sub(s.ipattr_bytes),
+                    st.lost_packets.saturating_sub(s.ipattr_lost),
+                );
+                s.ipattr_pkts = st.packet_count;
+                s.ipattr_bytes = s.bytes;
+                s.ipattr_lost = st.lost_packets;
+                d
+            })
+        else {
+            return;
+        };
+        if pkts_d > 0 || bytes_d > 0 {
+            self.ipstats
+                .observe_packets(src_ip, ts, pkts_d, bytes_d, Dir::Tx);
+            self.ipstats
+                .observe_packets(dst_ip, ts, pkts_d, bytes_d, Dir::Rx);
+        }
+        if lost_d > 0 {
+            self.ipstats.observe_lost(src_ip, ts, lost_d, Dir::Tx);
+            self.ipstats.observe_lost(dst_ip, ts, lost_d, Dir::Rx);
+        }
+    }
+
     fn remove_calls(&mut self, ids: &[String]) {
         if ids.is_empty() {
             return;
@@ -552,14 +617,10 @@ impl Registry {
             self.removed.push_back(id.clone());
             let stream_keys: Vec<StreamKey> = self.stream_index.remove(id).unwrap_or_default();
             for k in stream_keys {
+                // Fold the stream's tail into per-IP stats before it goes.
+                self.flush_stream_ipattr(&k);
+                self.forget_stream(&k);
                 self.streams.remove(&k);
-                self.stream_call.remove(&k);
-                if let Some(v) = self.ssrc_index.get_mut(&k.ssrc) {
-                    v.retain(|k2| k2 != &k);
-                    if v.is_empty() {
-                        self.ssrc_index.remove(&k.ssrc);
-                    }
-                }
             }
         }
         self.order.retain(|id| !drop.contains(id));
@@ -609,6 +670,39 @@ impl Registry {
         while self.events.len() > 1000 {
             self.events.pop_front();
         }
+        self.events_ver += 1;
+    }
+
+    /// Append to the diagnostic ring. Single choke point so the snapshot
+    /// cache version is always bumped (bypassing it would serve stale
+    /// diagnostics to the UI).
+    pub fn push_diagnostic(&mut self, d: Diagnostic) {
+        self.diagnostics.push_back(d);
+        while self.diagnostics.len() > self.max_diagnostics {
+            self.diagnostics.pop_front();
+        }
+        self.diag_ver += 1;
+    }
+
+    /// Record a terminated call's heatmap cell. Single choke point for the
+    /// same reason as [`Self::push_diagnostic`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_heatmap_cell(
+        &mut self,
+        ts_us: u64,
+        key: String,
+        answered: bool,
+        failed: bool,
+        pdd_ms: Option<f64>,
+        jitter_ms: Option<f64>,
+        loss_pct: Option<f64>,
+        rtt_ms: Option<f64>,
+        mos: Option<f64>,
+    ) {
+        self.heatmap.record_call(
+            ts_us, key, answered, failed, pdd_ms, jitter_ms, loss_pct, rtt_ms, mos,
+        );
+        self.heat_ver += 1;
     }
 
     /// Register a stream summary reconstructed from an evlog record (replay
@@ -677,31 +771,108 @@ impl Registry {
 
     /// Build a UI snapshot: recent calls capped to `limit`, streams capped to
     /// 1000 (display only; exports use `snapshot_full`).
-    pub fn snapshot(&self, limit: usize) -> Snapshot {
+    pub fn snapshot(&mut self, limit: usize) -> Snapshot {
         self.snapshot_with(limit, 1000)
     }
 
     /// Full-fidelity snapshot for exports / end-of-run output.
-    pub fn snapshot_full(&self) -> Snapshot {
-        self.snapshot_with(usize::MAX, usize::MAX)
+    pub fn snapshot_full(&mut self) -> Snapshot {
+        let mut snap = self.snapshot_with(usize::MAX, usize::MAX);
+        // Exports must include the last partial second: bypass the
+        // 1s-granularity ip-stats cache and rebuild against the store.
+        snap.ip_stats = Arc::new(self.ipstats.snapshot());
+        snap
     }
 
-    pub fn snapshot_with(&self, limit: usize, stream_limit: usize) -> Snapshot {
-        // Summarize each stream exactly once and reuse everywhere: the
-        // aggregate averages (over ALL streams), the bounded `streams`
-        // snapshot Vec, and the per-call aggregates below (which used to
-        // re-run the full summary() per stream per call just to read .mos).
-        let stream_summaries: Vec<_> = self.streams.values().map(|s| s.summary()).collect();
-        // Per-call live-stream aggregates from that single pass: min MOS +
-        // stream count, keyed by borrowed call-id (no String clones).
+    /// Cached `events` clone — rebuilt only when the ring changed.
+    fn events_snapshot(&mut self) -> Arc<VecDeque<String>> {
+        let ver = self.events_ver;
+        if let Some((v, arc)) = &self.events_cache
+            && *v == ver
+        {
+            return Arc::clone(arc);
+        }
+        let arc = Arc::new(self.events.clone());
+        self.events_cache = Some((ver, Arc::clone(&arc)));
+        arc
+    }
+
+    /// Cached `diagnostics` clone — rebuilt only when the ring changed.
+    fn diag_snapshot(&mut self) -> Arc<Vec<Diagnostic>> {
+        let ver = self.diag_ver;
+        if let Some((v, arc)) = &self.diag_cache
+            && *v == ver
+        {
+            return Arc::clone(arc);
+        }
+        let arc = Arc::new(self.diagnostics.iter().cloned().collect());
+        self.diag_cache = Some((ver, Arc::clone(&arc)));
+        arc
+    }
+
+    /// Cached `buckets` clone — rebuilt only when a heatmap cell was recorded.
+    fn buckets_snapshot(&mut self) -> Arc<Vec<(u64, String, crate::model::stats::MetricSet)>> {
+        let ver = self.heat_ver;
+        if let Some((v, arc)) = &self.buckets_cache
+            && *v == ver
+        {
+            return Arc::clone(arc);
+        }
+        let arc = Arc::new(self.heatmap.flat());
+        self.buckets_cache = Some((ver, Arc::clone(&arc)));
+        arc
+    }
+
+    /// Cached per-IP stats, refreshed at 1s capture granularity (the finest
+    /// resolution the UI windows display anyway).
+    fn ip_stats_snapshot(&mut self) -> Arc<Vec<IpStats>> {
+        let bucket = self.last_us.unwrap_or(0) / 1_000_000;
+        if let Some((b, arc)) = &self.ip_stats_cache
+            && *b == bucket
+        {
+            return Arc::clone(arc);
+        }
+        let arc = Arc::new(self.ipstats.snapshot());
+        self.ip_stats_cache = Some((bucket, Arc::clone(&arc)));
+        arc
+    }
+
+    pub fn snapshot_with(&mut self, limit: usize, stream_limit: usize) -> Snapshot {
+        // One light pass over ALL streams feeds the aggregate averages and
+        // the per-call (min MOS, stream count) rollups: `stats_light` computes
+        // the same numbers as `summary()` without building a StreamSummary
+        // (no String or history clones). Full summaries are constructed only
+        // for the bounded display subset in the `streams` field below.
+        let mut jit = 0.0;
+        let mut jit_n = 0u64;
+        let mut loss = 0.0;
+        let mut loss_n = 0u64;
+        let mut mos = 0.0;
+        let mut mos_n = 0u64;
+        let mut rtt = 0.0;
+        let mut rtt_n = 0u64;
+        // Per-call live-stream rollup keyed by borrowed call-id (no clones).
         let mut live_by_call: FxHashMap<&str, (Option<f64>, usize)> = FxHashMap::default();
-        for st in &stream_summaries {
-            if let Some(cid) = st.call_id.as_deref() {
-                let e = live_by_call.entry(cid).or_insert((None, 0));
-                e.1 += 1;
-                if let Some(m) = st.mos {
-                    e.0 = Some(e.0.map_or(m, |a: f64| a.min(m)));
-                }
+        for s in self.streams.values() {
+            let (cid, j, l, m, r) = s.stats_light();
+            let e = live_by_call.entry(cid).or_insert((None, 0));
+            e.1 += 1;
+            if let Some(m) = m {
+                e.0 = Some(e.0.map_or(m, |a: f64| a.min(m)));
+            }
+            if let Some(j) = j {
+                jit += j;
+                jit_n += 1;
+            }
+            loss += l;
+            loss_n += 1;
+            if let Some(m) = m {
+                mos += m;
+                mos_n += 1;
+            }
+            if let Some(r) = r {
+                rtt += r;
+                rtt_n += 1;
             }
         }
         // Imported (replay/jsonl) summaries grouped once per publish instead
@@ -774,31 +945,8 @@ impl Registry {
                 setup_n += 1;
             }
         }
-        let mut jit = 0.0;
-        let mut jit_n = 0u64;
-        let mut loss = 0.0;
-        let mut loss_n = 0u64;
-        let mut mos = 0.0;
-        let mut mos_n = 0u64;
-        let mut rtt = 0.0;
-        let mut rtt_n = 0u64;
-        // Summarize each stream exactly once (above); fold the aggregates.
-        for st in &stream_summaries {
-            if let Some(j) = st.jitter_ms {
-                jit += j;
-                jit_n += 1;
-            }
-            loss += st.loss_pct;
-            loss_n += 1;
-            if let Some(m) = st.mos {
-                mos += m;
-                mos_n += 1;
-            }
-            if let Some(r) = st.rtt_avg_ms {
-                rtt += r;
-                rtt_n += 1;
-            }
-        }
+        // Imported (replay/jsonl) summaries fold into the same aggregates
+        // computed by the live-stream light pass above.
         for s in self.imported_streams.values() {
             if let Some(j) = s.jitter_ms {
                 jit += j;
@@ -850,19 +998,23 @@ impl Registry {
             asr,
             calls: summaries,
             streams: {
-                let mut s: Vec<_> = stream_summaries
-                    .into_iter()
+                // Full summaries only for the bounded display subset (the
+                // aggregates above already ran through the light pass).
+                let mut s: Vec<_> = self
+                    .streams
+                    .values()
                     .take(stream_limit)
+                    .map(|s| s.summary())
                     .collect();
                 let remaining = stream_limit.saturating_sub(s.len());
                 s.extend(self.imported_streams.values().take(remaining).cloned());
                 s
             },
-            events: self.events.clone(),
-            diagnostics: self.diagnostics.iter().cloned().collect(),
-            ip_stats: self.ipstats.snapshot(),
+            events: self.events_snapshot(),
+            diagnostics: self.diag_snapshot(),
+            ip_stats: self.ip_stats_snapshot(),
             sip_stats: self.sipstats.snapshot(),
-            buckets: self.heatmap.flat(),
+            buckets: self.buckets_snapshot(),
             focus: self.focus_hint.as_ref().and_then(|h| self.focus_detail(h)),
             paused: false,
         }
@@ -1405,4 +1557,64 @@ mod tests {
         assert_eq!(snap.ip_stats.len(), 2);
         assert!(snap.calls.is_empty()); // snaps don't create calls
     }
+    /// Perf probe (ignored by default): periodic-snapshot build cost at a
+    /// production-like stream count. Run with:
+    ///   cargo test --release --bin sipmon snapshot_build_perf -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn snapshot_build_perf() {
+        use crate::correlate::stream::RtpStream;
+        use crate::model::media::RatePoint;
+
+        let mut reg = Registry::with_source("perf".into());
+        const CALLS: usize = 10_000;
+        const PER_CALL: usize = 2;
+        for c in 0..CALLS {
+            reg.get_or_create_call(&format!("call-{c}@perf"));
+        }
+        let mut n = 0usize;
+        for c in 0..CALLS {
+            for d in 0..PER_CALL {
+                let flow = crate::model::packet::Flow5Tuple {
+                    proto: crate::model::packet::Proto::Udp,
+                    src: format!("10.{}.{}.{}:16000", c % 250, (c / 250) % 250, 1 + d)
+                        .parse()
+                        .unwrap(),
+                    dst: format!("192.168.{}.{}:16000", (c / 8) % 250, 1 + d)
+                        .parse()
+                        .unwrap(),
+                };
+                let mut s = RtpStream::new(
+                    flow,
+                    0x1000 + c as u32 * 4 + d as u32,
+                    format!("call-{c}@perf"),
+                );
+                // Full 10-minute sparkline history: the heavy part of a
+                // per-publish full-summary build.
+                for i in 0..120u32 {
+                    s.history.push_back(RatePoint {
+                        ts_us: i as u64 * 5_000_000,
+                        bytes: 8000,
+                        packets: 50,
+                        loss_pct: 1.0,
+                        jitter_ms: Some(5.0),
+                        mos: Some(4.2),
+                    });
+                }
+                let key = StreamKey { flow, ssrc: s.ssrc };
+                reg.streams.insert(key, s);
+                reg.note_stream(&format!("call-{c}@perf"), key);
+                n += 1;
+            }
+        }
+        let _ = reg.snapshot(500); // warm
+        const REPS: usize = 10;
+        let t = std::time::Instant::now();
+        for _ in 0..REPS {
+            std::hint::black_box(reg.snapshot(500));
+        }
+        let per = t.elapsed() / REPS as u32;
+        println!("snapshot(500) with {n} streams x120 history: {per:?}/publish");
+    }
+
 }

@@ -354,17 +354,19 @@ mod tests {
         assert_eq!(terminal_done, 0);
     }
 
-    /// last_lost must not outlive the streams it tracks.
+    /// Stream removal (teardown/eviction) must not drop the stream's
+    /// un-attributed per-IP tail: the packet/byte/loss deltas accumulated
+    /// since the last 1s ticker are folded in by `remove_calls`.
     #[test]
-    fn last_lost_pruned_after_stream_evict() {
+    fn ipattr_tail_not_lost_on_stream_removal() {
         use crate::correlate::turn::Encap;
         use crate::decode::rtp::RtpHeader;
         let cfg = Config {
             keep_terminated: false,
             ..Config::default()
         };
-        let mut corr = Correlator::new(&cfg, "lostmap".into());
-        let id = "lost-prune";
+        let mut corr = Correlator::new(&cfg, "ipattr".into());
+        let id = "ipattr-prune";
         corr.ingest_sip(sdp_msg(
             1_000_000,
             id,
@@ -391,13 +393,20 @@ mod tests {
         };
         corr.ingest_rtp(2_000_000, flow, hdr, 172, Encap::Direct);
         corr.maybe_periodic_flush(2_000_000);
-        corr.maybe_periodic_flush(8_000_000);
-        assert!(corr.test_last_lost_len() > 0);
-        corr.ingest_sip(sip(9_000_000, id, Method::Bye, true));
-        corr.ingest_sip(sip_resp(9_100_000, id, 200, "BYE"));
+        // No 1s ticker has attributed these packets yet (ts jumped 0 -> 2s,
+        // first tick only arms the clock) — teardown must still count them.
+        corr.ingest_sip(sip(3_000_000, id, Method::Bye, true));
+        corr.ingest_sip(sip_resp(3_100_000, id, 200, "BYE"));
         corr.maybe_periodic_flush(15_000_000);
-        assert_eq!(corr.test_last_lost_len(), 0);
         assert!(corr.reg.streams.is_empty());
+        let ip: std::net::IpAddr = "10.10.0.1".parse().unwrap();
+        let row = corr.reg.ipstats.snapshot();
+        let src_row = row.iter().find(|s| s.ip == ip).expect("src IP row");
+        assert_eq!(src_row.pkts_total(crate::store::ipstats::Dir::Tx), 1);
+        assert_eq!(src_row.bytes_total(crate::store::ipstats::Dir::Tx), 172);
+        let dst: std::net::IpAddr = "10.20.0.1".parse().unwrap();
+        let dst_row = row.iter().find(|s| s.ip == dst).expect("dst IP row");
+        assert_eq!(dst_row.pkts_total(crate::store::ipstats::Dir::Rx), 1);
     }
 
     /// A single pathological call (thousands of messages) must not grow the
@@ -586,7 +595,11 @@ mod tests {
                 Encap::Direct,
             );
         }
-        // Both endpoint IPs tracked with the right packet/byte counts.
+        // Both endpoint IPs tracked with the right packet/byte counts. Per-IP
+        // attribution now runs on the 1s ticker (stream-delta based), not per
+        // packet: arm it, then advance past one second.
+        corr.maybe_periodic_flush(1_100_000);
+        corr.maybe_periodic_flush(2_100_000);
         let stats = corr.reg.ipstats.snapshot();
         assert_eq!(stats.len(), 2, "both endpoints tracked");
         let a = stats

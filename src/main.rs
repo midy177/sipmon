@@ -870,16 +870,13 @@ fn replay_apply(corr: &mut Correlator, ty: u8, ts: u64, payload: &[u8]) {
                         Severity::Info => {}
                     }
                 }
-                corr.reg.diagnostics.push_back(diagnostics::Diagnostic {
+                corr.reg.push_diagnostic(diagnostics::Diagnostic {
                     ts_us: e.ts_us,
                     call_id: e.call_id.clone(),
                     severity,
                     code: diagnostics::code_from_str(&e.code),
                     message: e.message.clone(),
                 });
-                while corr.reg.diagnostics.len() > corr.reg.max_diagnostics {
-                    corr.reg.diagnostics.pop_front();
-                }
             }
         }
         _ => {}
@@ -1272,8 +1269,10 @@ fn run_export(
 
     let mut snap = corr.reg.snapshot_full();
     snap.streams.extend(streams_extra);
-    snap.diagnostics.extend(diags_extra);
-    snap.buckets.extend(buckets_extra);
+    // `make_mut` clones once only if the Arc is still shared with the
+    // registry's publish cache — a single EOF-time copy for exports.
+    Arc::make_mut(&mut snap.diagnostics).extend(diags_extra);
+    Arc::make_mut(&mut snap.buckets).extend(buckets_extra);
 
     if let Some(p) = jsonl.as_ref() {
         export::jsonl::export_snapshot(p, &snap)?;

@@ -36,14 +36,18 @@ impl CaptureSource for FileSource {
     }
 
     fn next_frame(&mut self, f: &mut dyn FnMut(u64, u32, &[u8])) -> bool {
-        loop {
-            if self
-                .stop
-                .as_ref()
-                .is_some_and(|s| s.load(Ordering::Relaxed))
-            {
-                return false;
-            }
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::Relaxed))
+        {
+            return false;
+        }
+        // Offline reads are pure memory: a larger batch than `live` amortizes
+        // the per-iteration pipeline overhead across more frames.
+        const BATCH: usize = 256;
+        let mut delivered = 0usize;
+        while delivered < BATCH {
             match self.cap.next_packet() {
                 Ok(pkt) => {
                     let ts_us = pcap_ts_us(pkt.header);
@@ -82,9 +86,9 @@ impl CaptureSource for FileSource {
                     }
 
                     f(ts_us, self.linktype, pkt.data);
-                    return true;
+                    delivered += 1;
                 }
-                Err(pcap::Error::NoMorePackets) => return false,
+                Err(pcap::Error::NoMorePackets) => return delivered > 0,
                 Err(pcap::Error::TimeoutExpired) => continue,
                 Err(e) => {
                     tracing::warn!(error = %e, "file capture error, stopping");
@@ -92,5 +96,6 @@ impl CaptureSource for FileSource {
                 }
             }
         }
+        true
     }
 }

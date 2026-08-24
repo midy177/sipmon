@@ -19,9 +19,8 @@ pub struct Correlator {
     tcp_reasm: crate::decode::tcp_reasm::TcpReassembler,
     invite_rr: HashMap<String, bool>,
     terminal_done: std::collections::HashSet<String>,
-    /// Per-stream last-known lost count, for attributing loss deltas to the
-    /// per-IP network stats during the periodic flush.
-    last_lost: HashMap<StreamKey, u64>,
+    /// Last capture time (us) the 1s per-IP attribution ticker ran.
+    last_ipattr_us: Option<u64>,
     min_severity: Severity,
     raw_truncate: Option<usize>,
     no_media: bool,
@@ -58,7 +57,7 @@ impl Correlator {
             tcp_reasm: crate::decode::tcp_reasm::TcpReassembler::new(),
             invite_rr: HashMap::new(),
             terminal_done: std::collections::HashSet::new(),
-            last_lost: HashMap::new(),
+            last_ipattr_us: None,
             min_severity: Severity::from_level(&config.diag_level),
             raw_truncate: config.raw_truncate,
             no_media: config.no_media,
@@ -85,11 +84,11 @@ impl Correlator {
     /// bookkeeping. Evlog writing is unaffected.
     pub fn clear(&mut self) {
         self.reg.clear();
-        self.last_lost.clear();
         self.invite_rr.clear();
         self.terminal_done.clear();
         self.pending_events.clear();
         self.last_flush_us = None;
+        self.last_ipattr_us = None;
         self.turn.clear();
         if self.session_stats.is_some() {
             self.session_stats = Some(crate::store::evstats::StatsAcc::new());
@@ -148,8 +147,24 @@ impl Correlator {
         }
     }
 
-    /// Every ~5s of capture time: emit StreamSnap events for active streams.
+    /// Every ~1s of capture time: attribute per-IP packet/byte/loss deltas.
+    /// Every ~5s: emit StreamSnap events + bounded-memory maintenance.
     pub fn maybe_periodic_flush(&mut self, ts_us: u64) {
+        // 1s ticker: fold each stream's accumulated packet/byte/loss deltas
+        // into the per-IP stats. This is what lets the RTP hot path skip its
+        // two per-packet `ipstats` lookups entirely.
+        let ipattr_due = match self.last_ipattr_us {
+            None => {
+                self.last_ipattr_us = Some(ts_us);
+                false
+            }
+            Some(last) => ts_us.saturating_sub(last) >= 1_000_000,
+        };
+        if ipattr_due {
+            self.last_ipattr_us = Some(ts_us);
+            self.attribute_ip_stats();
+        }
+
         let due = match self.last_flush_us {
             None => {
                 self.last_flush_us = Some(ts_us);
@@ -170,38 +185,13 @@ impl Correlator {
         let emit_snap = self.emit_evlog || self.session_stats.is_some();
         let keys: Vec<StreamKey> = self.reg.streams.keys().copied().collect();
         for key in keys {
-            let Some((flow, lost_now, evt)) = self.reg.streams.get_mut(&key).map(|s| {
+            let evt = self.reg.streams.get_mut(&key).map(|s| {
                 if keep_history {
                     s.sample(ts_us);
                 }
-                let lost_now = s.snapshot_stats().lost_packets;
-                let evt = emit_snap.then(|| s.to_snap_evt(ts_us));
-                (s.flow, lost_now, evt)
-            }) else {
-                continue;
-            };
-            // Attribute the newly-observed lost packets to both endpoints of
-            // the stream in the per-IP network stats (1s bucket resolution).
-            // From each IP's viewpoint: lost egress packets at the source,
-            // lost ingress packets at the destination.
-            let lost_delta =
-                lost_now.saturating_sub(self.last_lost.get(&key).copied().unwrap_or(0));
-            self.last_lost.insert(key, lost_now);
-            if lost_delta > 0 {
-                self.reg.ipstats.observe_lost(
-                    flow.src.ip(),
-                    ts_us,
-                    lost_delta,
-                    crate::store::ipstats::Dir::Tx,
-                );
-                self.reg.ipstats.observe_lost(
-                    flow.dst.ip(),
-                    ts_us,
-                    lost_delta,
-                    crate::store::ipstats::Dir::Rx,
-                );
-            }
-            if let Some(evt) = evt {
+                emit_snap.then(|| s.to_snap_evt(ts_us))
+            });
+            if let Some(Some(evt)) = evt {
                 self.push_ev(crate::store::evlog::Event::StreamSnap(evt));
             }
         }
@@ -212,8 +202,6 @@ impl Correlator {
         }
         self.reg.evict_stale(self.call_ttl_secs, ts_us);
         self.reg.evict_if_needed();
-        self.last_lost
-            .retain(|k, _| self.reg.streams.contains_key(k));
         self.prune_removed_bookkeeping();
         // Drop IPs idle for more than an hour (1s buckets only retain 10 min).
         const IPSTATS_IDLE_US: u64 = 3_600_000_000;
@@ -232,15 +220,25 @@ impl Correlator {
         }
     }
 
+    /// Attribute each stream's packet/byte/loss delta since the last call to
+    /// the per-IP stats: TX at the stream source, RX at the destination, in
+    /// 1s buckets timestamped at the stream's last packet. (The stream's own
+    /// accumulators are the source of truth; per-IP state is derived.)
+    /// 1s per-IP attribution ticker body: fold every stream's accumulated
+    /// delta into the per-IP stats. (Removal paths finalize a stream through
+    /// `Registry::remove_calls` -> `flush_stream_ipattr`, so eviction cannot
+    /// drop a tail either.)
+    fn attribute_ip_stats(&mut self) {
+        let keys: Vec<StreamKey> = self.reg.streams.keys().copied().collect();
+        for key in keys {
+            self.reg.flush_stream_ipattr(&key);
+        }
+    }
+
     /// (cfg-test) sizes of per-call bookkeeping maps, for bounded-memory tests.
     #[cfg(test)]
     pub(crate) fn test_bookkeeping_lens(&self) -> (usize, usize) {
         (self.invite_rr.len(), self.terminal_done.len())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_last_lost_len(&self) -> usize {
-        self.last_lost.len()
     }
 
     /// Process one raw frame end-to-end.
@@ -587,13 +585,6 @@ impl Correlator {
             );
         }
 
-        self.reg
-            .ipstats
-            .observe_packet(flow.src.ip(), ts, len, crate::store::ipstats::Dir::Tx);
-        self.reg
-            .ipstats
-            .observe_packet(flow.dst.ip(), ts, len, crate::store::ipstats::Dir::Rx);
-
         let reverse_flow = flow.reverse();
         let reverse_exists = self
             .reg
@@ -604,6 +595,7 @@ impl Correlator {
         let neg_for_new = self.reg.calls.get(&call_id).map(|c| c.negotiated.clone());
 
         let mut diags: Vec<Diagnostic> = Vec::new();
+        let emit_turn_note;
         {
             let stream = self.reg.streams.entry(key).or_insert_with(|| {
                 crate::correlate::stream::RtpStream::new(flow, header.ssrc, call_id.clone())
@@ -622,6 +614,12 @@ impl Correlator {
             }
             if encap != Encap::Direct {
                 stream.via_turn = true;
+            }
+            // TURN-carriage Info notes are per-stream, not per-packet: build
+            // them (and only once) below.
+            emit_turn_note = !stream.turn_note_emitted && (encap != Encap::Direct || leg.is_some());
+            if emit_turn_note {
+                stream.turn_note_emitted = true;
             }
             stream.observe(ts, header, len);
             if reverse_exists {
@@ -647,7 +645,7 @@ impl Correlator {
                 diags.push(d);
             }
         }
-        if encap == Encap::ChannelData {
+        if emit_turn_note && encap == Encap::ChannelData {
             diags.push(Diagnostic {
                 ts_us: ts,
                 call_id: call_id.clone(),
@@ -658,7 +656,7 @@ impl Correlator {
                     header.ssrc, flow
                 ),
             });
-        } else if encap == Encap::SendIndication {
+        } else if emit_turn_note && encap == Encap::SendIndication {
             diags.push(Diagnostic {
                 ts_us: ts,
                 call_id: call_id.clone(),
@@ -670,7 +668,7 @@ impl Correlator {
                 ),
             });
         }
-        if let Some(l) = leg {
+        if emit_turn_note && let Some(l) = leg {
             diags.push(Diagnostic {
                 ts_us: ts,
                 call_id: call_id.clone(),
@@ -709,7 +707,7 @@ impl Correlator {
     fn observe_existing_rtp(
         &mut self,
         ts: u64,
-        flow: Flow5Tuple,
+        _flow: Flow5Tuple,
         header: rtpp::RtpHeader,
         len: usize,
         key: StreamKey,
@@ -717,7 +715,6 @@ impl Correlator {
         let pt_diag = {
             let streams = &mut self.reg.streams;
             let calls = &mut self.reg.calls;
-            let ipstats = &mut self.reg.ipstats;
             let Some(stream) = streams.get_mut(&key) else {
                 return false;
             };
@@ -727,8 +724,8 @@ impl Correlator {
                 c.pkts_rtp += 1;
                 c.last_ts_us = ts;
             }
-            ipstats.observe_packet(flow.src.ip(), ts, len, crate::store::ipstats::Dir::Tx);
-            ipstats.observe_packet(flow.dst.ip(), ts, len, crate::store::ipstats::Dir::Rx);
+            // Per-IP packet/byte stats are attributed from the stream
+            // accumulators by the 1s ticker (`attribute_streams`), not here.
             if prev_pt.is_some_and(|p| p != header.payload_type) {
                 rules::check_pt_change(
                     ts,
@@ -918,10 +915,7 @@ impl Correlator {
             d.code,
             d.message
         ));
-        self.reg.diagnostics.push_back(d);
-        while self.reg.diagnostics.len() > self.reg.max_diagnostics {
-            self.reg.diagnostics.pop_front();
-        }
+        self.reg.push_diagnostic(d);
     }
 
     /// Run end-of-call housekeeping (teardown diagnostics, heatmap, eviction).
@@ -1037,6 +1031,7 @@ impl Correlator {
             }
             if !self.keep_terminated {
                 // Headless record: evlog already has the dialog; free RAM now.
+                // (remove_call finalizes the streams' per-IP attribution.)
                 self.reg.remove_call(call_id);
             } else {
                 self.reg.evict_if_needed();
@@ -1157,7 +1152,7 @@ impl Correlator {
             }
         }
         let avg = |s: f64, n: u64| if n == 0 { None } else { Some(s / n as f64) };
-        self.reg.heatmap.record_call(
+        self.reg.record_heatmap_cell(
             ts,
             key,
             answered,

@@ -30,12 +30,23 @@ pub struct RtpStream {
     /// TURN relay leg (client/peer) if this stream traverses a relay.
     pub leg: Option<crate::correlate::turn::Leg>,
     pub via_turn: bool,
+    /// TURN-carriage Info diagnostic already emitted for this stream. The
+    /// note is per-stream state, not per-packet: a relayed call's every RTP
+    /// packet would otherwise build (and usually severity-drop) a Diagnostic.
+    pub turn_note_emitted: bool,
     /// Cumulative RTP bytes observed.
     pub bytes: u64,
     /// Periodic 5s throughput/quality samples (oldest first, capped).
     pub history: VecDeque<RatePoint>,
     last_sample_bytes: u64,
     last_sample_packets: u64,
+    /// Last per-IP attributed totals (packet/byte/loss). The RTP hot path
+    /// bumps the stream's own counters only; the correlator's 1s ticker
+    /// attributes the deltas to both endpoints' per-IP stats — two hash
+    /// lookups per *tick* instead of two per *packet*.
+    pub ipattr_pkts: u64,
+    pub ipattr_bytes: u64,
+    pub ipattr_lost: u64,
 }
 
 impl RtpStream {
@@ -57,10 +68,14 @@ impl RtpStream {
             reverse_seen: false,
             leg: None,
             via_turn: false,
+            turn_note_emitted: false,
             bytes: 0,
             history: VecDeque::new(),
             last_sample_bytes: 0,
             last_sample_packets: 0,
+            ipattr_pkts: 0,
+            ipattr_bytes: 0,
+            ipattr_lost: 0,
         }
     }
 
@@ -132,23 +147,42 @@ impl RtpStream {
         self.acc.snapshot()
     }
 
+    /// Shared (rtt_avg, oneway, mos) core of `summary()` — one definition so
+    /// `summary()` and the light aggregate pass (`stats_light`) cannot drift.
+    fn rtt_oneway_mos(
+        &self,
+        loss_pct: f64,
+        jitter_ms: Option<f64>,
+    ) -> (Option<f64>, Option<f64>, Option<f64>) {
+        let rtt_avg = mean(&self.rtt_samples);
+        let oneway =
+            mean(&self.oneway_samples).or_else(|| rtt_avg.map(|r| r / 2.0)); // RTT/2 fallback
+        let mos = mos::estimate_mos(self.codec.as_deref(), self.payload_type, loss_pct, oneway, jitter_ms);
+        (rtt_avg, oneway, mos)
+    }
+
+    /// Aggregate-only projection of `summary()` for the periodic snapshot
+    /// pass: the same jitter/loss/mos/rtt numbers without building a
+    /// `StreamSummary` (no String or history clones). Returns
+    /// `(call_id, jitter_ms, loss_pct, mos, rtt_avg_ms)`.
+    pub fn stats_light(&self) -> (&str, Option<f64>, f64, Option<f64>, Option<f64>) {
+        let st = self.snapshot_stats();
+        let (rtt_avg, _, mos) = self.rtt_oneway_mos(st.loss_percent, st.jitter_ms);
+        (
+            self.call_id.as_str(),
+            st.jitter_ms,
+            st.loss_percent,
+            mos,
+            rtt_avg,
+        )
+    }
+
     /// Build the export/UI summary, including RTT/MOS aggregation.
     pub fn summary(&self) -> StreamSummary {
         let st = self.snapshot_stats();
-        let rtt_avg = mean(&self.rtt_samples);
+        let (rtt_avg, oneway, mos) = self.rtt_oneway_mos(st.loss_percent, st.jitter_ms);
         let rtt_min = self.rtt_samples.iter().copied().fold(None, min_opt);
         let rtt_max = self.rtt_samples.iter().copied().fold(None, max_opt);
-        let oneway = mean(&self.oneway_samples).or_else(|| {
-            // Fall back to RTT/2 if only round-trip is available (labeled as estimate upstream).
-            rtt_avg.map(|r| r / 2.0)
-        });
-        let mos = mos::estimate_mos(
-            self.codec.as_deref(),
-            self.payload_type,
-            st.loss_percent,
-            oneway,
-            st.jitter_ms,
-        );
         StreamSummary {
             call_id: Some(self.call_id.clone()),
             ssrc: self.ssrc,
@@ -179,17 +213,9 @@ impl RtpStream {
     /// the 10-minute sparkline history (unused by the event).
     pub fn to_snap_evt(&self, ts_us: u64) -> crate::store::evlog::StreamSnapEvt {
         let st = self.snapshot_stats();
-        let rtt_avg = mean(&self.rtt_samples);
+        let (rtt_avg, oneway, mos) = self.rtt_oneway_mos(st.loss_percent, st.jitter_ms);
         let rtt_min = self.rtt_samples.iter().copied().fold(None, min_opt);
         let rtt_max = self.rtt_samples.iter().copied().fold(None, max_opt);
-        let oneway = mean(&self.oneway_samples).or_else(|| rtt_avg.map(|r| r / 2.0));
-        let mos = mos::estimate_mos(
-            self.codec.as_deref(),
-            self.payload_type,
-            st.loss_percent,
-            oneway,
-            st.jitter_ms,
-        );
         crate::store::evlog::StreamSnapEvt {
             ts_us,
             call_id: self.call_id.clone(),

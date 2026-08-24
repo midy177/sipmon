@@ -35,20 +35,22 @@ impl CaptureSource for StdinSource {
     }
 
     fn next_frame(&mut self, f: &mut dyn FnMut(u64, u32, &[u8])) -> bool {
-        loop {
-            if self
-                .stop
-                .as_ref()
-                .is_some_and(|s| s.load(Ordering::Relaxed))
-            {
-                return false;
-            }
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::Relaxed))
+        {
+            return false;
+        }
+        const BATCH: usize = 256;
+        let mut delivered = 0usize;
+        while delivered < BATCH {
             match self.cap.next_packet() {
                 Ok(pkt) => {
                     f(pcap_ts_us(pkt.header), self.linktype, pkt.data);
-                    return true;
+                    delivered += 1;
                 }
-                Err(pcap::Error::NoMorePackets) => return false,
+                Err(pcap::Error::NoMorePackets) => return delivered > 0,
                 Err(pcap::Error::TimeoutExpired) => continue,
                 Err(e) => {
                     tracing::warn!(error = %e, "stdin capture error, stopping");
@@ -56,5 +58,6 @@ impl CaptureSource for StdinSource {
                 }
             }
         }
+        true
     }
 }

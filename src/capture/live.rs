@@ -49,25 +49,37 @@ impl CaptureSource for LiveSource {
     }
 
     fn next_frame(&mut self, f: &mut dyn FnMut(u64, u32, &[u8])) -> bool {
-        loop {
-            if self
-                .stop
-                .as_ref()
-                .is_some_and(|s| s.load(Ordering::Relaxed))
-            {
-                return false;
-            }
+        // Stop is checked per batch, not per frame: 64 frames at multi-Mpps
+        // rates complete in microseconds, so shutdown stays prompt.
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::Relaxed))
+        {
+            return false;
+        }
+        // Deliver whatever is immediately available, up to BATCH frames. The
+        // loop ends at the first would-block (activation timeout), so batch
+        // size tracks the NIC queue depth naturally: busy captures fill the
+        // batch, sparse ones deliver one frame and return.
+        const BATCH: usize = 64;
+        let mut delivered = 0usize;
+        while delivered < BATCH {
             match self.cap.next_packet() {
                 Ok(pkt) => {
                     f(pcap_ts_us(pkt.header), self.linktype, pkt.data);
-                    return true;
+                    delivered += 1;
                 }
-                Err(pcap::Error::TimeoutExpired) | Err(pcap::Error::NoMorePackets) => continue,
+                Err(pcap::Error::TimeoutExpired) | Err(pcap::Error::NoMorePackets) => break,
                 Err(e) => {
                     tracing::warn!(error = %e, "live capture error, stopping");
                     return false;
                 }
             }
         }
+        // `true` even when the batch is empty (idle interface): the 100ms
+        // activation timeout already paced this call, and the pipeline must
+        // not mistake a quiet interface for EOF.
+        true
     }
 }

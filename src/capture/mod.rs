@@ -11,8 +11,13 @@ pub mod stdin;
 ///
 /// Packet bytes are borrowed from the pcap ring for the duration of `f` only.
 pub trait CaptureSource: Send {
-    /// Invoke `f` with `(ts_us, linktype, packet_bytes)` for the next frame.
-    /// Returns `false` on EOF or shutdown.
+    /// Invoke `f` with `(ts_us, linktype, packet_bytes)` for frames that are
+    /// immediately available, up to a small batch (sources pick 64-256): one
+    /// call may deliver several frames before returning, amortizing the
+    /// pipeline's per-iteration overhead (clock reads, control-flag checks)
+    /// across a batch instead of paying it per frame. `false` means EOF or
+    /// shutdown; an empty-but-alive source (e.g. idle interface timeout)
+    /// still returns `true`.
     fn next_frame(&mut self, f: &mut dyn FnMut(u64, u32, &[u8])) -> bool;
     /// Attach a pipeline shutdown signal. Once set, `next_frame` must return
     /// `false` promptly so the pipeline can drain and exit cleanly.

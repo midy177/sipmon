@@ -4,6 +4,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use std::sync::Arc;
+
 use crate::diagnostics::{Diagnostic, Severity, code_from_str};
 use crate::model::media::StreamSummary;
 use crate::model::packet::{Flow5Tuple, Proto};
@@ -70,7 +72,7 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
         });
         writeln!(w, "{line}")?;
     }
-    for d in &snap.diagnostics {
+    for d in snap.diagnostics.iter() {
         let line = json!({
             "kind": "diag",
             "ts_us": d.ts_us,
@@ -81,7 +83,7 @@ pub fn export_snapshot(path: &Path, snap: &Snapshot) -> Result<()> {
         });
         writeln!(w, "{line}")?;
     }
-    for (bucket_us, key, m) in &snap.buckets {
+    for (bucket_us, key, m) in snap.buckets.iter() {
         let line = json!({
             "kind": "bucket",
             "bucket_us": bucket_us,
@@ -127,8 +129,8 @@ pub fn import_snapshot(path: &Path) -> Result<Snapshot> {
         match v.get("kind").and_then(|k| k.as_str()) {
             Some("call") => snap.calls.push(import_call(&v)),
             Some("stream") => snap.streams.push(import_stream(&v)),
-            Some("diag") => snap.diagnostics.push(import_diag(&v)),
-            Some("bucket") => snap.buckets.push(import_bucket(&v)),
+            Some("diag") => Arc::make_mut(&mut snap.diagnostics).push(import_diag(&v)),
+            Some("bucket") => Arc::make_mut(&mut snap.buckets).push(import_bucket(&v)),
             _ => {}
         }
     }
@@ -433,14 +435,14 @@ mod tests {
             bytes: 0,
             history: Vec::new(),
         });
-        snap.diagnostics.push(Diagnostic {
+        Arc::make_mut(&mut snap.diagnostics).push(Diagnostic {
             ts_us: 1_001_000,
             call_id: "abc@x".into(),
             severity: Severity::Warn,
             code: crate::diagnostics::RTP_PT_MISMATCH,
             message: "PT=8 not in negotiated codecs".into(),
         });
-        snap.buckets.push((
+        Arc::make_mut(&mut snap.buckets).push((
             900_000,
             "10.0.0.1".into(),
             MetricSet {

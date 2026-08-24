@@ -136,6 +136,7 @@ impl IpStats {
         }
     }
 
+    #[cfg(test)]
     fn add_packet(&mut self, ts_us: u64, len: usize, dir: Dir) {
         self.add_packets(ts_us, 1, len as u64, dir);
     }
@@ -373,8 +374,12 @@ impl IpStatsStore {
         self.map.entry(ip).or_insert_with(|| IpStats::new(ip))
     }
 
+    /// Per-packet observation. No longer on the RTP hot path (the correlator
+    /// attributes stream deltas on a 1s ticker); kept for tests and ad-hoc
+    /// single-packet accounting.
+    #[allow(dead_code)]
     pub fn observe_packet(&mut self, ip: IpAddr, ts_us: u64, len: usize, dir: Dir) {
-        self.entry(ip).add_packet(ts_us, len, dir);
+        self.entry(ip).add_packets(ts_us, 1, len as u64, dir);
     }
 
     /// Attribute `count` packets totaling `bytes` to `ip` in one shot.

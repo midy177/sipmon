@@ -64,7 +64,7 @@ pub fn ordered_rows<'a>(snap: &'a Snapshot, app: &mut App) -> Vec<&'a IpStats> {
         .iter()
         .filter_map(|ip| by_ip.get(ip).copied())
         .collect();
-    for s in &snap.ip_stats {
+    for s in snap.ip_stats.iter() {
         if !app.ip_sort_order.contains(&s.ip) {
             app.ip_sort_order.push(s.ip);
             v.push(s);
@@ -416,7 +416,7 @@ mod tests {
         st.add_active("10.10.0.8".parse().unwrap(), 2);
         st.add_active("10.20.0.8".parse().unwrap(), 1);
         let mut snap = Snapshot {
-            ip_stats: st.snapshot(),
+            ip_stats: std::sync::Arc::new(st.snapshot()),
             ..Snapshot::default()
         };
         snap.calls.push(crate::store::registry::CallSummary {

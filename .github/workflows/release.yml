@@ -10,8 +10,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned for the zigbuild jobs (musl-aarch64, macos-universal). Must match a
-  # real ziglang.org artifact; 0.15+ uses the <arch>-<os> tarball name order.
+  # Pinned for the zigbuild jobs (build-linux-zig matrix, macos-universal).
+  # Must match a real ziglang.org artifact; 0.15+ uses the <arch>-<os> tarball
+  # name order.
   ZIG_VERSION: 0.16.0
 
 jobs:
@@ -89,12 +90,30 @@ jobs:
             target/x86_64-unknown-linux-musl/release/sipmon-x86_64-unknown-linux-musl
             target/x86_64-unknown-linux-musl/release/sipmon-x86_64-unknown-linux-musl.sha256
 
-  # Portable static Linux/ARM64 — cross-compiled with zig (no aarch64
-  # toolchain or qemu needed on the x86_64 runner). The Makefile builds the
-  # cross libpcap (cached under ~/.cache/sipmon/pcap-zig, with a github
-  # clone + autoreconf fallback when tcpdump.org is unreachable) and links
-  # via cargo-zigbuild.
-  build-musl-aarch64:
+  # Linux targets cross-compiled with zig from the x86_64 runner via the
+  # Makefile (no per-arch toolchains or qemu needed). The Makefile builds the
+  # cross libpcap per target with `zig cc` (cached under ~/.cache/sipmon/pcap-zig,
+  # with a github clone + autoreconf fallback when tcpdump.org is unreachable)
+  # and links via cargo-zigbuild. One matrix entry per target:
+  #   - musl:    portable, fully static, zero runtime deps.
+  #   - gnu:     glibc, dynamically linked — the interpreter + libc.so.6 +
+  #              libpcap.so.1 come from the target host at runtime (zig's
+  #              linker refuses to fall back from -lpcap to the static archive,
+  #              so these can't be made self-contained).
+  build-linux-zig:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - make-target: musl-aarch64
+            rust-target: aarch64-unknown-linux-musl
+            linkage: static
+          - make-target: gnu-x86_64
+            rust-target: x86_64-unknown-linux-gnu
+            linkage: dynamic
+          - make-target: gnu-aarch64
+            rust-target: aarch64-unknown-linux-gnu
+            linkage: dynamic
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,11 +125,11 @@ jobs:
             ~/.cargo/registry
             target
             ~/.cache/sipmon/pcap-zig
-          key: musl-aarch64-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-zig${{ env.ZIG_VERSION }}
+          key: zig-${{ matrix.rust-target }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-zig${{ env.ZIG_VERSION }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-musl
+          targets: ${{ matrix.rust-target }}
 
       - name: Install build tools
         run: |
@@ -129,28 +148,36 @@ jobs:
         run: cargo install cargo-zigbuild --locked
 
       - name: Build
-        run: make musl-aarch64
+        run: make ${{ matrix.make-target }}
 
-      - name: Verify fully static
+      - name: Verify linkage
         run: |
-          file target/aarch64-unknown-linux-musl/release/sipmon
-          file target/aarch64-unknown-linux-musl/release/sipmon | grep -q \
-            "statically linked" \
-            || { echo "ERROR: binary is not fully static"; exit 1; }
+          bin="target/${{ matrix.rust-target }}/release/sipmon"
+          file "$bin"
+          case "${{ matrix.linkage }}" in
+            static)
+              file "$bin" | grep -Eq "statically linked|static-pie" \
+                || { echo "ERROR: binary is not fully static"; exit 1; } ;;
+            dynamic)
+              file "$bin" | grep -q "dynamically linked" \
+                || { echo "ERROR: binary is not dynamically linked"; exit 1; }
+              readelf -d "$bin" | grep -q "libpcap.so.1" \
+                || { echo "ERROR: binary does not declare its libpcap.so.1 dep"; exit 1; } ;;
+          esac
 
       - name: Package
         run: |
-          cd target/aarch64-unknown-linux-musl/release
-          cp sipmon sipmon-aarch64-unknown-linux-musl
-          sha256sum sipmon-aarch64-unknown-linux-musl \
-            > sipmon-aarch64-unknown-linux-musl.sha256
+          cd target/${{ matrix.rust-target }}/release
+          cp sipmon sipmon-${{ matrix.rust-target }}
+          sha256sum sipmon-${{ matrix.rust-target }} \
+            > sipmon-${{ matrix.rust-target }}.sha256
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/aarch64-unknown-linux-musl/release/sipmon-aarch64-unknown-linux-musl
-            target/aarch64-unknown-linux-musl/release/sipmon-aarch64-unknown-linux-musl.sha256
+            target/${{ matrix.rust-target }}/release/sipmon-${{ matrix.rust-target }}
+            target/${{ matrix.rust-target }}/release/sipmon-${{ matrix.rust-target }}.sha256
 
   # macOS universal2 (x86_64 + arm64) — zig as the linker, SDK libpcap.
   build-macos-universal:
