@@ -86,11 +86,31 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
             Style::default().fg(theme::ACCENT),
         ),
     ];
-    if snap.pkts_dropped > 0 {
-        // Monitor-side drops (kernel/libpcap ring overflow): the loss figures
-        // include packets this machine never captured.
+    if snap.pkts_pcap_drop > 0 {
+        // Monitor-side capture-buffer drops: RTP loss figures can include
+        // packets this process did not read fast enough.
         spans.push(Span::styled(
-            format!("⚠ ifdrop {} ", snap.pkts_dropped),
+            format_drop_counter(
+                "pcap_drop",
+                snap.pkts_pcap_drop,
+                snap.pkts_pcap_recv,
+                snap.pkts_pcap_drop,
+            ),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if snap.pkts_if_drop > 0 {
+        // Interface/driver drops happen before libpcap; buffer-size tuning
+        // alone does not address them.
+        spans.push(Span::styled(
+            format_drop_counter(
+                "if_drop",
+                snap.pkts_if_drop,
+                snap.pkts_pcap_recv,
+                snap.pkts_if_drop,
+            ),
             Style::default()
                 .fg(theme::ERROR)
                 .add_modifier(Modifier::BOLD),
@@ -151,6 +171,18 @@ pub fn render_topbar(f: &mut Frame, area: Rect, snap: &Snapshot, app: &App) {
         height: 1,
     };
     f.render_widget(brand, brand_area);
+}
+
+fn format_drop_counter(label: &str, dropped: u64, received: u64, denominator_drop: u64) -> String {
+    let denom = received.saturating_add(denominator_drop);
+    if denom == 0 {
+        format!("⚠ {label} {dropped} ")
+    } else {
+        format!(
+            "⚠ {label} {dropped} ({:.1}%) ",
+            dropped as f64 / denom as f64 * 100.0
+        )
+    }
 }
 
 /// Live-recording indicator: a blinking ● REC <file> (<size>) shown in the top

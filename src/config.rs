@@ -49,6 +49,10 @@ pub struct Config {
     pub diag_level: String,
     /// Optional TURN server IPs to label server-side flows (auto-learned too).
     pub turn_servers: Vec<std::net::IpAddr>,
+    /// Live libpcap capture buffer size, in MiB.
+    pub pcap_buffer_mib: i32,
+    /// Live capture snapshot length, in bytes.
+    pub snaplen: i32,
     /// IPs of the local (monitored) machine. Used to anchor the Call Detail
     /// flow / media display so the local endpoint is always the right side and
     /// the arrows show ingress/egress. Empty = no directional anchor (raw
@@ -80,6 +84,8 @@ impl Default for Config {
             max_diagnostics: 50_000,
             diag_level: "warn".to_string(),
             turn_servers: Vec::new(),
+            pcap_buffer_mib: 64,
+            snaplen: 65_535,
             local_ips: Vec::new(),
             call_ttl_secs: 15 * 60,
             keep_terminated: true,

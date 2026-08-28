@@ -153,10 +153,14 @@ pub struct Snapshot {
     pub tz_offset_secs: Option<i32>,
     pub pps: f64,
     pub pkts_total: u64,
-    /// Packets the monitor itself dropped (kernel/libpcap ring overflow) on
-    /// live captures. Non-zero means loss figures may include monitor-side
-    /// drops, not network loss.
-    pub pkts_dropped: u64,
+    /// Packets reported by libpcap as received by the capture handle.
+    pub pkts_pcap_recv: u64,
+    /// Packets dropped because the OS/libpcap capture buffer filled. Non-zero
+    /// means RTP sequence gaps may include monitor-side drops, not network loss.
+    pub pkts_pcap_drop: u64,
+    /// Packets dropped by the network interface or driver before libpcap saw
+    /// them. Buffer-size tuning does not directly fix this class of drop.
+    pub pkts_if_drop: u64,
     pub calls_total: u64,
     pub active: usize,
     pub completed: usize,
@@ -207,8 +211,12 @@ pub struct Registry {
     /// UTC offset (seconds) of the machine that recorded the event log
     /// (populated on replay); used to render the original local wall-clock.
     pub tz_offset_secs: Option<i32>,
-    /// Live-capture drop counter (kernel/libpcap stats), see Snapshot's field.
-    pub pkts_dropped: u64,
+    /// Live-capture received counter from libpcap, see Snapshot's field.
+    pub pkts_pcap_recv: u64,
+    /// Live-capture libpcap buffer drop counter, see Snapshot's field.
+    pub pkts_pcap_drop: u64,
+    /// Live-capture interface/driver drop counter, see Snapshot's field.
+    pub pkts_if_drop: u64,
     pub pkts_last_window: u64,
     pub window_start_us: Option<u64>,
     pub pps: f64,
@@ -285,7 +293,9 @@ impl Default for Registry {
             last_us: None,
             pkts_total: 0,
             tz_offset_secs: None,
-            pkts_dropped: 0,
+            pkts_pcap_recv: 0,
+            pkts_pcap_drop: 0,
+            pkts_if_drop: 0,
             pkts_last_window: 0,
             window_start_us: None,
             pps: 0.0,
@@ -984,7 +994,9 @@ impl Registry {
             tz_offset_secs: self.tz_offset_secs,
             pps: self.pps,
             pkts_total: self.pkts_total,
-            pkts_dropped: self.pkts_dropped,
+            pkts_pcap_recv: self.pkts_pcap_recv,
+            pkts_pcap_drop: self.pkts_pcap_drop,
+            pkts_if_drop: self.pkts_if_drop,
             calls_total: calls_total.max(self.calls.len() as u64),
             active: active_n,
             completed: comp_n,

@@ -7,6 +7,17 @@ pub mod live;
 pub mod replay;
 pub mod stdin;
 
+/// Live capture statistics reported by libpcap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PcapStats {
+    /// Packets received by the capture handle.
+    pub received: u64,
+    /// Packets dropped because the OS/libpcap capture buffer filled.
+    pub dropped: u64,
+    /// Packets dropped by the network interface or driver before libpcap.
+    pub if_dropped: u64,
+}
+
 /// Unified capture source: pull-based, zero-copy.
 ///
 /// Packet bytes are borrowed from the pcap ring for the duration of `f` only.
@@ -23,11 +34,11 @@ pub trait CaptureSource: Send {
     /// `false` promptly so the pipeline can drain and exit cleanly.
     fn set_stop(&mut self, _stop: Arc<AtomicBool>) {}
 
-    /// Live capture drop statistics, if the source can provide them:
-    /// `(received, dropped)` as reported by the kernel/libpcap. Non-zero
-    /// `dropped` means the monitor itself missed packets (loss figures may be
-    /// overstated). File/replay sources return `None`.
-    fn pcap_stats(&mut self) -> Option<(u64, u64)> {
+    /// Live capture statistics, if the source can provide them. Non-zero
+    /// `dropped` means the monitor itself missed packets after they reached
+    /// the capture path; non-zero `if_dropped` means the interface/driver
+    /// dropped packets before libpcap could see them.
+    fn pcap_stats(&mut self) -> Option<PcapStats> {
         None
     }
 }
@@ -39,7 +50,7 @@ impl CaptureSource for Box<dyn CaptureSource> {
     fn set_stop(&mut self, stop: Arc<AtomicBool>) {
         (**self).set_stop(stop)
     }
-    fn pcap_stats(&mut self) -> Option<(u64, u64)> {
+    fn pcap_stats(&mut self) -> Option<PcapStats> {
         (**self).pcap_stats()
     }
 }

@@ -2,6 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 
+use crate::model::media::StreamSummary;
 use crate::store::registry::Snapshot;
 use crate::ui::app::App;
 use crate::ui::{fmt_ms, mask_socket, theme};
@@ -10,8 +11,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
     super::render_topbar(f, chunks[0], snap, app);
 
-    let mut streams = snap.streams.clone();
-    streams.sort_by_key(|s| s.ssrc);
+    let streams = sorted_streams(snap.streams.clone());
     let privacy = app.privacy;
     let local = &app.local_ips;
     let flow_w = streams
@@ -95,4 +95,34 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Snapshot, app: &mut App) {
     )
     .row_highlight_style(theme::selected());
     f.render_stateful_widget(table, chunks[1], &mut app.streams_state);
+}
+
+fn sorted_streams(mut streams: Vec<StreamSummary>) -> Vec<StreamSummary> {
+    streams.sort_by_key(|s| std::cmp::Reverse(s.ssrc));
+    streams
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streams_sort_by_ssrc_descending() {
+        let streams = sorted_streams(vec![
+            StreamSummary {
+                ssrc: 0x10,
+                ..StreamSummary::default()
+            },
+            StreamSummary {
+                ssrc: 0xff,
+                ..StreamSummary::default()
+            },
+            StreamSummary {
+                ssrc: 0x80,
+                ..StreamSummary::default()
+            },
+        ]);
+        let ssrcs: Vec<u32> = streams.iter().map(|s| s.ssrc).collect();
+        assert_eq!(ssrcs, vec![0xff, 0x80, 0x10]);
+    }
 }

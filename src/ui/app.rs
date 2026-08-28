@@ -910,6 +910,16 @@ mod tests {
         )
     }
 
+    fn app_with_snap(snap: Snapshot) -> App {
+        App::new(
+            wrap_snap(snap),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+            RecordState::default(),
+        )
+    }
+
     #[test]
     fn tab_cycles_all_six_pages_including_call_detail() {
         let mut a = app();
@@ -1126,6 +1136,33 @@ mod tests {
         assert!(
             !top.contains("REC"),
             "indicator must be hidden when idle: {top:?}"
+        );
+    }
+
+    #[test]
+    fn topbar_distinguishes_pcap_and_interface_drops() {
+        let mut a = app_with_snap(Snapshot {
+            source: "live:any".into(),
+            pkts_pcap_recv: 88,
+            pkts_pcap_drop: 12,
+            pkts_if_drop: 3,
+            ..Snapshot::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut a)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let top: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            top.contains("pcap_drop 12 (12.0%)"),
+            "top bar missing libpcap drop counter: {top:?}"
+        );
+        assert!(
+            top.contains("if_drop 3 (3.3%)"),
+            "top bar missing interface drop counter: {top:?}"
+        );
+        assert!(
+            !top.contains("ifdrop"),
+            "top bar must not conflate libpcap drops with ifdrop: {top:?}"
         );
     }
 

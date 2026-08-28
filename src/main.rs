@@ -72,6 +72,12 @@ struct Cli {
     /// Comma-separated TURN server IPs (optional; also auto-learned)
     #[arg(long, value_delimiter = ',')]
     turn_servers: Vec<std::net::IpAddr>,
+    /// Live libpcap capture buffer size in MiB
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i32).range(1..=2047))]
+    pcap_buffer_mib: i32,
+    /// Live capture snapshot length in bytes
+    #[arg(long, default_value_t = 65_535, value_parser = clap::value_parser!(i32).range(1..=262_144))]
+    snaplen: i32,
     /// Comma-separated local (monitored) machine IPs; anchors Call Detail flow
     /// so the local endpoint is always on the right with ingress/egress arrows.
     /// Defaults to this host's own interface addresses.
@@ -252,7 +258,12 @@ fn main() -> Result<()> {
             let mut c = cfg.clone();
             c.bpf = filter;
             c.no_media = no_media;
-            let source = capture::live::LiveSource::open(&interface, c.bpf.as_deref())?;
+            let source = capture::live::LiveSource::open(
+                &interface,
+                c.bpf.as_deref(),
+                c.pcap_buffer_mib,
+                c.snaplen,
+            )?;
             run_capture_loop(
                 Box::new(source),
                 c,
@@ -334,7 +345,12 @@ fn main() -> Result<()> {
             if let Some(path) = cli.file {
                 return run_default_file(&cfg, &path, global_no_tui);
             }
-            let source = capture::live::LiveSource::open("any", cfg.bpf.as_deref())?;
+            let source = capture::live::LiveSource::open(
+                "any",
+                cfg.bpf.as_deref(),
+                cfg.pcap_buffer_mib,
+                cfg.snaplen,
+            )?;
             run_capture_loop(
                 Box::new(source),
                 cfg,
@@ -407,6 +423,8 @@ fn build_config(cli: &Cli) -> Config {
         max_diagnostics: cli.max_diagnostics,
         diag_level: cli.diag_level.clone(),
         turn_servers: cli.turn_servers.clone(),
+        pcap_buffer_mib: cli.pcap_buffer_mib,
+        snaplen: cli.snaplen,
         local_ips: config::resolve_local_ips(&cli.local_ips),
         bucket: Bucket::from_str_lossy(&cli.bucket),
         export_jsonl: cli.export_jsonl.clone(),
@@ -462,7 +480,12 @@ fn run_record(
     cfg.evlog = Some(evlog.to_path_buf());
     cfg.dry_run = false; // record always persists
 
-    let source = capture::live::LiveSource::open(interface, cfg.bpf.as_deref())?;
+    let source = capture::live::LiveSource::open(
+        interface,
+        cfg.bpf.as_deref(),
+        cfg.pcap_buffer_mib,
+        cfg.snaplen,
+    )?;
     run_capture_loop(
         Box::new(source),
         cfg,
@@ -690,18 +713,27 @@ fn run_capture_loop(
                         last_pub_search = cur_search;
                     }
                 }
-                // Monitor-side drop accounting: packets the kernel/libpcap
-                // ring lost look like RTP seq gaps and would be booked as
-                // network loss. Surface the counter so the operator can tell
-                // monitor drops from real loss.
-                if let Some((_recv, dropped)) = source.pcap_stats()
-                    && dropped > corr.reg.pkts_dropped
-                {
-                    tracing::warn!(
-                        dropped,
-                        "monitor dropped packets (capture ring overflow): loss stats may be overstated"
-                    );
-                    corr.reg.pkts_dropped = dropped;
+                // Capture-side drop accounting: packets missed by this
+                // monitor look like RTP seq gaps and can be mistaken for
+                // network loss.
+                if let Some(stats) = source.pcap_stats() {
+                    corr.reg.pkts_pcap_recv = stats.received;
+                    if stats.dropped > corr.reg.pkts_pcap_drop {
+                        tracing::warn!(
+                            received = stats.received,
+                            pcap_drop = stats.dropped,
+                            "monitor dropped packets in the libpcap/OS capture buffer: loss stats may be overstated"
+                        );
+                        corr.reg.pkts_pcap_drop = stats.dropped;
+                    }
+                    if stats.if_dropped > corr.reg.pkts_if_drop {
+                        tracing::warn!(
+                            received = stats.received,
+                            if_drop = stats.if_dropped,
+                            "interface/driver dropped packets before libpcap: loss stats may be overstated"
+                        );
+                        corr.reg.pkts_if_drop = stats.if_dropped;
+                    }
                 }
                 flush_recorder(&mut writer, &shared2.record);
                 last_publish = std::time::Instant::now();

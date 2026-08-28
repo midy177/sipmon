@@ -113,6 +113,8 @@ SSRC per leg, so quality views split per leg (expected for a transcoder).
 --max-diagnostics N  Diagnostics ring cap (default 50000)
 --diag-level X       info|warn|critical (default warn)
 --turn-servers IP,…  TURN server IP list (auto-learning also supported)
+--pcap-buffer-mib N  Live libpcap capture buffer size in MiB (default 64)
+--snaplen N          Live capture snapshot length in bytes (default 65535)
 --local-ips IP,…     Local (monitored) machine IPs: Call Detail flow/media pin
                      the local endpoint to the right with ingress/egress arrows
                      (default: this host's own interface addresses)
